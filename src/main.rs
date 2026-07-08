@@ -19,6 +19,8 @@ use std::io::{Write, BufRead, BufReader};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use std::collections::HashMap;
+use std::process;
+use futures_util::stream::StreamExt;
 
 // ============ CONFIG FILE ============
 
@@ -35,7 +37,7 @@ fn load_api_keys() -> HashMap<String, String> {
                 if line.is_empty() || line.starts_with('#') {
                     continue;
                 }
-                // Format: "cloud*model:key"
+                // Format: "cloud@model:key"
                 if let Some((model, key)) = line.split_once(':') {
                     keys.insert(model.trim().to_string(), key.trim().to_string());
                 }
@@ -67,21 +69,21 @@ impl CloudModelConfig {
     fn get_default_configs() -> Vec<Self> {
         vec![
             CloudModelConfig {
-                name: "cloud*deepseek".to_string(),
+                name: "cloud@deepseek".to_string(),
                 display_name: "DeepSeek Chat".to_string(),
                 api_type: CloudApiType::DeepSeek,
                 model_id: "deepseek-chat".to_string(),
                 base_url: "https://api.deepseek.com".to_string(),
             },
             CloudModelConfig {
-                name: "cloud*mistral".to_string(),
+                name: "cloud@mistral".to_string(),
                 display_name: "Mistral Medium".to_string(),
                 api_type: CloudApiType::Mistral,
                 model_id: "mistral-medium-3.5".to_string(),
                 base_url: "https://api.mistral.ai".to_string(),
             },
             CloudModelConfig {
-                name: "cloud*deepseek-coder".to_string(),
+                name: "cloud@deepseek-coder".to_string(),
                 display_name: "DeepSeek Coder".to_string(),
                 api_type: CloudApiType::DeepSeek,
                 model_id: "deepseek-coder".to_string(),
@@ -303,31 +305,33 @@ impl OllamaClient {
         &self,
         model: &str,
         messages: Vec<OllamaChatMessage>,
-        tools: Vec<Tool>,
+        tools: Option<Vec<Tool>>,
     ) -> Result<OllamaChatResponse, Box<dyn std::error::Error>> {
         let url = format!("{}/api/chat", self.base_url);
         
-        let tool_definitions: Vec<serde_json::Value> = tools.iter().map(|tool| {
-            serde_json::json!({
-                "type": "function",
-                "function": {
-                    "name": tool.name,
-                    "description": tool.description,
-                    "parameters": {
-                        "type": tool.parameters.param_type,
-                        "properties": tool.parameters.properties,
-                        "required": tool.parameters.required,
-                    }
-                }
-            })
-        }).collect();
-        
-        let request_body = serde_json::json!({
+        let mut request_body = serde_json::json!({
             "model": model,
             "messages": messages,
-            "tools": tool_definitions,
             "stream": false,
         });
+
+        if let Some(tools) = tools {
+            let tool_definitions: Vec<serde_json::Value> = tools.iter().map(|tool| {
+                serde_json::json!({
+                    "type": "function",
+                    "function": {
+                        "name": tool.name,
+                        "description": tool.description,
+                        "parameters": {
+                            "type": tool.parameters.param_type,
+                            "properties": tool.parameters.properties,
+                            "required": tool.parameters.required,
+                        }
+                    }
+                })
+            }).collect();
+            request_body["tools"] = serde_json::Value::Array(tool_definitions);
+        }
 
         let response = self
             .client
@@ -343,6 +347,62 @@ impl OllamaClient {
 
         let chat_response: OllamaChatResponse = response.json().await?;
         Ok(chat_response)
+    }
+
+    async fn generate_streaming(
+        &self,
+        model: &str,
+        prompt: &str,
+        tx: mpsc::UnboundedSender<String>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let url = format!("{}/api/generate", self.base_url);
+        
+        let request_body = serde_json::json!({
+            "model": model,
+            "prompt": prompt,
+            "stream": true,
+        });
+
+        let response = self
+            .client
+            .post(&url)
+            .json(&request_body)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            let error_text = response.text().await?;
+            return Err(format!("Ollama API error: {}", error_text).into());
+        }
+
+        let bytes_stream = response.bytes_stream();
+        let mut result = String::new();
+        tokio::pin!(bytes_stream);
+
+        while let Some(chunk) = bytes_stream.next().await {
+            let chunk = chunk?;
+            let chunk_str = String::from_utf8_lossy(&chunk);
+            
+            for line in chunk_str.lines() {
+                if line.is_empty() {
+                    continue;
+                }
+                if let Ok(resp) = serde_json::from_str::<serde_json::Value>(line) {
+                    if let Some(response) = resp.get("response").and_then(|r| r.as_str()) {
+                        result.push_str(response);
+                        // Send only the accumulated response text
+                        let _ = tx.send(result.clone());
+                    }
+                    if let Some(done) = resp.get("done").and_then(|d| d.as_bool()) {
+                        if done {
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
     }
 
     async fn list_models(&self) -> Result<Vec<String>, Box<dyn std::error::Error>> {
@@ -986,6 +1046,8 @@ struct App {
     api_keys: HashMap<String, String>,
     deepseek_clients: Vec<DeepSeekClient>,
     mistral_clients: Vec<MistralClient>,
+    streaming_buffer: String,
+    has_model_line: bool,
 }
 
 impl App {
@@ -1028,6 +1090,8 @@ impl App {
             api_keys,
             deepseek_clients,
             mistral_clients,
+            streaming_buffer: String::new(),
+            has_model_line: false,
         }
     }
 
@@ -1042,11 +1106,23 @@ impl App {
     }
 
     fn is_cloud_model(&self, model: &str) -> bool {
-        model.starts_with("cloud*")
+        model.starts_with("cloud@")
     }
 
     fn get_cloud_config(&self, model: &str) -> Option<&CloudModelConfig> {
         self.cloud_configs.iter().find(|c| c.name == model)
+    }
+
+    fn get_model_display(&self) -> String {
+        if self.model.starts_with("cloud@") {
+            if let Some(config) = self.get_cloud_config(&self.model) {
+                config.display_name.clone()
+            } else {
+                self.model.clone()
+            }
+        } else {
+            self.model.clone()
+        }
     }
 
     fn handle_menu_action(&mut self, action: MenuAction) {
@@ -1058,7 +1134,7 @@ impl App {
                 self.status_message = Some("📂 Load action (not implemented)".to_string());
             }
             MenuAction::Exit => {
-                std::process::exit(0);
+                self.cleanup_and_exit();
             }
             MenuAction::ChatMode => {
                 self.mode = AppMode::Chat;
@@ -1075,6 +1151,12 @@ impl App {
             MenuAction::None => {}
         }
         self.menu.deactivate();
+    }
+
+    fn cleanup_and_exit(&self) {
+        let _ = disable_raw_mode();
+        let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
+        process::exit(0);
     }
 
     fn save_output(&mut self) {
@@ -1096,7 +1178,11 @@ impl App {
     fn handle_command(&mut self, cmd: &str) -> Option<String> {
         match cmd {
             "/help" => {
-                Some("📋 Available commands:\n\n/list - List available models\n/use <model> - Switch to a specific model\n/help - Show this help message".to_string())
+                Some("📋 Available commands:\n\n/list - List available models\n/use <model> - Switch to a specific model\n/quit or /q or /exit - Quit the application\n/help - Show this help message".to_string())
+            }
+            "/quit" | "/q" | "/exit" => {
+                self.cleanup_and_exit();
+                None
             }
             "/list" => {
                 Some("📋 Fetching model list...".to_string())
@@ -1104,10 +1190,8 @@ impl App {
             _ if cmd.starts_with("/use ") => {
                 let model = cmd.strip_prefix("/use ").unwrap().trim();
                 if !model.is_empty() {
-                    // Clone the model name to avoid borrow issues
                     let model_name = model.to_string();
                     
-                    // First, check if it's a cloud model and get the config
                     let is_cloud = self.is_cloud_model(&model_name);
                     let cloud_config = if is_cloud {
                         self.get_cloud_config(&model_name).cloned()
@@ -1115,14 +1199,12 @@ impl App {
                         None
                     };
                     
-                    // Check local models
                     let found_model = self.models.iter().find(|m| {
                         **m == model_name ||
                         m.starts_with(&format!("{}:", &model_name)) ||
                         m.starts_with(&model_name)
                     });
                     
-                    // Now handle the switch based on what we found
                     if let Some(config) = cloud_config {
                         if self.api_keys.contains_key(&model_name) {
                             self.model = model_name.clone();
@@ -1234,12 +1316,10 @@ impl App {
     }
 
     async fn process_agent_request(&self, prompt: String) -> String {
-        // Check if this is a cloud model
         if self.is_cloud_model(&self.model) {
             return self.process_cloud_request(prompt, &self.model).await;
         }
 
-        // For local Ollama models, use the agent loop
         let tools = vec![
             Tool::list_directory(),
             Tool::read_file(),
@@ -1266,7 +1346,7 @@ impl App {
             let response = match self.ollama_client.chat_with_tools(
                 &self.model,
                 messages.clone(),
-                tools.clone(),
+                Some(tools.clone()),
             ).await {
                 Ok(r) => r,
                 Err(e) => return format!("❌ Error: {}", e),
@@ -1462,13 +1542,14 @@ fn render_about_dialog<B: Backend>(f: &mut Frame<B>, app: &App) {
         Line::from("  • Cloud models: DeepSeek, Mistral"),
         Line::from("  • Tool calling (list_directory, read_file)"),
         Line::from("  • Agent loop with multi-turn tool execution"),
+        Line::from("  • Streaming responses"),
         Line::from("  • Markdown rendering"),
         Line::from("  • Mouse support"),
         Line::from("  • Prompt history"),
         Line::from(""),
         Line::from("Cloud API Keys:"),
         Line::from("  • Add keys to config.keys file"),
-        Line::from("  • Format: cloud*model:your_api_key"),
+        Line::from("  • Format: cloud@model:your_api_key"),
         Line::from(""),
         Line::from(Span::styled(
             "Press Enter or ESC to close",
@@ -1507,20 +1588,17 @@ fn ui<B: Backend>(f: &mut Frame<B>, app: &mut App) {
         AppMode::Agent => "🤖 AGENT MODE (Tools available)",
     };
     
-    let model_display = if app.model.starts_with("cloud*") {
-        if let Some(config) = app.get_cloud_config(&app.model) {
-            format!("☁️ {}", config.display_name)
-        } else {
-            app.model.clone()
-        }
+    let model_display = app.get_model_display();
+    let model_display_with_cloud = if app.model.starts_with("cloud@") {
+        format!("☁️ {}", model_display)
     } else {
-        app.model.clone()
+        model_display.clone()
     };
     
     let output_area = chunks[1];
     let output_block = Block::default()
         .borders(Borders::ALL)
-        .title(format!("📝 Response [{}] - {}", mode_indicator, model_display));
+        .title(format!("📝 Response [{}] - {}", mode_indicator, model_display_with_cloud));
     
     if let Some(err) = &app.error {
         let error_text = Paragraph::new(format!("❌ Error: {}", err))
@@ -1601,21 +1679,13 @@ fn ui<B: Backend>(f: &mut Frame<B>, app: &mut App) {
     } else if let Some(err) = &app.error {
         format!("❌ {}", err)
     } else if app.is_loading {
-        "⏳ Processing request (may involve multiple tool calls)...".to_string()
+        "⏳ Processing request...".to_string()
     } else {
-        let cloud_indicator = if app.model.starts_with("cloud*") { "☁️ " } else { "" };
+        let cloud_indicator = if app.model.starts_with("cloud@") { "☁️ " } else { "" };
         let tools_indicator = if app.mode == AppMode::Agent { " 🔧" } else { "" };
         format!("🤖 {}{}{} | Ctrl+S to save | F9 for menu | /help for commands", 
             cloud_indicator,
-            if app.model.starts_with("cloud*") {
-                if let Some(config) = app.get_cloud_config(&app.model) {
-                    config.display_name.as_str()
-                } else {
-                    &app.model
-                }
-            } else {
-                &app.model
-            }, 
+            app.get_model_display(), 
             tools_indicator
         )
     };
@@ -1652,13 +1722,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut app = App::new(ollama_client.clone(), cloud_configs);
     
     match ollama_client.list_models().await {
-        Ok(mut models) => {
-            // Add cloud models to the list
+        Ok(models) => {
+            let mut all_models = models.clone();
             let cloud_models = app.get_cloud_models();
-            models.extend(cloud_models);
+            all_models.extend(cloud_models);
             
-            if !models.is_empty() {
-                app.models = models.clone();
+            if !all_models.is_empty() {
+                app.models = all_models;
                 app.model = models[0].clone();
                 let cloud_count = app.get_cloud_models().len();
                 app.status_message = Some(format!(
@@ -1702,22 +1772,72 @@ async fn run_app<B: Backend>(
     loop {
         terminal.draw(|f| ui(f, app))?;
 
-        while let Ok(response) = rx.try_recv() {
-            if !app.output.is_empty() {
-                app.output.push_str("\n\n---\n\n");
+        while let Ok(chunk) = rx.try_recv() {
+            if chunk.is_empty() {
+                // Streaming complete
+                app.streaming_buffer.clear();
+                app.is_loading = false;
+                app.status_message = None;
+                app.auto_scroll = true;
+                app.has_model_line = false;
+                continue;
             }
-            app.output.push_str(&response);
-            app.is_loading = false;
-            app.error = None;
-            app.status_message = None;
-            app.auto_scroll = true;
+
+            // Check if this is a model line message
+            if chunk.starts_with("MODEL_LINE:") {
+                let model_name = chunk.strip_prefix("MODEL_LINE:").unwrap_or("").to_string();
+                // Add the model name line to the output
+                let new_line = format!("{}: ", model_name);
+                if !app.output.is_empty() && !app.output.ends_with('\n') {
+                    app.output.push('\n');
+                }
+                app.output.push_str(&new_line);
+                app.has_model_line = true;
+                app.auto_scroll = true;
+                continue;
+            }
+
+            // Otherwise, this is a response text chunk
+            if app.has_model_line {
+                // Update the model line with the new response text
+                app.streaming_buffer = chunk;
+                let model_display = app.get_model_display();
+                let model_prefix = format!("{}:", model_display);
+                
+                // Find the LAST occurrence of the model prefix (the current response)
+                let lines: Vec<&str> = app.output.lines().collect();
+                let mut model_line_index = None;
+                for (i, line) in lines.iter().enumerate().rev() {
+                    if line.starts_with(&model_prefix) {
+                        model_line_index = Some(i);
+                        break;
+                    }
+                }
+                
+                if let Some(idx) = model_line_index {
+                    // Keep lines before the model line, then replace from idx onward with the new response
+                    let mut new_output = lines[..idx].join("\n");
+                    if !new_output.is_empty() {
+                        new_output.push('\n');
+                    }
+                    new_output.push_str(&format!("{}: {}", model_display, app.streaming_buffer));
+                    app.output = new_output;
+                } else {
+                    // Should not happen, but fallback
+                    if !app.output.is_empty() && !app.output.ends_with('\n') {
+                        app.output.push('\n');
+                    }
+                    app.output.push_str(&format!("{}: {}", model_display, app.streaming_buffer));
+                }
+                app.auto_scroll = true;
+            }
         }
 
         if poll(Duration::from_millis(50))? {
             if let Event::Key(key) = event::read()? {
                 match key.code {
                     KeyCode::Char('q') if key.modifiers == crossterm::event::KeyModifiers::CONTROL => {
-                        return Ok(());
+                        app.cleanup_and_exit();
                     }
                     KeyCode::Char('s') if key.modifiers == crossterm::event::KeyModifiers::CONTROL => {
                         if !app.is_loading {
@@ -1774,92 +1894,85 @@ async fn run_app<B: Backend>(
                             
                             if prompt.starts_with("/") {
                                 if let Some(response) = app.handle_command(&prompt) {
-                                    if !app.output.is_empty() {
-                                        app.output.push_str("\n\n---\n\n");
+                                    if !app.output.is_empty() && !app.output.ends_with('\n') {
+                                        app.output.push('\n');
                                     }
                                     app.output.push_str(&response);
                                     app.auto_scroll = true;
                                     
-if prompt == "/list" {
-    let client = ollama_client.clone();
-    let tx = tx_clone.clone();
-    let cloud_models = app.get_cloud_models();
-    tokio::spawn(async move {
-        match client.list_models().await {
-            Ok(mut models) => {
-                let mut response = "📋 Available models:\n\n".to_string();
-                
-                // Local models
-                for model in &models {
-                    response.push_str(&format!("   {}\n", model));
-                }
-                
-                // Cloud models - escape the * character
-                for model in &cloud_models {
-                    // Replace * with escaped version to prevent markdown interpretation
-                    let escaped = model.replace("*", "\\\\*");
-                    response.push_str(&format!("☁️  {}\n", escaped));
-                }
-                
-                response.push_str("\n☁️  = Cloud model (requires API key in config.keys)");
-                let _ = tx.send(response);
-            }
-            Err(e) => {
-                let _ = tx.send(format!("❌ Error listing models: {}", e));
-            }
-        }
-    });
-}
-                                   
+                                    if prompt == "/list" {
+                                        let client = ollama_client.clone();
+                                        let tx = tx_clone.clone();
+                                        let cloud_models = app.get_cloud_models();
+                                        tokio::spawn(async move {
+                                            match client.list_models().await {
+                                                Ok(models) => {
+                                                    let mut response = "📋 Available models:\n\n".to_string();
+                                                    for model in &models {
+                                                        response.push_str(&format!("   {}\n", model));
+                                                    }
+                                                    for model in &cloud_models {
+                                                        response.push_str(&format!("☁️  {}\n", model));
+                                                    }
+                                                    response.push_str("\n☁️  = Cloud model (requires API key in config.keys)");
+                                                    let _ = tx.send(response);
+                                                }
+                                                Err(e) => {
+                                                    let _ = tx.send(format!("❌ Error listing models: {}", e));
+                                                }
+                                            }
+                                        });
+                                    }
                                 }
                                 continue;
                             }
+                            
+                            // Add user prompt to output without extra newline
+                            if !app.output.is_empty() && !app.output.ends_with('\n') {
+                                app.output.push('\n');
+                            }
+                            app.output.push_str(&format!("USER: {}", prompt));
                             
                             app.add_to_history(prompt.clone());
                             app.is_loading = true;
                             app.status_message = Some("⏳ Processing request...".to_string());
                             app.auto_scroll = true;
+                            app.has_model_line = false;
                             
                             let app_clone = app.clone();
                             let tx = tx_clone.clone();
                             let prompt_clone = prompt.clone();
+                            let model_display = app.get_model_display();
                             
                             tokio::spawn(async move {
-                                let response = if app_clone.mode == AppMode::Agent {
-                                    app_clone.process_agent_request(prompt_clone).await
+                                if app_clone.mode == AppMode::Agent {
+                                    let response = app_clone.process_agent_request(prompt_clone).await;
+                                    let formatted = format!("{}: {}", model_display, response);
+                                    let _ = tx.send(formatted);
                                 } else {
-                                    // Chat mode - simple generation
                                     if app_clone.is_cloud_model(&app_clone.model) {
-                                        app_clone.process_cloud_request(prompt_clone, &app_clone.model).await
+                                        let response = app_clone.process_cloud_request(prompt_clone, &app_clone.model).await;
+                                        let formatted = format!("{}: {}", model_display, response);
+                                        let _ = tx.send(formatted);
                                     } else {
-                                        let tools = vec![
-                                            Tool::list_directory(),
-                                            Tool::read_file(),
-                                        ];
-                                        match app_clone.ollama_client.chat_with_tools(
+                                        // Send the model line first
+                                        let _ = tx.send(format!("MODEL_LINE:{}", model_display));
+                                        
+                                        // Now stream the response
+                                        match app_clone.ollama_client.generate_streaming(
                                             &app_clone.model,
-                                            vec![
-                                                OllamaChatMessage {
-                                                    role: "user".to_string(),
-                                                    content: Some(prompt_clone),
-                                                    tool_calls: None,
-                                                    tool_name: None,
-                                                }
-                                            ],
-                                            tools,
+                                            &prompt_clone,
+                                            tx.clone(),
                                         ).await {
-                                            Ok(response) => {
-                                                if let Some(content) = response.message.content {
-                                                    content
-                                                } else {
-                                                    "No response".to_string()
-                                                }
+                                            Ok(_) => {
+                                                let _ = tx.send("".to_string());
                                             }
-                                            Err(e) => format!("❌ Error: {}", e),
+                                            Err(e) => {
+                                                let _ = tx.send(format!("{}: ❌ Error: {}", model_display, e));
+                                            }
                                         }
                                     }
-                                };
-                                let _ = tx.send(response);
+                                }
                             });
                         }
                     }
