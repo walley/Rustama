@@ -21,6 +21,8 @@ use tokio::sync::mpsc;
 use std::collections::HashMap;
 use std::process;
 use futures_util::stream::StreamExt;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 // ============ CONFIG FILE ============
 
@@ -395,6 +397,8 @@ impl OllamaClient {
                     }
                     if let Some(done) = resp.get("done").and_then(|d| d.as_bool()) {
                         if done {
+                            // Send empty message to signal completion
+                            let _ = tx.send(String::new());
                             return Ok(());
                         }
                     }
@@ -1226,6 +1230,10 @@ impl App {
     }
 
     fn append_to_conversation(&mut self, role: &str, content: &str) {
+        // Don't add empty messages
+        if content.is_empty() {
+            return;
+        }
         self.conversation.push(OllamaChatMessage {
             role: role.to_string(),
             content: content.to_string(),
@@ -1233,8 +1241,8 @@ impl App {
             tool_name: None,
         });
         // Limit conversation length to prevent memory issues
-        if self.conversation.len() > 20 {
-            self.conversation.drain(0..2);
+        if self.conversation.len() > 50 {
+            self.conversation.drain(0..10);
         }
     }
 
@@ -1280,16 +1288,21 @@ impl App {
                     "❌ No Mistral client configured".to_string()
                 }
             };
+            // Add error message to conversation
+            self.append_to_conversation("assistant", &response);
             return response;
         }
 
         // For local Ollama models
         if self.mode == AppMode::Agent {
-            return self.process_agent_request(prompt).await;
+            return self.process_agent_request().await;
         }
 
         // Chat mode - use streaming with context
         let model_display = self.get_model_display();
+        
+        // Reset streaming buffer for this request
+        self.streaming_buffer.clear();
         
         // Send the model line first
         let _ = tx.send(format!("MODEL_LINE:{}", model_display));
@@ -1306,19 +1319,21 @@ impl App {
                 if !response.is_empty() {
                     self.append_to_conversation("assistant", &response);
                 }
-                return response;
+                // Send empty message to signal completion
+                let _ = tx.send(String::new());
+                response
             }
             Err(e) => {
                 let error_msg = format!("❌ Error: {}", e);
                 self.append_to_conversation("assistant", &error_msg);
-                return error_msg;
+                let _ = tx.send(error_msg.clone());
+                error_msg
             }
         }
     }
 
-    async fn process_agent_request(&mut self, prompt: String) -> String {
-        // Add user message to conversation
-        self.append_to_conversation("user", &prompt);
+    async fn process_agent_request(&mut self) -> String {
+        // Note: user message is already added in process_chat_request
 
         let tools = vec![
             Tool::list_directory(),
@@ -1331,7 +1346,9 @@ impl App {
         loop {
             iteration += 1;
             if iteration > max_iterations {
-                return "⚠️ Max tool iterations reached".to_string();
+                let msg = "⚠️ Max tool iterations reached".to_string();
+                self.append_to_conversation("assistant", &msg);
+                return msg;
             }
 
             let response = match self.ollama_client.chat_with_context(
@@ -1340,7 +1357,11 @@ impl App {
                 Some(tools.clone()),
             ).await {
                 Ok(r) => r,
-                Err(e) => return format!("❌ Error: {}", e),
+                Err(e) => {
+                    let msg = format!("❌ Error: {}", e);
+                    self.append_to_conversation("assistant", &msg);
+                    return msg;
+                }
             };
 
             let response_message = response.message;
@@ -1391,7 +1412,9 @@ impl App {
                 self.append_to_conversation("assistant", &content);
                 return content;
             } else {
-                return "No response from model".to_string();
+                let msg = "No response from model".to_string();
+                self.append_to_conversation("assistant", &msg);
+                return msg;
             }
         }
     }
@@ -1454,11 +1477,16 @@ async fn handle_command(
                         "tool" => "🔧",
                         _ => "📝",
                     };
+                    let content_preview = if msg.content.len() > 100 {
+                        format!("{}...", &msg.content[..100])
+                    } else {
+                        msg.content.clone()
+                    };
                     response.push_str(&format!("{}. {} {}: \n   {}\n\n", 
                         i + 1, 
                         role_emoji, 
                         msg.role.to_uppercase(),
-                        msg.content
+                        content_preview
                     ));
                 }
                 response.push_str(&format!("📊 Total messages: {}", app.conversation.len()));
@@ -1859,7 +1887,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     
-    let res = run_app(&mut terminal, &mut app, &mut rx, ollama_client, tx).await;
+    // Wrap app in Arc<Mutex> for sharing with async tasks
+    let app = Arc::new(Mutex::new(app));
+    let app_clone = app.clone();
+    
+    let res = run_app(&mut terminal, app_clone, &mut rx, ollama_client, tx).await;
 
     disable_raw_mode()?;
     execute!(
@@ -1876,10 +1908,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-
 async fn run_app(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    app: &mut App,
+    app_arc: Arc<Mutex<App>>,
     rx: &mut mpsc::UnboundedReceiver<String>,
     ollama_client: OllamaClient,
     tx: mpsc::UnboundedSender<String>,
@@ -1887,13 +1918,29 @@ async fn run_app(
     let tx_clone = tx.clone();
     
     loop {
-        terminal.draw(|f| ui(f, app))?;
+        // Draw the UI - lock the app for the duration
+        {
+            let mut app = app_arc.lock().await;
+            terminal.draw(|f| ui(f, &mut *app))?;
+        }
 
         while let Ok(chunk) = rx.try_recv() {
+            let mut app = app_arc.lock().await;
+            
             if chunk.is_empty() {
+                // Streaming complete - finalize the response
                 if !app.streaming_buffer.is_empty() {
+                    // The response was already appended in process_chat_request
+                    // Just update the output display
                     let response = app.streaming_buffer.clone();
-                    app.append_to_conversation("assistant", &response);
+                    let model_display = app.get_model_display();
+                    // Check if the response is already in the output
+                    if !app.output.contains(&format!("{}: {}", model_display, response)) {
+                        if !app.output.is_empty() && !app.output.ends_with('\n') {
+                            app.output.push('\n');
+                        }
+                        app.output.push_str(&format!("{}: {}", model_display, response));
+                    }
                 }
                 app.streaming_buffer.clear();
                 app.is_loading = false;
@@ -1903,8 +1950,10 @@ async fn run_app(
                 continue;
             }
 
+            // Check if this is a model line message
             if chunk.starts_with("MODEL_LINE:") {
                 let model_name = chunk.strip_prefix("MODEL_LINE:").unwrap_or("").to_string();
+                // Add the model name line to the output
                 let new_line = format!("{}: ", model_name);
                 if !app.output.is_empty() && !app.output.ends_with('\n') {
                     app.output.push('\n');
@@ -1915,11 +1964,15 @@ async fn run_app(
                 continue;
             }
 
+            // Otherwise, this is a response text chunk or command result
             if app.has_model_line {
-                app.streaming_buffer = chunk;
+                // Update the model line with the new response text
+                let chunk_clone = chunk.clone();
+                app.streaming_buffer = chunk_clone;
                 let model_display = app.get_model_display();
                 let model_prefix = format!("{}:", model_display);
                 
+                // Find the LAST occurrence of the model prefix (the current response)
                 let lines: Vec<&str> = app.output.lines().collect();
                 let mut model_line_index = None;
                 for (i, line) in lines.iter().enumerate().rev() {
@@ -1929,22 +1982,28 @@ async fn run_app(
                     }
                 }
                 
+                // Clone the streaming buffer before using it in format!
+                let streaming_content = app.streaming_buffer.clone();
+                
                 if let Some(idx) = model_line_index {
+                    // Keep lines before the model line, then replace from idx onward with the new response
                     let mut new_output = lines[..idx].join("\n");
                     if !new_output.is_empty() {
                         new_output.push('\n');
                     }
-                    new_output.push_str(&format!("{}: {}", model_display, app.streaming_buffer));
+                    new_output.push_str(&format!("{}: {}", model_display, streaming_content));
                     app.output = new_output;
                 } else {
+                    // Should not happen, but fallback
                     if !app.output.is_empty() && !app.output.ends_with('\n') {
                         app.output.push('\n');
                     }
-                    app.output.push_str(&format!("{}: {}", model_display, app.streaming_buffer));
+                    app.output.push_str(&format!("{}: {}", model_display, streaming_content));
                 }
                 app.auto_scroll = true;
                 app.status_message = None;
             } else {
+                // This is a command result (like /list or /context)
                 if !app.output.is_empty() && !app.output.ends_with('\n') {
                     app.output.push('\n');
                 }
@@ -1954,8 +2013,9 @@ async fn run_app(
             }
         }
 
-        if event::poll(Duration::from_millis(10))? {
+        if event::poll(Duration::from_millis(50))? {
             if let Event::Key(key) = event::read()? {
+                let mut app = app_arc.lock().await;
                 match key.code {
                     KeyCode::Char('q') if key.modifiers == crossterm::event::KeyModifiers::CONTROL => {
                         app.cleanup_and_exit();
@@ -2003,10 +2063,11 @@ async fn run_app(
                             app.show_about = false;
                         } else if app.menu.active {
                             if app.menu.selected_subitem > 0 {
-                                let action = app.menu.select_subitem(
-                                    app.menu.selected_menu,
-                                    app.menu.selected_subitem - 1
-                                );
+                                // Clone the menu to avoid borrow checker issues
+                                let menu = &mut app.menu;
+                                let menu_index = menu.selected_menu;
+                                let sub_index = menu.selected_subitem - 1;
+                                let action = menu.select_subitem(menu_index, sub_index);
                                 app.handle_menu_action(action);
                             }
                         } else if !app.input.is_empty() && !app.is_loading {
@@ -2014,7 +2075,7 @@ async fn run_app(
                             app.input.clear();
                             
                             if prompt.starts_with('/') {
-                                let handled = handle_command(&prompt, app, &ollama_client, &tx_clone).await;
+                                let handled = handle_command(&prompt, &mut app, &ollama_client, &tx_clone).await;
                                 if handled {
                                     continue;
                                 }
@@ -2031,12 +2092,13 @@ async fn run_app(
                             app.auto_scroll = true;
                             app.has_model_line = false;
                             
-                            let mut app_clone = app.clone();
+                            let app_clone = app_arc.clone();
                             let tx = tx_clone.clone();
                             let prompt_clone = prompt.clone();
                             
                             tokio::spawn(async move {
-                                let response = app_clone.process_chat_request(prompt_clone, tx.clone()).await;
+                                let mut app = app_clone.lock().await;
+                                let response = app.process_chat_request(prompt_clone, tx.clone()).await;
                                 let _ = tx.send(response);
                             });
                         }
@@ -2088,6 +2150,7 @@ async fn run_app(
                     _ => {}
                 }
             } else if let Event::Mouse(mouse) = event::read()? {
+                let mut app = app_arc.lock().await;
                 match mouse.kind {
                     MouseEventKind::ScrollUp => {
                         if app.menu.active {
@@ -2107,7 +2170,6 @@ async fn run_app(
                     }
                     MouseEventKind::Down(MouseButton::Left) => {
                         if app.show_about {
-                            // Use the terminal's current frame area
                             let area = terminal.get_frame().area();
                             let dialog_width = (area.width * 2 / 5).min(50);
                             let dialog_height = 13;
