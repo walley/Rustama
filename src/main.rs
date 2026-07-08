@@ -256,7 +256,7 @@ impl ToolEngine {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct OllamaChatMessage {
     role: String,
-    content: Option<String>,
+    content: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_calls: Option<Vec<OllamaToolCall>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -301,7 +301,7 @@ impl OllamaClient {
         }
     }
 
-    async fn chat_with_tools(
+    async fn chat_with_context(
         &self,
         model: &str,
         messages: Vec<OllamaChatMessage>,
@@ -352,14 +352,14 @@ impl OllamaClient {
     async fn generate_streaming(
         &self,
         model: &str,
-        prompt: &str,
+        messages: Vec<OllamaChatMessage>,
         tx: mpsc::UnboundedSender<String>,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let url = format!("{}/api/generate", self.base_url);
+        let url = format!("{}/api/chat", self.base_url);
         
         let request_body = serde_json::json!({
             "model": model,
-            "prompt": prompt,
+            "messages": messages,
             "stream": true,
         });
 
@@ -388,7 +388,7 @@ impl OllamaClient {
                     continue;
                 }
                 if let Ok(resp) = serde_json::from_str::<serde_json::Value>(line) {
-                    if let Some(response) = resp.get("response").and_then(|r| r.as_str()) {
+                    if let Some(response) = resp.get("message").and_then(|m| m.get("content")).and_then(|c| c.as_str()) {
                         result.push_str(response);
                         // Send only the accumulated response text
                         let _ = tx.send(result.clone());
@@ -843,9 +843,9 @@ impl DeepSeekClient {
         }
     }
 
-    async fn chat_with_tools(
+    async fn chat_with_context(
         &self,
-        prompt: &str,
+        messages: Vec<OllamaChatMessage>,
         tools: Vec<Tool>,
     ) -> Result<String, Box<dyn std::error::Error>> {
         let url = format!("{}/v1/chat/completions", self.base_url);
@@ -865,14 +865,17 @@ impl DeepSeekClient {
             })
         }).collect();
         
+        // Convert our messages to OpenAI/DeepSeek format
+        let deepseek_messages: Vec<serde_json::Value> = messages.iter().map(|msg| {
+            serde_json::json!({
+                "role": msg.role,
+                "content": msg.content
+            })
+        }).collect();
+        
         let request_body = serde_json::json!({
             "model": self.model_id,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": prompt
-                }
-            ],
+            "messages": deepseek_messages,
             "tools": tool_definitions,
             "tool_choice": "auto",
             "stream": false,
@@ -942,9 +945,9 @@ impl MistralClient {
         }
     }
 
-    async fn chat_with_tools(
+    async fn chat_with_context(
         &self,
-        prompt: &str,
+        messages: Vec<OllamaChatMessage>,
         tools: Vec<Tool>,
     ) -> Result<String, Box<dyn std::error::Error>> {
         let url = format!("{}/v1/chat/completions", self.base_url);
@@ -964,14 +967,16 @@ impl MistralClient {
             })
         }).collect();
         
+        let mistral_messages: Vec<serde_json::Value> = messages.iter().map(|msg| {
+            serde_json::json!({
+                "role": msg.role,
+                "content": msg.content
+            })
+        }).collect();
+        
         let request_body = serde_json::json!({
             "model": self.model_id,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": prompt
-                }
-            ],
+            "messages": mistral_messages,
             "tools": tool_definitions,
             "tool_choice": "auto",
             "stream": false,
@@ -1048,6 +1053,7 @@ struct App {
     mistral_clients: Vec<MistralClient>,
     streaming_buffer: String,
     has_model_line: bool,
+    conversation: Vec<OllamaChatMessage>,
 }
 
 impl App {
@@ -1092,6 +1098,7 @@ impl App {
             mistral_clients,
             streaming_buffer: String::new(),
             has_model_line: false,
+            conversation: Vec::new(),
         }
     }
 
@@ -1175,70 +1182,6 @@ impl App {
         }
     }
 
-    fn handle_command(&mut self, cmd: &str) -> Option<String> {
-        match cmd {
-            "/help" => {
-                Some("📋 Available commands:\n\n/list - List available models\n/use <model> - Switch to a specific model\n/quit or /q or /exit - Quit the application\n/help - Show this help message".to_string())
-            }
-            "/quit" | "/q" | "/exit" => {
-                self.cleanup_and_exit();
-                None
-            }
-            "/list" => {
-                Some("📋 Fetching model list...".to_string())
-            }
-            _ if cmd.starts_with("/use ") => {
-                let model = cmd.strip_prefix("/use ").unwrap().trim();
-                if !model.is_empty() {
-                    let model_name = model.to_string();
-                    
-                    let is_cloud = self.is_cloud_model(&model_name);
-                    let cloud_config = if is_cloud {
-                        self.get_cloud_config(&model_name).cloned()
-                    } else {
-                        None
-                    };
-                    
-                    let found_model = self.models.iter().find(|m| {
-                        **m == model_name ||
-                        m.starts_with(&format!("{}:", &model_name)) ||
-                        m.starts_with(&model_name)
-                    });
-                    
-                    if let Some(config) = cloud_config {
-                        if self.api_keys.contains_key(&model_name) {
-                            self.model = model_name.clone();
-                            let display_name = config.display_name.clone();
-                            self.status_message = Some(format!("🔄 Switched to cloud model: {}", display_name));
-                            return Some(format!("🔄 Switched to cloud model: {}\n", display_name));
-                        } else {
-                            let msg = format!("❌ No API key found for {} in {}\nAdd a line: {}:your_key_here", 
-                                config.display_name, CONFIG_FILE, model_name);
-                            self.status_message = Some(msg.clone());
-                            return Some(msg);
-                        }
-                    } else if let Some(found) = found_model {
-                        self.model = found.clone();
-                        let found_clone = found.clone();
-                        self.status_message = Some(format!("🔄 Switched to model: {}", found_clone));
-                        return Some(format!("🔄 Switched to model: {}\n", found_clone));
-                    } else {
-                        let models_list = self.models.join(", ");
-                        let msg = format!("❌ Model not found: {}. Available: {}", model_name, models_list);
-                        self.status_message = Some(msg.clone());
-                        return Some(msg);
-                    }
-                }
-                None
-            }
-            _ => {
-                let msg = format!("❌ Unknown command: {}", cmd);
-                self.status_message = Some(msg.clone());
-                Some(msg)
-            }
-        }
-    }
-
     fn previous_history(&mut self) -> Option<String> {
         if self.history_index > 0 {
             self.history_index -= 1;
@@ -1282,56 +1225,104 @@ impl App {
         }
     }
 
-    async fn process_cloud_request(&self, prompt: String, model: &str) -> String {
-        let config = match self.get_cloud_config(model) {
-            Some(c) => c,
-            None => return format!("❌ Cloud model not found: {}", model),
-        };
+    fn append_to_conversation(&mut self, role: &str, content: &str) {
+        self.conversation.push(OllamaChatMessage {
+            role: role.to_string(),
+            content: content.to_string(),
+            tool_calls: None,
+            tool_name: None,
+        });
+        // Limit conversation length to prevent memory issues
+        if self.conversation.len() > 20 {
+            self.conversation.drain(0..2);
+        }
+    }
 
-        let tools = vec![
-            Tool::list_directory(),
-            Tool::read_file(),
-        ];
+    async fn process_chat_request(&mut self, prompt: String, tx: mpsc::UnboundedSender<String>) -> String {
+        // Add user message to conversation
+        self.append_to_conversation("user", &prompt);
 
-        match config.api_type {
-            CloudApiType::DeepSeek => {
-                for client in &self.deepseek_clients {
-                    match client.chat_with_tools(&prompt, tools).await {
-                        Ok(response) => return response,
-                        Err(e) => return format!("❌ DeepSeek error: {}", e),
+        // Check if this is a cloud model
+        if self.is_cloud_model(&self.model) {
+            let config = match self.get_cloud_config(&self.model) {
+                Some(c) => c,
+                None => return format!("❌ Cloud model not found: {}", self.model),
+            };
+
+            let tools = vec![
+                Tool::list_directory(),
+                Tool::read_file(),
+            ];
+
+            let response = match config.api_type {
+                CloudApiType::DeepSeek => {
+                    for client in &self.deepseek_clients {
+                        match client.chat_with_context(self.conversation.clone(), tools).await {
+                            Ok(response) => {
+                                self.append_to_conversation("assistant", &response);
+                                return response;
+                            }
+                            Err(e) => return format!("❌ DeepSeek error: {}", e),
+                        }
                     }
+                    "❌ No DeepSeek client configured".to_string()
                 }
-                "❌ No DeepSeek client configured".to_string()
+                CloudApiType::Mistral => {
+                    for client in &self.mistral_clients {
+                        match client.chat_with_context(self.conversation.clone(), tools).await {
+                            Ok(response) => {
+                                self.append_to_conversation("assistant", &response);
+                                return response;
+                            }
+                            Err(e) => return format!("❌ Mistral error: {}", e),
+                        }
+                    }
+                    "❌ No Mistral client configured".to_string()
+                }
+            };
+            return response;
+        }
+
+        // For local Ollama models
+        if self.mode == AppMode::Agent {
+            return self.process_agent_request(prompt).await;
+        }
+
+        // Chat mode - use streaming with context
+        let model_display = self.get_model_display();
+        
+        // Send the model line first
+        let _ = tx.send(format!("MODEL_LINE:{}", model_display));
+        
+        // Now stream the response
+        match self.ollama_client.generate_streaming(
+            &self.model,
+            self.conversation.clone(),
+            tx.clone(),
+        ).await {
+            Ok(_) => {
+                // Get the final response from the streaming buffer
+                let response = self.streaming_buffer.clone();
+                if !response.is_empty() {
+                    self.append_to_conversation("assistant", &response);
+                }
+                return response;
             }
-            CloudApiType::Mistral => {
-                for client in &self.mistral_clients {
-                    match client.chat_with_tools(&prompt, tools).await {
-                        Ok(response) => return response,
-                        Err(e) => return format!("❌ Mistral error: {}", e),
-                    }
-                }
-                "❌ No Mistral client configured".to_string()
+            Err(e) => {
+                let error_msg = format!("❌ Error: {}", e);
+                self.append_to_conversation("assistant", &error_msg);
+                return error_msg;
             }
         }
     }
 
-    async fn process_agent_request(&self, prompt: String) -> String {
-        if self.is_cloud_model(&self.model) {
-            return self.process_cloud_request(prompt, &self.model).await;
-        }
+    async fn process_agent_request(&mut self, prompt: String) -> String {
+        // Add user message to conversation
+        self.append_to_conversation("user", &prompt);
 
         let tools = vec![
             Tool::list_directory(),
             Tool::read_file(),
-        ];
-
-        let mut messages = vec![
-            OllamaChatMessage {
-                role: "user".to_string(),
-                content: Some(prompt),
-                tool_calls: None,
-                tool_name: None,
-            }
         ];
 
         let max_iterations = 5;
@@ -1343,9 +1334,9 @@ impl App {
                 return "⚠️ Max tool iterations reached".to_string();
             }
 
-            let response = match self.ollama_client.chat_with_tools(
+            let response = match self.ollama_client.chat_with_context(
                 &self.model,
-                messages.clone(),
+                self.conversation.clone(),
                 Some(tools.clone()),
             ).await {
                 Ok(r) => r,
@@ -1356,6 +1347,14 @@ impl App {
 
             if let Some(tool_calls) = response_message.tool_calls {
                 if !tool_calls.is_empty() {
+                    // Add assistant message with tool calls
+                    self.conversation.push(OllamaChatMessage {
+                        role: "assistant".to_string(),
+                        content: String::new(),
+                        tool_calls: Some(tool_calls.clone()),
+                        tool_name: None,
+                    });
+
                     let mut tool_results = Vec::new();
                     
                     for tool_call in &tool_calls {
@@ -1368,13 +1367,6 @@ impl App {
                         tool_results.push((tool_name.clone(), result));
                     }
 
-                    messages.push(OllamaChatMessage {
-                        role: "assistant".to_string(),
-                        content: None,
-                        tool_calls: Some(tool_calls),
-                        tool_name: None,
-                    });
-
                     for (tool_name, result) in tool_results {
                         let content = if result.success {
                             result.output
@@ -1382,9 +1374,9 @@ impl App {
                             format!("Error: {}", result.error.unwrap_or_default())
                         };
                         
-                        messages.push(OllamaChatMessage {
+                        self.conversation.push(OllamaChatMessage {
                             role: "tool".to_string(),
-                            content: Some(content),
+                            content,
                             tool_calls: None,
                             tool_name: Some(tool_name),
                         });
@@ -1394,12 +1386,133 @@ impl App {
                 }
             }
 
+            // No tool calls, we have the final answer
             if let Some(content) = response_message.content {
+                self.append_to_conversation("assistant", &content);
                 return content;
             } else {
                 return "No response from model".to_string();
             }
         }
+    }
+}
+
+// ============ COMMAND HANDLER ============
+
+async fn handle_command(
+    prompt: &str,
+    app: &mut App,
+    ollama_client: &OllamaClient,
+    tx: &mpsc::UnboundedSender<String>,
+) -> bool {
+    match prompt {
+        "/help" => {
+            let response = "📋 Available commands:\n\n/list - List available models\n/use <model> - Switch to a specific model\n/context - Show current conversation context\n/quit or /q or /exit - Quit the application\n/help - Show this help message".to_string();
+            let _ = tx.send(response);
+            true
+        }
+        "/quit" | "/q" | "/exit" => {
+            app.cleanup_and_exit();
+            true
+        }
+        "/list" => {
+            app.status_message = Some("📋 Fetching model list...".to_string());
+            app.auto_scroll = true;
+            let client = ollama_client.clone();
+            let tx = tx.clone();
+            let cloud_models = app.get_cloud_models();
+            tokio::spawn(async move {
+                match client.list_models().await {
+                    Ok(models) => {
+                        let mut response = "📋 Available models:\n\n".to_string();
+                        for model in &models {
+                            response.push_str(&format!("   {}\n", model));
+                        }
+                        for model in &cloud_models {
+                            response.push_str(&format!("☁️  {}\n", model));
+                        }
+                        response.push_str("\n☁️  = Cloud model (requires API key in config.keys)");
+                        let _ = tx.send(response);
+                    }
+                    Err(e) => {
+                        let _ = tx.send(format!("❌ Error listing models: {}", e));
+                    }
+                }
+            });
+            true
+        }
+        "/context" => {
+            if app.conversation.is_empty() {
+                let response = "📭 No conversation context yet. Start chatting to build context!".to_string();
+                let _ = tx.send(response);
+            } else {
+                let mut response = "📚 Current Conversation Context:\n\n".to_string();
+                for (i, msg) in app.conversation.iter().enumerate() {
+                    let role_emoji = match msg.role.as_str() {
+                        "user" => "👤",
+                        "assistant" => "🤖",
+                        "tool" => "🔧",
+                        _ => "📝",
+                    };
+                    response.push_str(&format!("{}. {} {}: \n   {}\n\n", 
+                        i + 1, 
+                        role_emoji, 
+                        msg.role.to_uppercase(),
+                        msg.content
+                    ));
+                }
+                response.push_str(&format!("📊 Total messages: {}", app.conversation.len()));
+                let _ = tx.send(response);
+            }
+            true
+        }
+        cmd if cmd.starts_with("/use ") => {
+            let model = cmd.strip_prefix("/use ").unwrap().trim();
+            if !model.is_empty() {
+                let model_name = model.to_string();
+                
+                let is_cloud = app.is_cloud_model(&model_name);
+                let cloud_config = if is_cloud {
+                    app.get_cloud_config(&model_name).cloned()
+                } else {
+                    None
+                };
+                
+                let found_model = app.models.iter().find(|m| {
+                    **m == model_name ||
+                    m.starts_with(&format!("{}:", &model_name)) ||
+                    m.starts_with(&model_name)
+                });
+                
+                if let Some(config) = cloud_config {
+                    if app.api_keys.contains_key(&model_name) {
+                        app.model = model_name.clone();
+                        let display_name = config.display_name.clone();
+                        app.status_message = Some(format!("🔄 Switched to cloud model: {}", display_name));
+                        let response = format!("🔄 Switched to cloud model: {}\n", display_name);
+                        let _ = tx.send(response);
+                    } else {
+                        let msg = format!("❌ No API key found for {} in {}\nAdd a line: {}:your_key_here", 
+                            config.display_name, CONFIG_FILE, model_name);
+                        app.status_message = Some(msg.clone());
+                        let _ = tx.send(msg);
+                    }
+                } else if let Some(found) = found_model {
+                    app.model = found.clone();
+                    let found_clone = found.clone();
+                    app.status_message = Some(format!("🔄 Switched to model: {}", found_clone));
+                    let response = format!("🔄 Switched to model: {}\n", found_clone);
+                    let _ = tx.send(response);
+                } else {
+                    let models_list = app.models.join(", ");
+                    let msg = format!("❌ Model not found: {}. Available: {}", model_name, models_list);
+                    app.status_message = Some(msg.clone());
+                    let _ = tx.send(msg);
+                }
+            }
+            true
+        }
+        _ => false,
     }
 }
 
@@ -1542,6 +1655,7 @@ fn render_about_dialog<B: Backend>(f: &mut Frame<B>, app: &App) {
         Line::from("  • Cloud models: DeepSeek, Mistral"),
         Line::from("  • Tool calling (list_directory, read_file)"),
         Line::from("  • Agent loop with multi-turn tool execution"),
+        Line::from("  • Full conversation context"),
         Line::from("  • Streaming responses"),
         Line::from("  • Markdown rendering"),
         Line::from("  • Mouse support"),
@@ -1607,6 +1721,7 @@ fn ui<B: Backend>(f: &mut Frame<B>, app: &mut App) {
             .wrap(Wrap { trim: true });
         f.render_widget(error_text, output_area);
     } else {
+        // Calculate the content height
         let content_height = if !app.output.is_empty() {
             let text = MarkdownRenderer::render(&app.output);
             text.height()
@@ -1616,8 +1731,10 @@ fn ui<B: Backend>(f: &mut Frame<B>, app: &mut App) {
         
         let viewport_height = output_area.height.saturating_sub(2) as usize;
         
+        // Update max scroll
         app.update_max_scroll(content_height, viewport_height);
         
+        // Get the visible portion of the text
         let visible_text = if !app.output.is_empty() {
             let full_text = MarkdownRenderer::render(&app.output);
             let start = app.scroll_offset.min(content_height.saturating_sub(1));
@@ -1634,11 +1751,13 @@ fn ui<B: Backend>(f: &mut Frame<B>, app: &mut App) {
             Text::default()
         };
         
+        // Render the visible text with the block
         let paragraph = Paragraph::new(visible_text)
             .block(output_block)
             .wrap(Wrap { trim: true });
         f.render_widget(paragraph, output_area);
         
+        // Add scrollbar if needed
         if content_height > viewport_height {
             let scrollbar_area = Rect {
                 x: output_area.x + output_area.width - 2,
@@ -1683,10 +1802,12 @@ fn ui<B: Backend>(f: &mut Frame<B>, app: &mut App) {
     } else {
         let cloud_indicator = if app.model.starts_with("cloud@") { "☁️ " } else { "" };
         let tools_indicator = if app.mode == AppMode::Agent { " 🔧" } else { "" };
-        format!("🤖 {}{}{} | Ctrl+S to save | F9 for menu | /help for commands", 
+        let context_indicator = if app.conversation.len() > 0 { " 📚" } else { "" };
+        format!("🤖 {}{}{}{} | Ctrl+S to save | F9 for menu | /help for commands | Scroll: PgUp/PgDn/Mouse", 
             cloud_indicator,
             app.get_model_display(), 
-            tools_indicator
+            tools_indicator,
+            context_indicator
         )
     };
     let status = Paragraph::new(status_text)
@@ -1774,7 +1895,11 @@ async fn run_app<B: Backend>(
 
         while let Ok(chunk) = rx.try_recv() {
             if chunk.is_empty() {
-                // Streaming complete
+                // Streaming complete - finalize the response
+                if !app.streaming_buffer.is_empty() {
+                    let response = app.streaming_buffer.clone();
+                    app.append_to_conversation("assistant", &response);
+                }
                 app.streaming_buffer.clear();
                 app.is_loading = false;
                 app.status_message = None;
@@ -1797,7 +1922,7 @@ async fn run_app<B: Backend>(
                 continue;
             }
 
-            // Otherwise, this is a response text chunk
+            // Otherwise, this is a response text chunk or command result
             if app.has_model_line {
                 // Update the model line with the new response text
                 app.streaming_buffer = chunk;
@@ -1830,6 +1955,15 @@ async fn run_app<B: Backend>(
                     app.output.push_str(&format!("{}: {}", model_display, app.streaming_buffer));
                 }
                 app.auto_scroll = true;
+                app.status_message = None;
+            } else {
+                // This is a command result (like /list or /context)
+                if !app.output.is_empty() && !app.output.ends_with('\n') {
+                    app.output.push('\n');
+                }
+                app.output.push_str(&chunk);
+                app.auto_scroll = true;
+                app.status_message = None;
             }
         }
 
@@ -1893,38 +2027,10 @@ async fn run_app<B: Backend>(
                             app.input.clear();
                             
                             if prompt.starts_with("/") {
-                                if let Some(response) = app.handle_command(&prompt) {
-                                    if !app.output.is_empty() && !app.output.ends_with('\n') {
-                                        app.output.push('\n');
-                                    }
-                                    app.output.push_str(&response);
-                                    app.auto_scroll = true;
-                                    
-                                    if prompt == "/list" {
-                                        let client = ollama_client.clone();
-                                        let tx = tx_clone.clone();
-                                        let cloud_models = app.get_cloud_models();
-                                        tokio::spawn(async move {
-                                            match client.list_models().await {
-                                                Ok(models) => {
-                                                    let mut response = "📋 Available models:\n\n".to_string();
-                                                    for model in &models {
-                                                        response.push_str(&format!("   {}\n", model));
-                                                    }
-                                                    for model in &cloud_models {
-                                                        response.push_str(&format!("☁️  {}\n", model));
-                                                    }
-                                                    response.push_str("\n☁️  = Cloud model (requires API key in config.keys)");
-                                                    let _ = tx.send(response);
-                                                }
-                                                Err(e) => {
-                                                    let _ = tx.send(format!("❌ Error listing models: {}", e));
-                                                }
-                                            }
-                                        });
-                                    }
+                                let handled = handle_command(&prompt, app, &ollama_client, &tx_clone).await;
+                                if handled {
+                                    continue;
                                 }
-                                continue;
                             }
                             
                             // Add user prompt to output without extra newline
@@ -1939,40 +2045,13 @@ async fn run_app<B: Backend>(
                             app.auto_scroll = true;
                             app.has_model_line = false;
                             
-                            let app_clone = app.clone();
+                            let mut app_clone = app.clone();
                             let tx = tx_clone.clone();
                             let prompt_clone = prompt.clone();
-                            let model_display = app.get_model_display();
                             
                             tokio::spawn(async move {
-                                if app_clone.mode == AppMode::Agent {
-                                    let response = app_clone.process_agent_request(prompt_clone).await;
-                                    let formatted = format!("{}: {}", model_display, response);
-                                    let _ = tx.send(formatted);
-                                } else {
-                                    if app_clone.is_cloud_model(&app_clone.model) {
-                                        let response = app_clone.process_cloud_request(prompt_clone, &app_clone.model).await;
-                                        let formatted = format!("{}: {}", model_display, response);
-                                        let _ = tx.send(formatted);
-                                    } else {
-                                        // Send the model line first
-                                        let _ = tx.send(format!("MODEL_LINE:{}", model_display));
-                                        
-                                        // Now stream the response
-                                        match app_clone.ollama_client.generate_streaming(
-                                            &app_clone.model,
-                                            &prompt_clone,
-                                            tx.clone(),
-                                        ).await {
-                                            Ok(_) => {
-                                                let _ = tx.send("".to_string());
-                                            }
-                                            Err(e) => {
-                                                let _ = tx.send(format!("{}: ❌ Error: {}", model_display, e));
-                                            }
-                                        }
-                                    }
-                                }
+                                let response = app_clone.process_chat_request(prompt_clone, tx.clone()).await;
+                                let _ = tx.send(response);
                             });
                         }
                     }
