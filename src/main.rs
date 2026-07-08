@@ -1,10 +1,10 @@
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, MouseButton, MouseEventKind, poll},
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, MouseButton, MouseEventKind},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{
-    backend::{Backend, CrosstermBackend},
+    backend::CrosstermBackend,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
@@ -1257,7 +1257,7 @@ impl App {
             let response = match config.api_type {
                 CloudApiType::DeepSeek => {
                     for client in &self.deepseek_clients {
-                        match client.chat_with_context(self.conversation.clone(), tools).await {
+                        match client.chat_with_context(self.conversation.clone(), tools.clone()).await {
                             Ok(response) => {
                                 self.append_to_conversation("assistant", &response);
                                 return response;
@@ -1269,7 +1269,7 @@ impl App {
                 }
                 CloudApiType::Mistral => {
                     for client in &self.mistral_clients {
-                        match client.chat_with_context(self.conversation.clone(), tools).await {
+                        match client.chat_with_context(self.conversation.clone(), tools.clone()).await {
                             Ok(response) => {
                                 self.append_to_conversation("assistant", &response);
                                 return response;
@@ -1518,7 +1518,7 @@ async fn handle_command(
 
 // ============ UI RENDERING ============
 
-fn render_menu_bar<B: Backend>(f: &mut Frame<B>, app: &mut App, area: Rect) {
+fn render_menu_bar(f: &mut Frame, app: &mut App, area: Rect) {
     app.menu.menu_bar_rect = area;
     
     let menu_labels = vec!["File", "Options", "Help"];
@@ -1565,12 +1565,12 @@ fn render_menu_bar<B: Backend>(f: &mut Frame<B>, app: &mut App, area: Rect) {
     }
 }
 
-fn render_menu_popup<B: Backend>(f: &mut Frame<B>, app: &App) {
+fn render_menu_popup(f: &mut Frame, app: &App) {
     if !app.menu.active {
         return;
     }
 
-    let area = f.size();
+    let area = f.area();
     let menu_index = app.menu.selected_menu;
     
     let (menu_x, menu_y) = if menu_index < app.menu.menu_positions.len() {
@@ -1617,12 +1617,12 @@ fn render_menu_popup<B: Backend>(f: &mut Frame<B>, app: &App) {
     f.render_widget(paragraph, popup_area);
 }
 
-fn render_about_dialog<B: Backend>(f: &mut Frame<B>, app: &App) {
+fn render_about_dialog(f: &mut Frame, app: &App) {
     if !app.show_about {
         return;
     }
 
-    let area = f.size();
+    let area = f.area();
     
     let dialog_width = (area.width * 2 / 5).min(50);
     let dialog_height = 13;
@@ -1683,7 +1683,7 @@ fn render_about_dialog<B: Backend>(f: &mut Frame<B>, app: &App) {
     f.render_widget(paragraph, dialog_area);
 }
 
-fn ui<B: Backend>(f: &mut Frame<B>, app: &mut App) {
+fn ui(f: &mut Frame, app: &mut App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .margin(1)
@@ -1693,7 +1693,7 @@ fn ui<B: Backend>(f: &mut Frame<B>, app: &mut App) {
             Constraint::Length(3),  // Input
             Constraint::Length(1),  // Status bar
         ].as_ref())
-        .split(f.size());
+        .split(f.area());
 
     render_menu_bar(f, app, chunks[0]);
 
@@ -1721,7 +1721,6 @@ fn ui<B: Backend>(f: &mut Frame<B>, app: &mut App) {
             .wrap(Wrap { trim: true });
         f.render_widget(error_text, output_area);
     } else {
-        // Calculate the content height
         let content_height = if !app.output.is_empty() {
             let text = MarkdownRenderer::render(&app.output);
             text.height()
@@ -1731,10 +1730,8 @@ fn ui<B: Backend>(f: &mut Frame<B>, app: &mut App) {
         
         let viewport_height = output_area.height.saturating_sub(2) as usize;
         
-        // Update max scroll
         app.update_max_scroll(content_height, viewport_height);
         
-        // Get the visible portion of the text
         let visible_text = if !app.output.is_empty() {
             let full_text = MarkdownRenderer::render(&app.output);
             let start = app.scroll_offset.min(content_height.saturating_sub(1));
@@ -1751,13 +1748,11 @@ fn ui<B: Backend>(f: &mut Frame<B>, app: &mut App) {
             Text::default()
         };
         
-        // Render the visible text with the block
         let paragraph = Paragraph::new(visible_text)
             .block(output_block)
             .wrap(Wrap { trim: true });
         f.render_widget(paragraph, output_area);
         
-        // Add scrollbar if needed
         if content_height > viewport_height {
             let scrollbar_area = Rect {
                 x: output_area.x + output_area.width - 2,
@@ -1767,8 +1762,8 @@ fn ui<B: Backend>(f: &mut Frame<B>, app: &mut App) {
             };
             
             let mut scrollbar_state = ScrollbarState::default()
-                .content_length(content_height as u16)
-                .position(app.scroll_offset as u16);
+                .content_length(content_height)
+                .position(app.scroll_offset);
             
             f.render_stateful_widget(
                 Scrollbar::default()
@@ -1802,7 +1797,7 @@ fn ui<B: Backend>(f: &mut Frame<B>, app: &mut App) {
     } else {
         let cloud_indicator = if app.model.starts_with("cloud@") { "☁️ " } else { "" };
         let tools_indicator = if app.mode == AppMode::Agent { " 🔧" } else { "" };
-        let context_indicator = if app.conversation.len() > 0 { " 📚" } else { "" };
+        let context_indicator = if !app.conversation.is_empty() { " 📚" } else { "" };
         format!("🤖 {}{}{}{} | Ctrl+S to save | F9 for menu | /help for commands | Scroll: PgUp/PgDn/Mouse", 
             cloud_indicator,
             app.get_model_display(), 
@@ -1821,7 +1816,7 @@ fn ui<B: Backend>(f: &mut Frame<B>, app: &mut App) {
     if !app.menu.active && !app.show_about {
         let cursor_x = chunks[2].x + 1 + app.input.len() as u16;
         let cursor_y = chunks[2].y + 1;
-        f.set_cursor(cursor_x, cursor_y);
+        f.set_cursor_position((cursor_x, cursor_y));
     }
 }
 
@@ -1881,8 +1876,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn run_app<B: Backend>(
-    terminal: &mut Terminal<B>,
+
+async fn run_app(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App,
     rx: &mut mpsc::UnboundedReceiver<String>,
     ollama_client: OllamaClient,
@@ -1895,7 +1891,6 @@ async fn run_app<B: Backend>(
 
         while let Ok(chunk) = rx.try_recv() {
             if chunk.is_empty() {
-                // Streaming complete - finalize the response
                 if !app.streaming_buffer.is_empty() {
                     let response = app.streaming_buffer.clone();
                     app.append_to_conversation("assistant", &response);
@@ -1908,10 +1903,8 @@ async fn run_app<B: Backend>(
                 continue;
             }
 
-            // Check if this is a model line message
             if chunk.starts_with("MODEL_LINE:") {
                 let model_name = chunk.strip_prefix("MODEL_LINE:").unwrap_or("").to_string();
-                // Add the model name line to the output
                 let new_line = format!("{}: ", model_name);
                 if !app.output.is_empty() && !app.output.ends_with('\n') {
                     app.output.push('\n');
@@ -1922,14 +1915,11 @@ async fn run_app<B: Backend>(
                 continue;
             }
 
-            // Otherwise, this is a response text chunk or command result
             if app.has_model_line {
-                // Update the model line with the new response text
                 app.streaming_buffer = chunk;
                 let model_display = app.get_model_display();
                 let model_prefix = format!("{}:", model_display);
                 
-                // Find the LAST occurrence of the model prefix (the current response)
                 let lines: Vec<&str> = app.output.lines().collect();
                 let mut model_line_index = None;
                 for (i, line) in lines.iter().enumerate().rev() {
@@ -1940,7 +1930,6 @@ async fn run_app<B: Backend>(
                 }
                 
                 if let Some(idx) = model_line_index {
-                    // Keep lines before the model line, then replace from idx onward with the new response
                     let mut new_output = lines[..idx].join("\n");
                     if !new_output.is_empty() {
                         new_output.push('\n');
@@ -1948,7 +1937,6 @@ async fn run_app<B: Backend>(
                     new_output.push_str(&format!("{}: {}", model_display, app.streaming_buffer));
                     app.output = new_output;
                 } else {
-                    // Should not happen, but fallback
                     if !app.output.is_empty() && !app.output.ends_with('\n') {
                         app.output.push('\n');
                     }
@@ -1957,7 +1945,6 @@ async fn run_app<B: Backend>(
                 app.auto_scroll = true;
                 app.status_message = None;
             } else {
-                // This is a command result (like /list or /context)
                 if !app.output.is_empty() && !app.output.ends_with('\n') {
                     app.output.push('\n');
                 }
@@ -1967,7 +1954,7 @@ async fn run_app<B: Backend>(
             }
         }
 
-        if poll(Duration::from_millis(50))? {
+        if event::poll(Duration::from_millis(10))? {
             if let Event::Key(key) = event::read()? {
                 match key.code {
                     KeyCode::Char('q') if key.modifiers == crossterm::event::KeyModifiers::CONTROL => {
@@ -2026,14 +2013,13 @@ async fn run_app<B: Backend>(
                             let prompt = app.input.clone();
                             app.input.clear();
                             
-                            if prompt.starts_with("/") {
+                            if prompt.starts_with('/') {
                                 let handled = handle_command(&prompt, app, &ollama_client, &tx_clone).await;
                                 if handled {
                                     continue;
                                 }
                             }
                             
-                            // Add user prompt to output without extra newline
                             if !app.output.is_empty() && !app.output.ends_with('\n') {
                                 app.output.push('\n');
                             }
@@ -2121,7 +2107,8 @@ async fn run_app<B: Backend>(
                     }
                     MouseEventKind::Down(MouseButton::Left) => {
                         if app.show_about {
-                            let area = terminal.size()?;
+                            // Use the terminal's current frame area
+                            let area = terminal.get_frame().area();
                             let dialog_width = (area.width * 2 / 5).min(50);
                             let dialog_height = 13;
                             let dialog_x = (area.width - dialog_width) / 2;
