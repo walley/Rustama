@@ -23,6 +23,20 @@ use std::process;
 use futures_util::stream::StreamExt;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use chrono::Local;
+
+// ============ LOGGING ============
+
+fn log_message(msg: &str) {
+    let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S%.3f").to_string();
+    let log_entry = format!("[{}] {}\n", timestamp, msg);
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("output.log")
+        .unwrap_or_else(|_| fs::File::create("output.log").unwrap());
+    let _ = file.write_all(log_entry.as_bytes());
+}
 
 // ============ CONFIG FILE ============
 
@@ -39,7 +53,6 @@ fn load_api_keys() -> HashMap<String, String> {
                 if line.is_empty() || line.starts_with('#') {
                     continue;
                 }
-                // Format: "cloud@model:key"
                 if let Some((model, key)) = line.split_once(':') {
                     keys.insert(model.trim().to_string(), key.trim().to_string());
                 }
@@ -276,12 +289,12 @@ struct OllamaFunction {
     arguments: serde_json::Value,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct OllamaChatResponse {
     message: OllamaResponseMessage,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct OllamaResponseMessage {
     role: String,
     content: Option<String>,
@@ -335,6 +348,8 @@ impl OllamaClient {
             request_body["tools"] = serde_json::Value::Array(tool_definitions);
         }
 
+        log_message(&format!("SENDING to Ollama: {}", serde_json::to_string_pretty(&request_body).unwrap_or_default()));
+
         let response = self
             .client
             .post(&url)
@@ -344,10 +359,12 @@ impl OllamaClient {
 
         if !response.status().is_success() {
             let error_text = response.text().await?;
+            log_message(&format!("Ollama ERROR: {}", error_text));
             return Err(format!("Ollama API error: {}", error_text).into());
         }
 
         let chat_response: OllamaChatResponse = response.json().await?;
+        log_message(&format!("RECEIVED from Ollama: {}", serde_json::to_string_pretty(&chat_response).unwrap_or_default()));
         Ok(chat_response)
     }
 
@@ -356,7 +373,7 @@ impl OllamaClient {
         model: &str,
         messages: Vec<OllamaChatMessage>,
         tx: mpsc::UnboundedSender<String>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<String, Box<dyn std::error::Error>> {
         let url = format!("{}/api/chat", self.base_url);
         
         let request_body = serde_json::json!({
@@ -364,6 +381,8 @@ impl OllamaClient {
             "messages": messages,
             "stream": true,
         });
+
+        log_message(&format!("STREAMING to Ollama: {}", serde_json::to_string_pretty(&request_body).unwrap_or_default()));
 
         let response = self
             .client
@@ -374,6 +393,7 @@ impl OllamaClient {
 
         if !response.status().is_success() {
             let error_text = response.text().await?;
+            log_message(&format!("Ollama STREAM ERROR: {}", error_text));
             return Err(format!("Ollama API error: {}", error_text).into());
         }
 
@@ -389,24 +409,27 @@ impl OllamaClient {
                 if line.is_empty() {
                     continue;
                 }
+                log_message(&format!("STREAM chunk: {}", line));
                 if let Ok(resp) = serde_json::from_str::<serde_json::Value>(line) {
                     if let Some(response) = resp.get("message").and_then(|m| m.get("content")).and_then(|c| c.as_str()) {
                         result.push_str(response);
-                        // Send only the accumulated response text
                         let _ = tx.send(result.clone());
                     }
                     if let Some(done) = resp.get("done").and_then(|d| d.as_bool()) {
                         if done {
-                            // Send empty message to signal completion
-                            let _ = tx.send(String::new());
-                            return Ok(());
+                            log_message(&format!("STREAM complete, final: {}", result));
+                            // Send the final response through the channel
+                            let _ = tx.send(result.clone());
+                            // Send DONE marker
+                            let _ = tx.send("__DONE__".to_string());
+                            return Ok(result);
                         }
                     }
                 }
             }
         }
 
-        Ok(())
+        Ok(result)
     }
 
     async fn list_models(&self) -> Result<Vec<String>, Box<dyn std::error::Error>> {
@@ -828,7 +851,6 @@ impl ToolSystem {
 
 // ============ CLOUD API CLIENTS ============
 
-// DeepSeek Client
 #[derive(Clone)]
 struct DeepSeekClient {
     client: reqwest::Client,
@@ -869,7 +891,6 @@ impl DeepSeekClient {
             })
         }).collect();
         
-        // Convert our messages to OpenAI/DeepSeek format
         let deepseek_messages: Vec<serde_json::Value> = messages.iter().map(|msg| {
             serde_json::json!({
                 "role": msg.role,
@@ -885,6 +906,8 @@ impl DeepSeekClient {
             "stream": false,
         });
 
+        log_message(&format!("DEEPSEEK sending: {}", serde_json::to_string_pretty(&request_body).unwrap_or_default()));
+
         let response = self
             .client
             .post(&url)
@@ -896,10 +919,12 @@ impl DeepSeekClient {
 
         if !response.status().is_success() {
             let error_text = response.text().await?;
+            log_message(&format!("DEEPSEEK error: {}", error_text));
             return Err(format!("DeepSeek API error: {}", error_text).into());
         }
 
         let json_response: serde_json::Value = response.json().await?;
+        log_message(&format!("DEEPSEEK received: {}", serde_json::to_string_pretty(&json_response).unwrap_or_default()));
         
         if let Some(tool_calls) = json_response["choices"][0]["message"]["tool_calls"].as_array() {
             if !tool_calls.is_empty() {
@@ -930,7 +955,6 @@ impl DeepSeekClient {
     }
 }
 
-// Mistral Client
 #[derive(Clone)]
 struct MistralClient {
     client: reqwest::Client,
@@ -986,6 +1010,8 @@ impl MistralClient {
             "stream": false,
         });
 
+        log_message(&format!("MISTRAL sending: {}", serde_json::to_string_pretty(&request_body).unwrap_or_default()));
+
         let response = self
             .client
             .post(&url)
@@ -997,10 +1023,12 @@ impl MistralClient {
 
         if !response.status().is_success() {
             let error_text = response.text().await?;
+            log_message(&format!("MISTRAL error: {}", error_text));
             return Err(format!("Mistral API error: {}", error_text).into());
         }
 
         let json_response: serde_json::Value = response.json().await?;
+        log_message(&format!("MISTRAL received: {}", serde_json::to_string_pretty(&json_response).unwrap_or_default()));
         
         if let Some(tool_calls) = json_response["choices"][0]["message"]["tool_calls"].as_array() {
             if !tool_calls.is_empty() {
@@ -1058,6 +1086,7 @@ struct App {
     streaming_buffer: String,
     has_model_line: bool,
     conversation: Vec<OllamaChatMessage>,
+    pending_response: String,
 }
 
 impl App {
@@ -1103,6 +1132,7 @@ impl App {
             streaming_buffer: String::new(),
             has_model_line: false,
             conversation: Vec::new(),
+            pending_response: String::new(),
         }
     }
 
@@ -1230,27 +1260,29 @@ impl App {
     }
 
     fn append_to_conversation(&mut self, role: &str, content: &str) {
-        // Don't add empty messages
         if content.is_empty() {
             return;
         }
-        self.conversation.push(OllamaChatMessage {
+        log_message(&format!("APPEND to conversation: role={}, content_len={}", role, content.len()));
+        let msg = OllamaChatMessage {
             role: role.to_string(),
             content: content.to_string(),
             tool_calls: None,
             tool_name: None,
-        });
-        // Limit conversation length to prevent memory issues
+        };
+        self.conversation.push(msg);
         if self.conversation.len() > 50 {
             self.conversation.drain(0..10);
         }
+        log_message(&format!("CONVERSATION now has {} messages", self.conversation.len()));
     }
 
     async fn process_chat_request(&mut self, prompt: String, tx: mpsc::UnboundedSender<String>) -> String {
+        log_message(&format!("PROCESS CHAT: {}", prompt));
+        
         // Add user message to conversation
         self.append_to_conversation("user", &prompt);
 
-        // Check if this is a cloud model
         if self.is_cloud_model(&self.model) {
             let config = match self.get_cloud_config(&self.model) {
                 Some(c) => c,
@@ -1288,53 +1320,43 @@ impl App {
                     "❌ No Mistral client configured".to_string()
                 }
             };
-            // Add error message to conversation
             self.append_to_conversation("assistant", &response);
             return response;
         }
 
-        // For local Ollama models
         if self.mode == AppMode::Agent {
             return self.process_agent_request().await;
         }
 
-        // Chat mode - use streaming with context
         let model_display = self.get_model_display();
-        
-        // Reset streaming buffer for this request
         self.streaming_buffer.clear();
-        
-        // Send the model line first
         let _ = tx.send(format!("MODEL_LINE:{}", model_display));
         
-        // Now stream the response
+        // Store the final response
+        let mut final_response = String::new();
+        
         match self.ollama_client.generate_streaming(
             &self.model,
             self.conversation.clone(),
             tx.clone(),
         ).await {
-            Ok(_) => {
-                // Get the final response from the streaming buffer
-                let response = self.streaming_buffer.clone();
-                if !response.is_empty() {
-                    self.append_to_conversation("assistant", &response);
+            Ok(response) => {
+                final_response = response;
+                log_message(&format!("STREAMING complete, response_len={}", final_response.len()));
+                if !final_response.is_empty() {
+                    self.append_to_conversation("assistant", &final_response);
                 }
-                // Send empty message to signal completion
-                let _ = tx.send(String::new());
-                response
+                final_response
             }
             Err(e) => {
                 let error_msg = format!("❌ Error: {}", e);
                 self.append_to_conversation("assistant", &error_msg);
-                let _ = tx.send(error_msg.clone());
                 error_msg
             }
         }
     }
 
     async fn process_agent_request(&mut self) -> String {
-        // Note: user message is already added in process_chat_request
-
         let tools = vec![
             Tool::list_directory(),
             Tool::read_file(),
@@ -1368,7 +1390,6 @@ impl App {
 
             if let Some(tool_calls) = response_message.tool_calls {
                 if !tool_calls.is_empty() {
-                    // Add assistant message with tool calls
                     self.conversation.push(OllamaChatMessage {
                         role: "assistant".to_string(),
                         content: String::new(),
@@ -1407,7 +1428,6 @@ impl App {
                 }
             }
 
-            // No tool calls, we have the final answer
             if let Some(content) = response_message.content {
                 self.append_to_conversation("assistant", &content);
                 return content;
@@ -1465,6 +1485,7 @@ async fn handle_command(
             true
         }
         "/context" => {
+            log_message(&format!("CONTEXT command - conversation len: {}", app.conversation.len()));
             if app.conversation.is_empty() {
                 let response = "📭 No conversation context yet. Start chatting to build context!".to_string();
                 let _ = tx.send(response);
@@ -1652,8 +1673,8 @@ fn render_about_dialog(f: &mut Frame, app: &App) {
 
     let area = f.area();
     
-    let dialog_width = (area.width * 2 / 5).min(50);
-    let dialog_height = 13;
+    let dialog_width = (area.width * 2 / 5).min(40);
+    let dialog_height = 8;
     
     let dialog_x = (area.width - dialog_width) / 2;
     let dialog_y = (area.height - dialog_height) / 2;
@@ -1673,25 +1694,10 @@ fn render_about_dialog(f: &mut Frame, app: &App) {
             Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
-        Line::from("Version: 0.9.0"),
+        Line::from("Version: 0.6.0"),
         Line::from(""),
-        Line::from("A terminal-based client for Ollama with"),
-        Line::from("cloud model support and tool calling."),
-        Line::from(""),
-        Line::from("Features:"),
-        Line::from("  • Chat & Agent modes"),
-        Line::from("  • Cloud models: DeepSeek, Mistral"),
-        Line::from("  • Tool calling (list_directory, read_file)"),
-        Line::from("  • Agent loop with multi-turn tool execution"),
-        Line::from("  • Full conversation context"),
-        Line::from("  • Streaming responses"),
-        Line::from("  • Markdown rendering"),
-        Line::from("  • Mouse support"),
-        Line::from("  • Prompt history"),
-        Line::from(""),
-        Line::from("Cloud API Keys:"),
-        Line::from("  • Add keys to config.keys file"),
-        Line::from("  • Format: cloud@model:your_api_key"),
+        Line::from("A terminal-based client for Ollama"),
+        Line::from("with cloud model support."),
         Line::from(""),
         Line::from(Span::styled(
             "Press Enter or ESC to close",
@@ -1716,10 +1722,10 @@ fn ui(f: &mut Frame, app: &mut App) {
         .direction(Direction::Vertical)
         .margin(1)
         .constraints([
-            Constraint::Length(1),  // Menu bar
-            Constraint::Min(1),     // Output
-            Constraint::Length(3),  // Input
-            Constraint::Length(1),  // Status bar
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(3),
+            Constraint::Length(1),
         ].as_ref())
         .split(f.area());
 
@@ -1826,7 +1832,7 @@ fn ui(f: &mut Frame, app: &mut App) {
         let cloud_indicator = if app.model.starts_with("cloud@") { "☁️ " } else { "" };
         let tools_indicator = if app.mode == AppMode::Agent { " 🔧" } else { "" };
         let context_indicator = if !app.conversation.is_empty() { " 📚" } else { "" };
-        format!("🤖 {}{}{}{} | Ctrl+S to save | F9 for menu | /help for commands | Scroll: PgUp/PgDn/Mouse", 
+        format!("🤖 {}{}{}{} | Ctrl+S to save | F9 for menu | /help for commands", 
             cloud_indicator,
             app.get_model_display(), 
             tools_indicator,
@@ -1852,6 +1858,7 @@ fn ui(f: &mut Frame, app: &mut App) {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    log_message("=== APP STARTED ===");
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
@@ -1887,7 +1894,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     
-    // Wrap app in Arc<Mutex> for sharing with async tasks
     let app = Arc::new(Mutex::new(app));
     let app_clone = app.clone();
     
@@ -1905,6 +1911,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("{:?}", err);
     }
 
+    log_message("=== APP EXITED ===");
     Ok(())
 }
 
@@ -1918,7 +1925,6 @@ async fn run_app(
     let tx_clone = tx.clone();
     
     loop {
-        // Draw the UI - lock the app for the duration
         {
             let mut app = app_arc.lock().await;
             terminal.draw(|f| ui(f, &mut *app))?;
@@ -1927,21 +1933,9 @@ async fn run_app(
         while let Ok(chunk) = rx.try_recv() {
             let mut app = app_arc.lock().await;
             
-            if chunk.is_empty() {
-                // Streaming complete - finalize the response
-                if !app.streaming_buffer.is_empty() {
-                    // The response was already appended in process_chat_request
-                    // Just update the output display
-                    let response = app.streaming_buffer.clone();
-                    let model_display = app.get_model_display();
-                    // Check if the response is already in the output
-                    if !app.output.contains(&format!("{}: {}", model_display, response)) {
-                        if !app.output.is_empty() && !app.output.ends_with('\n') {
-                            app.output.push('\n');
-                        }
-                        app.output.push_str(&format!("{}: {}", model_display, response));
-                    }
-                }
+            // Check for the DONE marker
+            if chunk == "__DONE__" {
+                log_message("RECEIVED DONE marker");
                 app.streaming_buffer.clear();
                 app.is_loading = false;
                 app.status_message = None;
@@ -1953,7 +1947,6 @@ async fn run_app(
             // Check if this is a model line message
             if chunk.starts_with("MODEL_LINE:") {
                 let model_name = chunk.strip_prefix("MODEL_LINE:").unwrap_or("").to_string();
-                // Add the model name line to the output
                 let new_line = format!("{}: ", model_name);
                 if !app.output.is_empty() && !app.output.ends_with('\n') {
                     app.output.push('\n');
@@ -1964,7 +1957,7 @@ async fn run_app(
                 continue;
             }
 
-            // Otherwise, this is a response text chunk or command result
+            // This is a response chunk or command result
             if app.has_model_line {
                 // Update the model line with the new response text
                 let chunk_clone = chunk.clone();
@@ -1972,7 +1965,6 @@ async fn run_app(
                 let model_display = app.get_model_display();
                 let model_prefix = format!("{}:", model_display);
                 
-                // Find the LAST occurrence of the model prefix (the current response)
                 let lines: Vec<&str> = app.output.lines().collect();
                 let mut model_line_index = None;
                 for (i, line) in lines.iter().enumerate().rev() {
@@ -1982,11 +1974,9 @@ async fn run_app(
                     }
                 }
                 
-                // Clone the streaming buffer before using it in format!
                 let streaming_content = app.streaming_buffer.clone();
                 
                 if let Some(idx) = model_line_index {
-                    // Keep lines before the model line, then replace from idx onward with the new response
                     let mut new_output = lines[..idx].join("\n");
                     if !new_output.is_empty() {
                         new_output.push('\n');
@@ -1994,7 +1984,6 @@ async fn run_app(
                     new_output.push_str(&format!("{}: {}", model_display, streaming_content));
                     app.output = new_output;
                 } else {
-                    // Should not happen, but fallback
                     if !app.output.is_empty() && !app.output.ends_with('\n') {
                         app.output.push('\n');
                     }
@@ -2003,7 +1992,8 @@ async fn run_app(
                 app.auto_scroll = true;
                 app.status_message = None;
             } else {
-                // This is a command result (like /list or /context)
+                // Command result
+                log_message(&format!("Command result: {}", chunk));
                 if !app.output.is_empty() && !app.output.ends_with('\n') {
                     app.output.push('\n');
                 }
@@ -2063,7 +2053,6 @@ async fn run_app(
                             app.show_about = false;
                         } else if app.menu.active {
                             if app.menu.selected_subitem > 0 {
-                                // Clone the menu to avoid borrow checker issues
                                 let menu = &mut app.menu;
                                 let menu_index = menu.selected_menu;
                                 let sub_index = menu.selected_subitem - 1;
@@ -2098,7 +2087,9 @@ async fn run_app(
                             
                             tokio::spawn(async move {
                                 let mut app = app_clone.lock().await;
+                                log_message(&format!("SPAWNED task for: {}", prompt_clone));
                                 let response = app.process_chat_request(prompt_clone, tx.clone()).await;
+                                log_message(&format!("Task complete, sending response"));
                                 let _ = tx.send(response);
                             });
                         }
@@ -2171,8 +2162,8 @@ async fn run_app(
                     MouseEventKind::Down(MouseButton::Left) => {
                         if app.show_about {
                             let area = terminal.get_frame().area();
-                            let dialog_width = (area.width * 2 / 5).min(50);
-                            let dialog_height = 13;
+                            let dialog_width = (area.width * 2 / 5).min(40);
+                            let dialog_height = 8;
                             let dialog_x = (area.width - dialog_width) / 2;
                             let dialog_y = (area.height - dialog_height) / 2;
                             
