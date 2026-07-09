@@ -24,6 +24,7 @@ use futures_util::stream::StreamExt;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use chrono::Local;
+use std::process::Command;
 
 // ============ LOGGING ============
 
@@ -164,6 +165,28 @@ impl Tool {
             },
         }
     }
+
+    fn execute_bash() -> Self {
+        Tool {
+            name: "execute_bash".to_string(),
+            description: "Execute a bash command (requires user confirmation)".to_string(),
+            parameters: ToolParameters {
+                param_type: "object".to_string(),
+                properties: serde_json::json!({
+                    "command": {
+                        "type": "string",
+                        "description": "The bash command to execute"
+                    },
+                    "working_directory": {
+                        "type": "string",
+                        "description": "Optional working directory for the command",
+                        "default": "."
+                    }
+                }),
+                required: vec!["command".to_string()],
+            },
+        }
+    }
 }
 
 // ============ TOOL EXECUTION ENGINE ==========
@@ -173,6 +196,7 @@ pub struct ToolResult {
     pub success: bool,
     pub output: String,
     pub error: Option<String>,
+    pub requires_confirmation: bool,
 }
 
 struct ToolEngine;
@@ -182,10 +206,12 @@ impl ToolEngine {
         match tool_name {
             "list_directory" => Self::list_directory(arguments),
             "read_file" => Self::read_file(arguments),
+            "execute_bash" => Self::execute_bash(arguments),
             _ => ToolResult {
                 success: false,
                 output: String::new(),
                 error: Some(format!("Unknown tool: {}", tool_name)),
+                requires_confirmation: false,
             }
         }
     }
@@ -233,12 +259,14 @@ impl ToolEngine {
                     success: true,
                     output,
                     error: None,
+                    requires_confirmation: false,
                 }
             }
             Err(e) => ToolResult {
                 success: false,
                 output: String::new(),
                 error: Some(format!("Failed to read directory: {}", e)),
+                requires_confirmation: false,
             }
         }
     }
@@ -255,12 +283,98 @@ impl ToolEngine {
                     success: true,
                     output,
                     error: None,
+                    requires_confirmation: false,
                 }
             }
             Err(e) => ToolResult {
                 success: false,
                 output: String::new(),
                 error: Some(format!("Failed to read file: {}", e)),
+                requires_confirmation: false,
+            }
+        }
+    }
+
+    fn execute_bash(args: serde_json::Value) -> ToolResult {
+        let command = args.get("command")
+            .and_then(|c| c.as_str())
+            .unwrap_or("");
+        
+        let working_dir = args.get("working_directory")
+            .and_then(|d| d.as_str())
+            .unwrap_or(".");
+        
+        if command.is_empty() {
+            return ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some("No command provided".to_string()),
+                requires_confirmation: false,
+            };
+        }
+
+        // Log the command execution attempt
+        log_message(&format!("EXECUTE_BASH: command='{}', cwd='{}'", command, working_dir));
+        
+        // Split the command into parts
+        let parts: Vec<&str> = command.split_whitespace().collect();
+        if parts.is_empty() {
+            return ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some("Empty command".to_string()),
+                requires_confirmation: false,
+            };
+        }
+
+        let cmd = parts[0];
+        let args = &parts[1..];
+
+        // Execute the command
+        let output = Command::new(cmd)
+            .args(args)
+            .current_dir(working_dir)
+            .output();
+        
+        match output {
+            Ok(output) => {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                
+                let mut result_output = String::new();
+                if !stdout.is_empty() {
+                    result_output.push_str(&stdout);
+                }
+                if !stderr.is_empty() {
+                    if !result_output.is_empty() {
+                        result_output.push('\n');
+                    }
+                    result_output.push_str(&format!("stderr: {}", stderr));
+                }
+                
+                if output.status.success() {
+                    ToolResult {
+                        success: true,
+                        output: result_output,
+                        error: None,
+                        requires_confirmation: true,
+                    }
+                } else {
+                    ToolResult {
+                        success: false,
+                        output: result_output,
+                        error: Some(format!("Command failed with exit code: {:?}", output.status.code())),
+                        requires_confirmation: true,
+                    }
+                }
+            }
+            Err(e) => {
+                ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!("Failed to execute command: {}", e)),
+                    requires_confirmation: false,
+                }
             }
         }
     }
@@ -418,9 +532,7 @@ impl OllamaClient {
                     if let Some(done) = resp.get("done").and_then(|d| d.as_bool()) {
                         if done {
                             log_message(&format!("STREAM complete, final: {}", result));
-                            // Send the final response through the channel
                             let _ = tx.send(result.clone());
-                            // Send DONE marker
                             let _ = tx.send("__DONE__".to_string());
                             return Ok(result);
                         }
@@ -1086,7 +1198,6 @@ struct App {
     streaming_buffer: String,
     has_model_line: bool,
     conversation: Vec<OllamaChatMessage>,
-    pending_response: String,
 }
 
 impl App {
@@ -1132,7 +1243,6 @@ impl App {
             streaming_buffer: String::new(),
             has_model_line: false,
             conversation: Vec::new(),
-            pending_response: String::new(),
         }
     }
 
@@ -1292,6 +1402,7 @@ impl App {
             let tools = vec![
                 Tool::list_directory(),
                 Tool::read_file(),
+                Tool::execute_bash(),
             ];
 
             let response = match config.api_type {
@@ -1332,7 +1443,6 @@ impl App {
         self.streaming_buffer.clear();
         let _ = tx.send(format!("MODEL_LINE:{}", model_display));
         
-        // Store the final response
         let mut final_response = String::new();
         
         match self.ollama_client.generate_streaming(
@@ -1360,6 +1470,7 @@ impl App {
         let tools = vec![
             Tool::list_directory(),
             Tool::read_file(),
+            Tool::execute_bash(),
         ];
 
         let max_iterations = 5;
@@ -1933,7 +2044,6 @@ async fn run_app(
         while let Ok(chunk) = rx.try_recv() {
             let mut app = app_arc.lock().await;
             
-            // Check for the DONE marker
             if chunk == "__DONE__" {
                 log_message("RECEIVED DONE marker");
                 app.streaming_buffer.clear();
@@ -1944,7 +2054,6 @@ async fn run_app(
                 continue;
             }
 
-            // Check if this is a model line message
             if chunk.starts_with("MODEL_LINE:") {
                 let model_name = chunk.strip_prefix("MODEL_LINE:").unwrap_or("").to_string();
                 let new_line = format!("{}: ", model_name);
@@ -1957,9 +2066,7 @@ async fn run_app(
                 continue;
             }
 
-            // This is a response chunk or command result
             if app.has_model_line {
-                // Update the model line with the new response text
                 let chunk_clone = chunk.clone();
                 app.streaming_buffer = chunk_clone;
                 let model_display = app.get_model_display();
@@ -1992,7 +2099,6 @@ async fn run_app(
                 app.auto_scroll = true;
                 app.status_message = None;
             } else {
-                // Command result
                 log_message(&format!("Command result: {}", chunk));
                 if !app.output.is_empty() && !app.output.ends_with('\n') {
                     app.output.push('\n');
