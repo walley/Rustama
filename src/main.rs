@@ -1561,7 +1561,7 @@ async fn handle_command(
 ) -> bool {
     match prompt {
         "/help" => {
-            let response = "📋 Available commands:\n\n/list - List available models\n/use <model> - Switch to a specific model\n/context - Show current conversation context\n/quit or /q or /exit - Quit the application\n/help - Show this help message".to_string();
+            let response = "📋 Available commands:\n\n/list - List available models\n/use <model> - Switch to a specific model\n/context - Show current conversation context\n/quit or /q or /exit - Exit the application\n/help - Show this help message";
             let _ = tx.send(response);
             true
         }
@@ -2109,241 +2109,255 @@ async fn run_app(
             }
         }
 
-        if event::poll(Duration::from_millis(50))? {
-            if let Event::Key(key) = event::read()? {
-                let mut app = app_arc.lock().await;
-                match key.code {
-                    KeyCode::Char('q') if key.modifiers == crossterm::event::KeyModifiers::CONTROL => {
-                        app.cleanup_and_exit();
-                    }
-                    KeyCode::Char('s') if key.modifiers == crossterm::event::KeyModifiers::CONTROL => {
-                        if !app.is_loading {
-                            app.save_output();
-                        }
-                    }
-                    KeyCode::F(9) => {
-                        app.menu.toggle();
-                        if app.menu.active {
-                            app.show_about = false;
-                        }
-                    }
-                    KeyCode::Esc => {
-                        if app.menu.active {
-                            app.menu.deactivate();
-                        } else if app.show_about {
-                            app.show_about = false;
-                        }
-                    }
-                    KeyCode::PageUp => {
-                        if app.scroll_offset > 0 {
-                            app.scroll_offset = app.scroll_offset.saturating_sub(10);
-                            app.auto_scroll = false;
-                        }
-                    }
-                    KeyCode::PageDown => {
-                        if app.scroll_offset < app.max_scroll {
-                            app.scroll_offset = (app.scroll_offset + 10).min(app.max_scroll);
-                            app.auto_scroll = false;
-                        }
-                    }
-                    KeyCode::Home => {
-                        app.scroll_offset = 0;
-                        app.auto_scroll = false;
-                    }
-                    KeyCode::End => {
-                        app.scroll_offset = app.max_scroll;
-                        app.auto_scroll = true;
-                    }
-                    KeyCode::Enter => {
-                        if app.show_about {
-                            app.show_about = false;
-                        } else if app.menu.active {
-                            if app.menu.selected_subitem > 0 {
-                                let menu = &mut app.menu;
-                                let menu_index = menu.selected_menu;
-                                let sub_index = menu.selected_subitem - 1;
-                                let action = menu.select_subitem(menu_index, sub_index);
-                                app.handle_menu_action(action);
+        // ===== FIX: Improved event handling =====
+        // Process ALL available events without blocking on individual reads
+        // Use a short timeout to prevent CPU spinning
+        if event::poll(Duration::from_millis(16))? {  // ~60 FPS
+            // Process up to 10 events per frame to avoid lag buildup
+            for _ in 0..10 {
+                match event::read() {
+                    Ok(Event::Key(key)) => {
+                        let mut app = app_arc.lock().await;
+                        match key.code {
+                            KeyCode::Char('q') if key.modifiers == crossterm::event::KeyModifiers::CONTROL => {
+                                app.cleanup_and_exit();
                             }
-                        } else if !app.input.is_empty() && !app.is_loading {
-                            let prompt = app.input.clone();
-                            app.input.clear();
-                            
-                            if prompt.starts_with('/') {
-                                let handled = handle_command(&prompt, &mut app, &ollama_client, &tx_clone).await;
-                                if handled {
-                                    continue;
+                            KeyCode::Char('s') if key.modifiers == crossterm::event::KeyModifiers::CONTROL => {
+                                if !app.is_loading {
+                                    app.save_output();
                                 }
                             }
-                            
-                            if !app.output.is_empty() && !app.output.ends_with('\n') {
-                                app.output.push('\n');
+                            KeyCode::F(9) => {
+                                app.menu.toggle();
+                                if app.menu.active {
+                                    app.show_about = false;
+                                }
                             }
-                            app.output.push_str(&format!("USER: {}", prompt));
-                            
-                            app.add_to_history(prompt.clone());
-                            app.is_loading = true;
-                            app.status_message = Some("⏳ Processing request...".to_string());
-                            app.auto_scroll = true;
-                            app.has_model_line = false;
-                            
-                            let app_clone = app_arc.clone();
-                            let tx = tx_clone.clone();
-                            let prompt_clone = prompt.clone();
-                            
-                            tokio::spawn(async move {
-                                let mut app = app_clone.lock().await;
-                                log_message(&format!("SPAWNED task for: {}", prompt_clone));
-                                let response = app.process_chat_request(prompt_clone, tx.clone()).await;
-                                log_message(&format!("Task complete, sending response"));
-                                let _ = tx.send(response);
-                            });
-                        }
-                    }
-                    KeyCode::Char(c) => {
-                        if !app.menu.active && !app.show_about {
-                            app.input.push(c);
-                        }
-                    }
-                    KeyCode::Backspace => {
-                        if !app.menu.active && !app.show_about {
-                            app.input.pop();
-                        }
-                    }
-                    KeyCode::Up => {
-                        if app.menu.active {
-                            app.menu.navigate(-1);
-                        } else if !app.show_about && !app.is_loading {
-                            if let Some(prev) = app.previous_history() {
-                                app.input = prev;
+                            KeyCode::Esc => {
+                                if app.menu.active {
+                                    app.menu.deactivate();
+                                } else if app.show_about {
+                                    app.show_about = false;
+                                }
                             }
-                        }
-                    }
-                    KeyCode::Down => {
-                        if app.menu.active {
-                            if app.menu.selected_subitem == 0 {
-                                app.menu.selected_subitem = 1;
-                            } else {
-                                app.menu.navigate(1);
+                            KeyCode::PageUp => {
+                                if app.scroll_offset > 0 {
+                                    app.scroll_offset = app.scroll_offset.saturating_sub(10);
+                                    app.auto_scroll = false;
+                                }
                             }
-                        } else if !app.show_about && !app.is_loading {
-                            if let Some(next) = app.next_history() {
-                                app.input = next;
+                            KeyCode::PageDown => {
+                                if app.scroll_offset < app.max_scroll {
+                                    app.scroll_offset = (app.scroll_offset + 10).min(app.max_scroll);
+                                    app.auto_scroll = false;
+                                }
                             }
-                        }
-                    }
-                    KeyCode::Left => {
-                        if app.menu.active {
-                            app.menu.selected_subitem = 0;
-                            app.menu.navigate(-1);
-                        }
-                    }
-                    KeyCode::Right => {
-                        if app.menu.active {
-                            app.menu.selected_subitem = 0;
-                            app.menu.navigate(1);
-                        }
-                    }
-                    _ => {}
-                }
-            } else if let Event::Mouse(mouse) = event::read()? {
-                let mut app = app_arc.lock().await;
-                match mouse.kind {
-                    MouseEventKind::ScrollUp => {
-                        if app.menu.active {
-                            app.menu.navigate(-1);
-                        } else if !app.show_about && app.scroll_offset > 0 {
-                            app.scroll_offset = app.scroll_offset.saturating_sub(3);
-                            app.auto_scroll = false;
-                        }
-                    }
-                    MouseEventKind::ScrollDown => {
-                        if app.menu.active {
-                            app.menu.navigate(1);
-                        } else if !app.show_about && app.scroll_offset < app.max_scroll {
-                            app.scroll_offset = (app.scroll_offset + 3).min(app.max_scroll);
-                            app.auto_scroll = false;
-                        }
-                    }
-                    MouseEventKind::Down(MouseButton::Left) => {
-                        if app.show_about {
-                            let area = terminal.get_frame().area();
-                            let dialog_width = (area.width * 2 / 5).min(40);
-                            let dialog_height = 8;
-                            let dialog_x = (area.width - dialog_width) / 2;
-                            let dialog_y = (area.height - dialog_height) / 2;
-                            
-                            let dialog_area = Rect {
-                                x: dialog_x,
-                                y: dialog_y,
-                                width: dialog_width,
-                                height: dialog_height,
-                            };
-                            
-                            if mouse.column < dialog_area.x || mouse.column > dialog_area.x + dialog_area.width
-                                || mouse.row < dialog_area.y || mouse.row > dialog_area.y + dialog_area.height {
-                                app.show_about = false;
+                            KeyCode::Home => {
+                                app.scroll_offset = 0;
+                                app.auto_scroll = false;
                             }
-                            continue;
-                        }
-                        
-                        let menu_bar = app.menu.menu_bar_rect;
-                        
-                        if mouse.row == menu_bar.y && mouse.column >= menu_bar.x && mouse.column < menu_bar.x + menu_bar.width {
-                            let click_x = mouse.column - menu_bar.x;
-                            
-                            let menu_idx = if click_x < 8 {
-                                0
-                            } else if click_x < 18 {
-                                1
-                            } else {
-                                2
-                            };
-                            
-                            if !app.menu.active || app.menu.selected_menu != menu_idx {
-                                app.menu.activate();
-                                app.menu.selected_menu = menu_idx;
-                                app.menu.selected_subitem = 1;
-                            } else {
-                                app.menu.deactivate();
+                            KeyCode::End => {
+                                app.scroll_offset = app.max_scroll;
+                                app.auto_scroll = true;
                             }
-                            continue;
-                        }
-                        
-                        if app.menu.active {
-                            let menu_index = app.menu.selected_menu;
-                            let sub_items = app.menu.get_submenu_items(menu_index);
-                            if !sub_items.is_empty() {
-                                let (menu_x, menu_y) = if menu_index < app.menu.menu_positions.len() {
-                                    app.menu.menu_positions[menu_index]
-                                } else {
-                                    (2, 2)
-                                };
-                                
-                                let submenu_area = Rect {
-                                    x: menu_x,
-                                    y: menu_y + 1,
-                                    width: 20,
-                                    height: sub_items.len() as u16 + 2,
-                                };
-                                
-                                if mouse.column >= submenu_area.x && mouse.column <= submenu_area.x + submenu_area.width
-                                    && mouse.row >= submenu_area.y && mouse.row <= submenu_area.y + submenu_area.height {
-                                    let sub_index = (mouse.row - submenu_area.y - 1) as usize;
-                                    if sub_index < sub_items.len() {
-                                        let action = app.menu.select_subitem(
-                                            menu_index,
-                                            sub_index
-                                        );
+                            KeyCode::Enter => {
+                                if app.show_about {
+                                    app.show_about = false;
+                                } else if app.menu.active {
+                                    if app.menu.selected_subitem > 0 {
+                                        let menu = &mut app.menu;
+                                        let menu_index = menu.selected_menu;
+                                        let sub_index = menu.selected_subitem - 1;
+                                        let action = menu.select_subitem(menu_index, sub_index);
                                         app.handle_menu_action(action);
                                     }
-                                } else {
-                                    app.menu.deactivate();
+                                } else if !app.input.is_empty() && !app.is_loading {
+                                    let prompt = app.input.clone();
+                                    app.input.clear();
+                                    
+                                    if prompt.starts_with('/') {
+                                        let handled = handle_command(&prompt, &mut app, &ollama_client, &tx_clone).await;
+                                        if handled {
+                                            continue;
+                                        }
+                                    }
+                                    
+                                    if !app.output.is_empty() && !app.output.ends_with('\n') {
+                                        app.output.push('\n');
+                                    }
+                                    app.output.push_str(&format!("USER: {}", prompt));
+                                    
+                                    app.add_to_history(prompt.clone());
+                                    app.is_loading = true;
+                                    app.status_message = Some("⏳ Processing request...".to_string());
+                                    app.auto_scroll = true;
+                                    app.has_model_line = false;
+                                    
+                                    let app_clone = app_arc.clone();
+                                    let tx = tx_clone.clone();
+                                    let prompt_clone = prompt.clone();
+                                    
+                                    tokio::spawn(async move {
+                                        let mut app = app_clone.lock().await;
+                                        log_message(&format!("SPAWNED task for: {}", prompt_clone));
+                                        let response = app.process_chat_request(prompt_clone, tx.clone()).await;
+                                        log_message(&format!("Task complete, sending response"));
+                                        let _ = tx.send(response);
+                                    });
                                 }
-                            } else {
-                                app.menu.deactivate();
                             }
+                            KeyCode::Char(c) => {
+                                if !app.menu.active && !app.show_about {
+                                    app.input.push(c);
+                                }
+                            }
+                            KeyCode::Backspace => {
+                                if !app.menu.active && !app.show_about {
+                                    app.input.pop();
+                                }
+                            }
+                            KeyCode::Up => {
+                                if app.menu.active {
+                                    app.menu.navigate(-1);
+                                } else if !app.show_about && !app.is_loading {
+                                    if let Some(prev) = app.previous_history() {
+                                        app.input = prev;
+                                    }
+                                }
+                            }
+                            KeyCode::Down => {
+                                if app.menu.active {
+                                    if app.menu.selected_subitem == 0 {
+                                        app.menu.selected_subitem = 1;
+                                    } else {
+                                        app.menu.navigate(1);
+                                    }
+                                } else if !app.show_about && !app.is_loading {
+                                    if let Some(next) = app.next_history() {
+                                        app.input = next;
+                                    }
+                                }
+                            }
+                            KeyCode::Left => {
+                                if app.menu.active {
+                                    app.menu.selected_subitem = 0;
+                                    app.menu.navigate(-1);
+                                }
+                            }
+                            KeyCode::Right => {
+                                if app.menu.active {
+                                    app.menu.selected_subitem = 0;
+                                    app.menu.navigate(1);
+                                }
+                            }
+                            _ => {}
                         }
+                    }
+                    Ok(Event::Mouse(mouse)) => {
+                        let mut app = app_arc.lock().await;
+                        match mouse.kind {
+                            MouseEventKind::ScrollUp => {
+                                if app.menu.active {
+                                    app.menu.navigate(-1);
+                                } else if !app.show_about && app.scroll_offset > 0 {
+                                    app.scroll_offset = app.scroll_offset.saturating_sub(3);
+                                    app.auto_scroll = false;
+                                }
+                            }
+                            MouseEventKind::ScrollDown => {
+                                if app.menu.active {
+                                    app.menu.navigate(1);
+                                } else if !app.show_about && app.scroll_offset < app.max_scroll {
+                                    app.scroll_offset = (app.scroll_offset + 3).min(app.max_scroll);
+                                    app.auto_scroll = false;
+                                }
+                            }
+                            MouseEventKind::Down(MouseButton::Left) => {
+                                if app.show_about {
+                                    let area = terminal.get_frame().area();
+                                    let dialog_width = (area.width * 2 / 5).min(40);
+                                    let dialog_height = 8;
+                                    let dialog_x = (area.width - dialog_width) / 2;
+                                    let dialog_y = (area.height - dialog_height) / 2;
+                                    
+                                    let dialog_area = Rect {
+                                        x: dialog_x,
+                                        y: dialog_y,
+                                        width: dialog_width,
+                                        height: dialog_height,
+                                    };
+                                    
+                                    if mouse.column < dialog_area.x || mouse.column > dialog_area.x + dialog_area.width
+                                        || mouse.row < dialog_area.y || mouse.row > dialog_area.y + dialog_area.height {
+                                        app.show_about = false;
+                                    }
+                                    continue;
+                                }
+                                
+                                let menu_bar = app.menu.menu_bar_rect;
+                                
+                                if mouse.row == menu_bar.y && mouse.column >= menu_bar.x && mouse.column < menu_bar.x + menu_bar.width {
+                                    let click_x = mouse.column - menu_bar.x;
+                                    
+                                    let menu_idx = if click_x < 8 {
+                                        0
+                                    } else if click_x < 18 {
+                                        1
+                                    } else {
+                                        2
+                                    };
+                                    
+                                    if !app.menu.active || app.menu.selected_menu != menu_idx {
+                                        app.menu.activate();
+                                        app.menu.selected_menu = menu_idx;
+                                        app.menu.selected_subitem = 1;
+                                    } else {
+                                        app.menu.deactivate();
+                                    }
+                                    continue;
+                                }
+                                
+                                if app.menu.active {
+                                    let menu_index = app.menu.selected_menu;
+                                    let sub_items = app.menu.get_submenu_items(menu_index);
+                                    if !sub_items.is_empty() {
+                                        let (menu_x, menu_y) = if menu_index < app.menu.menu_positions.len() {
+                                            app.menu.menu_positions[menu_index]
+                                        } else {
+                                            (2, 2)
+                                        };
+                                        
+                                        let submenu_area = Rect {
+                                            x: menu_x,
+                                            y: menu_y + 1,
+                                            width: 20,
+                                            height: sub_items.len() as u16 + 2,
+                                        };
+                                        
+                                        if mouse.column >= submenu_area.x && mouse.column <= submenu_area.x + submenu_area.width
+                                            && mouse.row >= submenu_area.y && mouse.row <= submenu_area.y + submenu_area.height {
+                                            let sub_index = (mouse.row - submenu_area.y - 1) as usize;
+                                            if sub_index < sub_items.len() {
+                                                let action = app.menu.select_subitem(
+                                                    menu_index,
+                                                    sub_index
+                                                );
+                                                app.handle_menu_action(action);
+                                            }
+                                        } else {
+                                            app.menu.deactivate();
+                                        }
+                                    } else {
+                                        app.menu.deactivate();
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    Err(_) => {
+                        // No more events in the queue
+                        break;
                     }
                     _ => {}
                 }
