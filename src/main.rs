@@ -24,7 +24,30 @@ use futures_util::stream::StreamExt;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use chrono::Local;
-use std::process::Command;
+
+// ============ CONVERSATION HISTORY STORAGE ============
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ConversationEntry {
+    role: String,
+    content: String,
+    timestamp: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ConversationHistory {
+    entries: Vec<ConversationEntry>,
+    model: String,
+    mode: AppMode,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ConversationExport {
+    messages: Vec<ConversationEntry>,
+    model: String,
+    mode: String,
+    timestamp: String,
+}
 
 // ============ LOGGING ============
 
@@ -314,68 +337,14 @@ impl ToolEngine {
         }
 
         // Log the command execution attempt
-        log_message(&format!("EXECUTE_BASH: command='{}', cwd='{}'", command, working_dir));
+        log_message(&format!("EXECUTE_BASH ATTEMPT: command='{}', cwd='{}'", command, working_dir));
         
-        // Split the command into parts
-        let parts: Vec<&str> = command.split_whitespace().collect();
-        if parts.is_empty() {
-            return ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Empty command".to_string()),
-                requires_confirmation: false,
-            };
-        }
-
-        let cmd = parts[0];
-        let args = &parts[1..];
-
-        // Execute the command
-        let output = Command::new(cmd)
-            .args(args)
-            .current_dir(working_dir)
-            .output();
-        
-        match output {
-            Ok(output) => {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                
-                let mut result_output = String::new();
-                if !stdout.is_empty() {
-                    result_output.push_str(&stdout);
-                }
-                if !stderr.is_empty() {
-                    if !result_output.is_empty() {
-                        result_output.push('\n');
-                    }
-                    result_output.push_str(&format!("stderr: {}", stderr));
-                }
-                
-                if output.status.success() {
-                    ToolResult {
-                        success: true,
-                        output: result_output,
-                        error: None,
-                        requires_confirmation: true,
-                    }
-                } else {
-                    ToolResult {
-                        success: false,
-                        output: result_output,
-                        error: Some(format!("Command failed with exit code: {:?}", output.status.code())),
-                        requires_confirmation: true,
-                    }
-                }
-            }
-            Err(e) => {
-                ToolResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some(format!("Failed to execute command: {}", e)),
-                    requires_confirmation: false,
-                }
-            }
+        // Return a result that requires confirmation
+        ToolResult {
+            success: false,
+            output: format!("Command requires confirmation: {}", command),
+            error: None,
+            requires_confirmation: true,
         }
     }
 }
@@ -800,7 +769,34 @@ enum MenuAction {
     None,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+// ============ BASH CONFIRMATION ============
+
+#[derive(Debug, Clone)]
+struct BashConfirmation {
+    command: String,
+    working_dir: String,
+}
+
+// ============ FILE BROWSER ============
+
+#[derive(Debug, Clone)]
+struct FileBrowserState {
+    path: String,
+    entries: Vec<FileEntry>,
+    selected: usize,
+    scroll_offset: usize,
+}
+
+#[derive(Debug, Clone)]
+struct FileEntry {
+    name: String,
+    is_dir: bool,
+    is_symlink: bool,
+}
+
+// ============ APP MODE ============
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum AppMode {
     Chat,
     Agent,
@@ -1198,6 +1194,8 @@ struct App {
     streaming_buffer: String,
     has_model_line: bool,
     conversation: Vec<OllamaChatMessage>,
+    bash_confirmation: Option<BashConfirmation>,
+    file_browser: Option<FileBrowserState>,
 }
 
 impl App {
@@ -1243,6 +1241,8 @@ impl App {
             streaming_buffer: String::new(),
             has_model_line: false,
             conversation: Vec::new(),
+            bash_confirmation: None,
+            file_browser: None,
         }
     }
 
@@ -1279,10 +1279,10 @@ impl App {
     fn handle_menu_action(&mut self, action: MenuAction) {
         match action {
             MenuAction::Save => {
-                self.save_output();
+                self.save_conversation();
             }
             MenuAction::Load => {
-                self.status_message = Some("📂 Load action (not implemented)".to_string());
+                self.open_file_browser();
             }
             MenuAction::Exit => {
                 self.cleanup_and_exit();
@@ -1310,19 +1310,147 @@ impl App {
         process::exit(0);
     }
 
-    fn save_output(&mut self) {
-        if self.output.is_empty() {
-            self.status_message = Some("⚠️ No output to save".to_string());
+    fn save_conversation(&mut self) {
+        if self.conversation.is_empty() {
+            self.status_message = Some("⚠️ No conversation to save".to_string());
             return;
         }
 
-        match fs::write("output.txt", &self.output) {
-            Ok(_) => {
-                self.status_message = Some("✅ Output saved to output.txt".to_string());
+        let entries: Vec<ConversationEntry> = self.conversation.iter().map(|msg| {
+            ConversationEntry {
+                role: msg.role.clone(),
+                content: msg.content.clone(),
+                timestamp: Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+            }
+        }).collect();
+
+        let export = ConversationExport {
+            messages: entries,
+            model: self.model.clone(),
+            mode: format!("{:?}", self.mode),
+            timestamp: Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+        };
+
+        match serde_json::to_string_pretty(&export) {
+            Ok(json_content) => {
+                match fs::write("conversation.json", &json_content) {
+                    Ok(_) => {
+                        self.status_message = Some("✅ Conversation saved to conversation.json".to_string());
+                    }
+                    Err(e) => {
+                        self.status_message = Some(format!("❌ Failed to save: {}", e));
+                    }
+                }
             }
             Err(e) => {
-                self.status_message = Some(format!("❌ Failed to save: {}", e));
+                self.status_message = Some(format!("❌ Failed to serialize: {}", e));
             }
+        }
+    }
+
+    fn open_file_browser(&mut self) {
+        match self.list_files(".") {
+            Ok(entries) => {
+                self.file_browser = Some(FileBrowserState {
+                    path: ".".to_string(),
+                    entries,
+                    selected: 0,
+                    scroll_offset: 0,
+                });
+                self.status_message = Some("📂 Select a conversation file to load".to_string());
+            }
+            Err(e) => {
+                self.status_message = Some(format!("❌ {}", e));
+            }
+        }
+    }
+
+    fn list_files(&self, path: &str) -> Result<Vec<FileEntry>, String> {
+        let mut entries = Vec::new();
+        let path = if path.is_empty() { "." } else { path };
+        
+        match fs::read_dir(path) {
+            Ok(read_dir) => {
+                for entry in read_dir {
+                    if let Ok(entry) = entry {
+                        let name = entry.file_name().to_string_lossy().to_string();
+                        let is_dir = entry.path().is_dir();
+                        let is_symlink = entry.path().is_symlink();
+                        entries.push(FileEntry { name, is_dir, is_symlink });
+                    }
+                }
+                entries.sort_by(|a, b| {
+                    if a.is_dir && !b.is_dir { std::cmp::Ordering::Less }
+                    else if !a.is_dir && b.is_dir { std::cmp::Ordering::Greater }
+                    else { a.name.cmp(&b.name) }
+                });
+                Ok(entries)
+            }
+            Err(e) => Err(format!("Failed to read directory: {}", e)),
+        }
+    }
+
+    fn load_conversation(&mut self, path: &str) -> Result<String, String> {
+        let content = fs::read_to_string(path)
+            .map_err(|e| format!("Failed to read file: {}", e))?;
+        
+        // Try to parse as JSON export
+        if let Ok(export) = serde_json::from_str::<ConversationExport>(&content) {
+            self.conversation.clear();
+            for entry in export.messages {
+                self.conversation.push(OllamaChatMessage {
+                    role: entry.role,
+                    content: entry.content,
+                    tool_calls: None,
+                    tool_name: None,
+                });
+            }
+            self.model = export.model;
+            // Parse mode from string
+            if export.mode.contains("Agent") {
+                self.mode = AppMode::Agent;
+            } else {
+                self.mode = AppMode::Chat;
+            }
+            return Ok(format!("✅ Loaded {} messages from {}", self.conversation.len(), path));
+        }
+        
+        // Try to parse legacy format
+        let mut loaded = 0;
+        self.conversation.clear();
+        
+        for line in content.lines() {
+            if let Some(rest) = line.strip_prefix("USER: ") {
+                self.conversation.push(OllamaChatMessage {
+                    role: "user".to_string(),
+                    content: rest.to_string(),
+                    tool_calls: None,
+                    tool_name: None,
+                });
+                loaded += 1;
+            } else if let Some(rest) = line.strip_prefix("ASSISTANT: ") {
+                self.conversation.push(OllamaChatMessage {
+                    role: "assistant".to_string(),
+                    content: rest.to_string(),
+                    tool_calls: None,
+                    tool_name: None,
+                });
+                loaded += 1;
+            } else if let Some(rest) = line.strip_prefix("MODEL: ") {
+                self.conversation.push(OllamaChatMessage {
+                    role: "assistant".to_string(),
+                    content: rest.to_string(),
+                    tool_calls: None,
+                    tool_name: None,
+                });
+                loaded += 1;
+            }
+        }
+        
+        if loaded > 0 {
+            Ok(format!("✅ Loaded {} messages from {}", loaded, path))
+        } else {
+            Err("No valid conversation found in file".to_string())
         }
     }
 
@@ -1387,10 +1515,92 @@ impl App {
         log_message(&format!("CONVERSATION now has {} messages", self.conversation.len()));
     }
 
+    fn get_available_tools_info(&self) -> String {
+        let tools = vec![
+            ("list_directory", "List contents of a directory", vec!["path"]),
+            ("read_file", "Read contents of a file", vec!["path"]),
+            ("execute_bash", "Execute a bash command (requires confirmation)", vec!["command"]),
+        ];
+        
+        let mut output = "🔧 Available Tools:\n\n".to_string();
+        for (name, desc, params) in tools {
+            output.push_str(&format!("📌 {}\n   {}\n   Parameters: {}\n\n", 
+                name, desc, params.join(", ")));
+        }
+        output
+    }
+
+    fn execute_bash_with_confirmation(&mut self, command: &str, working_dir: &str) {
+        self.bash_confirmation = Some(BashConfirmation {
+            command: command.to_string(),
+            working_dir: working_dir.to_string(),
+        });
+        self.status_message = Some("⚡ Confirm command execution".to_string());
+    }
+
+    fn confirm_bash_execution(&mut self, confirmed: bool) {
+        if let Some(conf) = self.bash_confirmation.take() {
+            if confirmed {
+                self.execute_bash_command(&conf.command, &conf.working_dir);
+            } else {
+                let error_msg = format!("bash: {}: command not found (execution declined)", conf.command);
+                self.append_to_conversation("assistant", &error_msg);
+                if !self.output.is_empty() && !self.output.ends_with('\n') {
+                    self.output.push('\n');
+                }
+                self.output.push_str(&error_msg);
+                self.status_message = Some("⛔ Command execution declined".to_string());
+            }
+        }
+        self.bash_confirmation = None;
+    }
+
+    fn execute_bash_command(&mut self, command: &str, working_dir: &str) {
+        log_message(&format!("EXECUTING BASH: command='{}', cwd='{}'", command, working_dir));
+        
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(command)
+            .current_dir(working_dir)
+            .output();
+        
+        match output {
+            Ok(output) => {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let result = if stdout.is_empty() && stderr.is_empty() {
+                    "Command executed successfully (no output)".to_string()
+                } else if !stdout.is_empty() && !stderr.is_empty() {
+                    format!("stdout:\n{}\nstderr:\n{}", stdout, stderr)
+                } else if !stdout.is_empty() {
+                    stdout.to_string()
+                } else {
+                    stderr.to_string()
+                };
+                
+                let output_text = format!("🔧 Command: {}\nResult:\n{}", command, result);
+                self.append_to_conversation("assistant", &output_text);
+                if !self.output.is_empty() && !self.output.ends_with('\n') {
+                    self.output.push('\n');
+                }
+                self.output.push_str(&output_text);
+                self.status_message = Some("✅ Command executed".to_string());
+            }
+            Err(e) => {
+                let error_msg = format!("❌ Failed to execute command: {}", e);
+                self.append_to_conversation("assistant", &error_msg);
+                if !self.output.is_empty() && !self.output.ends_with('\n') {
+                    self.output.push('\n');
+                }
+                self.output.push_str(&error_msg);
+                self.status_message = Some(error_msg);
+            }
+        }
+    }
+
     async fn process_chat_request(&mut self, prompt: String, tx: mpsc::UnboundedSender<String>) -> String {
         log_message(&format!("PROCESS CHAT: {}", prompt));
         
-        // Add user message to conversation
         self.append_to_conversation("user", &prompt);
 
         if self.is_cloud_model(&self.model) {
@@ -1509,6 +1719,7 @@ impl App {
                     });
 
                     let mut tool_results = Vec::new();
+                    let mut requires_confirmation = false;
                     
                     for tool_call in &tool_calls {
                         let tool_name = &tool_call.function.name;
@@ -1517,7 +1728,36 @@ impl App {
                         ToolSystem::log_tool_call(tool_name, args.clone());
                         
                         let result = ToolEngine::execute_tool(tool_name, args);
+                        
+                        if result.requires_confirmation && tool_name == "execute_bash" {
+                            requires_confirmation = true;
+                            // Extract command and working_dir from args
+                            let command = tool_call.function.arguments.get("command")
+                                .and_then(|c| c.as_str())
+                                .unwrap_or("");
+                            let working_dir = tool_call.function.arguments.get("working_directory")
+                                .and_then(|d| d.as_str())
+                                .unwrap_or(".");
+                            
+                            if !command.is_empty() {
+                                self.execute_bash_with_confirmation(command, working_dir);
+                                let pending_msg = format!("⚡ Command pending confirmation: {}\nPress Enter to execute, ESC to decline", command);
+                                self.append_to_conversation("assistant", &pending_msg);
+                                if !self.output.is_empty() && !self.output.ends_with('\n') {
+                                    self.output.push('\n');
+                                }
+                                self.output.push_str(&pending_msg);
+                                return pending_msg;
+                            }
+                        }
+                        
                         tool_results.push((tool_name.clone(), result));
+                    }
+
+                    if requires_confirmation {
+                        // Wait for user confirmation
+                        // The confirmation will be handled in the event loop
+                        continue;
                     }
 
                     for (tool_name, result) in tool_results {
@@ -1561,8 +1801,18 @@ async fn handle_command(
 ) -> bool {
     match prompt {
         "/help" => {
-            let response = "📋 Available commands:\n\n/list - List available models\n/use <model> - Switch to a specific model\n/context - Show current conversation context\n/quit or /q or /exit - Exit the application\n/help - Show this help message";
+            let response = "📋 Available commands:\n\n/list - List available models\n/use <model> - Switch to a specific model\n/context - Show current conversation context\n/tools - List available tools\n/load - Load conversation from file\n/quit or /q or /exit - Quit the application\n/help - Show this help message".to_string();
             let _ = tx.send(response);
+            true
+        }
+        "/tools" => {
+            let response = app.get_available_tools_info();
+            let _ = tx.send(response);
+            true
+        }
+        "/load" => {
+            app.open_file_browser();
+            let _ = tx.send("📂 File browser opened. Select a conversation file to load.".to_string());
             true
         }
         "/quit" | "/q" | "/exit" => {
@@ -1676,7 +1926,75 @@ async fn handle_command(
     }
 }
 
-// ============ UI RENDERING ============
+// ============ UI RENDER FUNCTIONS ============
+
+fn render_file_browser(f: &mut Frame, app: &App) {
+    if app.file_browser.is_none() {
+        return;
+    }
+    
+    let browser = app.file_browser.as_ref().unwrap();
+    let area = f.area();
+    
+    let dialog_width = (area.width * 2 / 3).min(50);
+    let dialog_height = (area.height * 2 / 3).min(20);
+    let dialog_x = (area.width - dialog_width) / 2;
+    let dialog_y = (area.height - dialog_height) / 2;
+    
+    let dialog_area = Rect {
+        x: dialog_x,
+        y: dialog_y,
+        width: dialog_width,
+        height: dialog_height,
+    };
+    
+    f.render_widget(Clear, dialog_area);
+    
+    let mut content = vec![
+        Line::from(Span::styled(
+            "📂 Load Conversation File",
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(format!("Path: {}", browser.path)),
+        Line::from(""),
+    ];
+    
+    let visible_count = (dialog_height - 6) as usize;
+    let start = browser.scroll_offset;
+    let end = (start + visible_count).min(browser.entries.len());
+    
+    for (i, entry) in browser.entries.iter().enumerate().skip(start).take(end - start) {
+        let prefix = if entry.is_dir { "📁 " } else if entry.is_symlink { "🔗 " } else { "📄 " };
+        let display = format!("{}{}", prefix, entry.name);
+        let is_selected = i == browser.selected;
+        let style = if is_selected {
+            Style::default().fg(Color::Black).bg(Color::White).add_modifier(Modifier::BOLD)
+        } else if entry.is_dir {
+            Style::default().fg(Color::Cyan)
+        } else if entry.is_symlink {
+            Style::default().fg(Color::Yellow)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        content.push(Line::styled(display, style));
+    }
+    
+    content.push(Line::from(""));
+    content.push(Line::from(Span::styled(
+        "↑/↓ navigate • Enter select • ESC cancel",
+        Style::default().fg(Color::DarkGray),
+    )));
+    
+    let text = Text::from(content);
+    let paragraph = Paragraph::new(text)
+        .block(Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan))
+            .title(" 📂 Load File "))
+        .wrap(Wrap { trim: true });
+    
+    f.render_widget(paragraph, dialog_area);
+}
 
 fn render_menu_bar(f: &mut Frame, app: &mut App, area: Rect) {
     app.menu.menu_bar_rect = area;
@@ -1828,6 +2146,59 @@ fn render_about_dialog(f: &mut Frame, app: &App) {
     f.render_widget(paragraph, dialog_area);
 }
 
+// ============ BASH CONFIRMATION DIALOG ============
+
+fn render_bash_confirmation(f: &mut Frame, app: &App) {
+    if app.bash_confirmation.is_none() {
+        return;
+    }
+    
+    let conf = app.bash_confirmation.as_ref().unwrap();
+    let area = f.area();
+    
+    let dialog_width = (area.width * 3 / 4).min(60);
+    let dialog_height = 7;
+    let dialog_x = (area.width - dialog_width) / 2;
+    let dialog_y = (area.height - dialog_height) / 2;
+    
+    let dialog_area = Rect {
+        x: dialog_x,
+        y: dialog_y,
+        width: dialog_width,
+        height: dialog_height,
+    };
+    
+    f.render_widget(Clear, dialog_area);
+    
+    let content = vec![
+        Line::from(Span::styled(
+            "⚠️ Confirm Command Execution",
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(format!("Command: {}", conf.command)),
+        Line::from(""),
+        Line::from("  [ ESC / Decline ]  ←  →  [ Enter / Execute ]"),
+        Line::from(Span::styled(
+            "Use ←/→ to select, Enter to confirm, ESC to cancel",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+    
+    let text = Text::from(content);
+    let paragraph = Paragraph::new(text)
+        .block(Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Yellow))
+            .title(" ⚡ Command Confirmation "))
+        .alignment(Alignment::Center)
+        .wrap(Wrap { trim: true });
+    
+    f.render_widget(paragraph, dialog_area);
+}
+
+// ============ UI RENDERING ============
+
 fn ui(f: &mut Frame, app: &mut App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -1955,6 +2326,8 @@ fn ui(f: &mut Frame, app: &mut App) {
         .alignment(Alignment::Center);
     f.render_widget(status, chunks[3]);
 
+    render_file_browser(f, app);
+    render_bash_confirmation(f, app);
     render_menu_popup(f, app);
     render_about_dialog(f, app);
 
@@ -2036,17 +2409,18 @@ async fn run_app(
     let tx_clone = tx.clone();
     
     loop {
+        // Render the UI
         {
             let mut app = app_arc.lock().await;
             terminal.draw(|f| ui(f, &mut *app))?;
         }
 
+        // Process all pending channel messages
         while let Ok(chunk) = rx.try_recv() {
             let mut app = app_arc.lock().await;
             
             if chunk == "__DONE__" {
                 log_message("RECEIVED DONE marker");
-                app.streaming_buffer.clear();
                 app.is_loading = false;
                 app.status_message = None;
                 app.auto_scroll = true;
@@ -2091,10 +2465,13 @@ async fn run_app(
                     new_output.push_str(&format!("{}: {}", model_display, streaming_content));
                     app.output = new_output;
                 } else {
-                    if !app.output.is_empty() && !app.output.ends_with('\n') {
-                        app.output.push('\n');
+                    let full_line = format!("{}: {}", model_display, streaming_content);
+                    if !app.output.contains(&full_line) {
+                        if !app.output.is_empty() && !app.output.ends_with('\n') {
+                            app.output.push('\n');
+                        }
+                        app.output.push_str(&full_line);
                     }
-                    app.output.push_str(&format!("{}: {}", model_display, streaming_content));
                 }
                 app.auto_scroll = true;
                 app.status_message = None;
@@ -2109,11 +2486,10 @@ async fn run_app(
             }
         }
 
-        // ===== FIX: Improved event handling =====
-        // Process ALL available events without blocking on individual reads
-        // Use a short timeout to prevent CPU spinning
-        if event::poll(Duration::from_millis(16))? {  // ~60 FPS
-            // Process up to 10 events per frame to avoid lag buildup
+        // Process events with improved responsiveness
+        // Use a shorter poll timeout (16ms = ~60 FPS) and process multiple events per frame
+        if event::poll(Duration::from_millis(16))? {
+            // Process up to 10 events per frame to clear the queue
             for _ in 0..10 {
                 match event::read() {
                     Ok(Event::Key(key)) => {
@@ -2124,7 +2500,7 @@ async fn run_app(
                             }
                             KeyCode::Char('s') if key.modifiers == crossterm::event::KeyModifiers::CONTROL => {
                                 if !app.is_loading {
-                                    app.save_output();
+                                    app.save_conversation();
                                 }
                             }
                             KeyCode::F(9) => {
@@ -2134,7 +2510,12 @@ async fn run_app(
                                 }
                             }
                             KeyCode::Esc => {
-                                if app.menu.active {
+                                if let Some(_) = app.bash_confirmation {
+                                    app.confirm_bash_execution(false);
+                                } else if let Some(_) = app.file_browser {
+                                    app.file_browser = None;
+                                    app.status_message = Some("❌ Load cancelled".to_string());
+                                } else if app.menu.active {
                                     app.menu.deactivate();
                                 } else if app.show_about {
                                     app.show_about = false;
@@ -2160,9 +2541,103 @@ async fn run_app(
                                 app.scroll_offset = app.max_scroll;
                                 app.auto_scroll = true;
                             }
+                            KeyCode::Up => {
+                                if app.menu.active {
+                                    app.menu.navigate(-1);
+                                } else if let Some(browser) = &mut app.file_browser {
+                                    if browser.selected > 0 {
+                                        browser.selected -= 1;
+                                        if browser.selected < browser.scroll_offset {
+                                            browser.scroll_offset = browser.selected;
+                                        }
+                                    }
+                                } else if !app.show_about && !app.is_loading {
+                                    if let Some(prev) = app.previous_history() {
+                                        app.input = prev;
+                                    }
+                                }
+                            }
+                            KeyCode::Down => {
+                                if app.menu.active {
+                                    if app.menu.selected_subitem == 0 {
+                                        app.menu.selected_subitem = 1;
+                                    } else {
+                                        app.menu.navigate(1);
+                                    }
+                                } else if let Some(browser) = &mut app.file_browser {
+                                    if browser.selected + 1 < browser.entries.len() {
+                                        browser.selected += 1;
+                                        let visible_count = (browser.entries.len() - 1).min(14);
+                                        if browser.selected > browser.scroll_offset + visible_count {
+                                            browser.scroll_offset = browser.selected - visible_count;
+                                        }
+                                    }
+                                } else if !app.show_about && !app.is_loading {
+                                    if let Some(next) = app.next_history() {
+                                        app.input = next;
+                                    }
+                                }
+                            }
+                            KeyCode::Left => {
+                                if app.menu.active {
+                                    app.menu.selected_subitem = 0;
+                                    app.menu.navigate(-1);
+                                }
+                            }
+                            KeyCode::Right => {
+                                if app.menu.active {
+                                    app.menu.selected_subitem = 0;
+                                    app.menu.navigate(1);
+                                }
+                            }
                             KeyCode::Enter => {
                                 if app.show_about {
                                     app.show_about = false;
+                                } else if let Some(browser) = &mut app.file_browser.take() {
+                                    if let Some(entry) = browser.entries.get(browser.selected) {
+                                        let new_path = if browser.path == "." {
+                                            entry.name.clone()
+                                        } else {
+                                            format!("{}/{}", browser.path, entry.name)
+                                        };
+                                        
+                                        if entry.is_dir {
+                                            match app.list_files(&new_path) {
+                                                Ok(entries) => {
+                                                    app.file_browser = Some(FileBrowserState {
+                                                        path: new_path,
+                                                        entries,
+                                                        selected: 0,
+                                                        scroll_offset: 0,
+                                                    });
+                                                }
+                                                Err(e) => {
+                                                    app.status_message = Some(format!("❌ {}", e));
+                                                    app.file_browser = None;
+                                                }
+                                            }
+                                        } else {
+                                            let result = app.load_conversation(&new_path);
+                                            match result {
+                                                Ok(msg) => {
+                                                    app.status_message = Some(msg);
+                                                    if !app.output.is_empty() && !app.output.ends_with('\n') {
+                                                        app.output.push('\n');
+                                                    }
+                                                    app.output.push_str(&format!("📂 Loaded conversation from {}\n", new_path));
+                                                    app.file_browser = None;
+                                                }
+                                                Err(e) => {
+                                                    app.status_message = Some(format!("❌ {}", e));
+                                                    app.file_browser = None;
+                                                }
+                                            }
+                                        }
+                                    } else {
+                                        app.file_browser = None;
+                                    }
+                                } else if let Some(_) = app.bash_confirmation {
+                                    app.confirm_bash_execution(true);
                                 } else if app.menu.active {
                                     if app.menu.selected_subitem > 0 {
                                         let menu = &mut app.menu;
@@ -2207,47 +2682,13 @@ async fn run_app(
                                 }
                             }
                             KeyCode::Char(c) => {
-                                if !app.menu.active && !app.show_about {
+                                if !app.menu.active && !app.show_about && app.file_browser.is_none() && app.bash_confirmation.is_none() {
                                     app.input.push(c);
                                 }
                             }
                             KeyCode::Backspace => {
-                                if !app.menu.active && !app.show_about {
+                                if !app.menu.active && !app.show_about && app.file_browser.is_none() && app.bash_confirmation.is_none() {
                                     app.input.pop();
-                                }
-                            }
-                            KeyCode::Up => {
-                                if app.menu.active {
-                                    app.menu.navigate(-1);
-                                } else if !app.show_about && !app.is_loading {
-                                    if let Some(prev) = app.previous_history() {
-                                        app.input = prev;
-                                    }
-                                }
-                            }
-                            KeyCode::Down => {
-                                if app.menu.active {
-                                    if app.menu.selected_subitem == 0 {
-                                        app.menu.selected_subitem = 1;
-                                    } else {
-                                        app.menu.navigate(1);
-                                    }
-                                } else if !app.show_about && !app.is_loading {
-                                    if let Some(next) = app.next_history() {
-                                        app.input = next;
-                                    }
-                                }
-                            }
-                            KeyCode::Left => {
-                                if app.menu.active {
-                                    app.menu.selected_subitem = 0;
-                                    app.menu.navigate(-1);
-                                }
-                            }
-                            KeyCode::Right => {
-                                if app.menu.active {
-                                    app.menu.selected_subitem = 0;
-                                    app.menu.navigate(1);
                                 }
                             }
                             _ => {}
@@ -2355,11 +2796,8 @@ async fn run_app(
                             _ => {}
                         }
                     }
-                    Err(_) => {
-                        // No more events in the queue
-                        break;
-                    }
-                    _ => {}
+                    Ok(_) => {}
+                    Err(_) => break, // No more events in queue
                 }
             }
         }
