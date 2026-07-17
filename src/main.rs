@@ -1,2387 +1,44 @@
-use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, MouseButton, MouseEventKind},
-    execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
-};
-use ratatui::{
-    backend::CrosstermBackend,
-    layout::{Alignment, Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
-    text::{Line, Span, Text},
-    widgets::{Block, Borders, Paragraph, Wrap, Clear, Scrollbar, ScrollbarState, ScrollbarOrientation},
-    Frame, Terminal,
-};
-use serde::{Deserialize, Serialize};
 use std::io;
-use std::fs;
-use std::fs::OpenOptions;
-use std::io::{Write, BufRead, BufReader};
 use std::time::Duration;
-use tokio::sync::mpsc;
-use std::collections::HashMap;
-use std::process;
-use futures_util::stream::StreamExt;
-use std::sync::Arc;
-use tokio::sync::Mutex;
-use chrono::Local;
 
-// ============ CONVERSATION HISTORY STORAGE ============
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ConversationEntry {
-    role: String,
-    content: String,
-    timestamp: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ConversationHistory {
-    entries: Vec<ConversationEntry>,
-    model: String,
-    mode: AppMode,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ConversationExport {
-    messages: Vec<ConversationEntry>,
-    model: String,
-    mode: String,
-    timestamp: String,
-}
-
-// ============ LOGGING ============
-
-fn log_message(msg: &str) {
-    let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S%.3f").to_string();
-    let log_entry = format!("[{}] {}\n", timestamp, msg);
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("output.log")
-        .unwrap_or_else(|_| fs::File::create("output.log").unwrap());
-    let _ = file.write_all(log_entry.as_bytes());
-}
-
-// ============ CONFIG FILE ============
-
-const CONFIG_FILE: &str = "config.keys";
-
-fn load_api_keys() -> HashMap<String, String> {
-    let mut keys = HashMap::new();
-    
-    if let Ok(file) = fs::File::open(CONFIG_FILE) {
-        let reader = BufReader::new(file);
-        for line in reader.lines() {
-            if let Ok(line) = line {
-                let line = line.trim();
-                if line.is_empty() || line.starts_with('#') {
-                    continue;
-                }
-                if let Some((model, key)) = line.split_once(':') {
-                    keys.insert(model.trim().to_string(), key.trim().to_string());
-                }
-            }
-        }
-    }
-    
-    keys
-}
-
-// ============ CLOUD MODELS CONFIGURATION ============
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CloudModelConfig {
-    pub name: String,
-    pub display_name: String,
-    pub api_type: CloudApiType,
-    pub model_id: String,
-    pub base_url: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum CloudApiType {
-    DeepSeek,
-    Mistral,
-}
-
-impl CloudModelConfig {
-    fn get_default_configs() -> Vec<Self> {
-        vec![
-            CloudModelConfig {
-                name: "cloud@deepseek".to_string(),
-                display_name: "DeepSeek Chat".to_string(),
-                api_type: CloudApiType::DeepSeek,
-                model_id: "deepseek-chat".to_string(),
-                base_url: "https://api.deepseek.com".to_string(),
-            },
-            CloudModelConfig {
-                name: "cloud@mistral".to_string(),
-                display_name: "Mistral Medium".to_string(),
-                api_type: CloudApiType::Mistral,
-                model_id: "mistral-medium-3.5".to_string(),
-                base_url: "https://api.mistral.ai".to_string(),
-            },
-            CloudModelConfig {
-                name: "cloud@deepseek-coder".to_string(),
-                display_name: "DeepSeek Coder".to_string(),
-                api_type: CloudApiType::DeepSeek,
-                model_id: "deepseek-coder".to_string(),
-                base_url: "https://api.deepseek.com".to_string(),
-            },
-        ]
-    }
-}
-
-// ============ TOOL DEFINITIONS ============
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Tool {
-    pub name: String,
-    pub description: String,
-    pub parameters: ToolParameters,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ToolParameters {
-    #[serde(rename = "type")]
-    pub param_type: String,
-    pub properties: serde_json::Value,
-    pub required: Vec<String>,
-}
-
-impl Tool {
-    fn list_directory() -> Self {
-        Tool {
-            name: "list_directory".to_string(),
-            description: "List contents of a directory".to_string(),
-            parameters: ToolParameters {
-                param_type: "object".to_string(),
-                properties: serde_json::json!({
-                    "path": {
-                        "type": "string",
-                        "description": "Path to the directory to list"
-                    },
-                    "show_hidden": {
-                        "type": "boolean",
-                        "description": "Whether to show hidden files",
-                        "default": false
-                    }
-                }),
-                required: vec!["path".to_string()],
-            },
-        }
-    }
-    
-    fn read_file() -> Self {
-        Tool {
-            name: "read_file".to_string(),
-            description: "Read contents of a file".to_string(),
-            parameters: ToolParameters {
-                param_type: "object".to_string(),
-                properties: serde_json::json!({
-                    "path": {
-                        "type": "string",
-                        "description": "Path to the file to read"
-                    }
-                }),
-                required: vec!["path".to_string()],
-            },
-        }
-    }
-
-    fn execute_bash() -> Self {
-        Tool {
-            name: "execute_bash".to_string(),
-            description: "Execute a bash command (requires user confirmation)".to_string(),
-            parameters: ToolParameters {
-                param_type: "object".to_string(),
-                properties: serde_json::json!({
-                    "command": {
-                        "type": "string",
-                        "description": "The bash command to execute"
-                    },
-                    "working_directory": {
-                        "type": "string",
-                        "description": "Optional working directory for the command",
-                        "default": "."
-                    }
-                }),
-                required: vec!["command".to_string()],
-            },
-        }
-    }
-}
-
-// ============ TOOL EXECUTION ENGINE ==========
-
-#[derive(Debug, Clone)]
-pub struct ToolResult {
-    pub success: bool,
-    pub output: String,
-    pub error: Option<String>,
-    pub requires_confirmation: bool,
-}
-
-struct ToolEngine;
-
-impl ToolEngine {
-    fn execute_tool(tool_name: &str, arguments: serde_json::Value) -> ToolResult {
-        match tool_name {
-            "list_directory" => Self::list_directory(arguments),
-            "read_file" => Self::read_file(arguments),
-            "execute_bash" => Self::execute_bash(arguments),
-            _ => ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!("Unknown tool: {}", tool_name)),
-                requires_confirmation: false,
-            }
-        }
-    }
-    
-    fn list_directory(args: serde_json::Value) -> ToolResult {
-        let path = args.get("path")
-            .and_then(|p| p.as_str())
-            .unwrap_or(".");
-        
-        let show_hidden = args.get("show_hidden")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        
-        match fs::read_dir(path) {
-            Ok(entries) => {
-                let mut output = String::new();
-                let mut files = Vec::new();
-                
-                for entry in entries {
-                    if let Ok(entry) = entry {
-                        let name = entry.file_name().to_string_lossy().to_string();
-                        if !show_hidden && name.starts_with('.') {
-                            continue;
-                        }
-                        let is_dir = entry.path().is_dir();
-                        let is_symlink = entry.path().is_symlink();
-                        
-                        let entry_type = if is_dir {
-                            "📁"
-                        } else if is_symlink {
-                            "🔗"
-                        } else {
-                            "📄"
-                        };
-                        
-                        files.push(format!("{} {}", entry_type, name));
-                    }
-                }
-                
-                files.sort();
-                output.push_str(&format!("Directory: {}\n\n", path));
-                output.push_str(&files.join("\n"));
-                
-                ToolResult {
-                    success: true,
-                    output,
-                    error: None,
-                    requires_confirmation: false,
-                }
-            }
-            Err(e) => ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!("Failed to read directory: {}", e)),
-                requires_confirmation: false,
-            }
-        }
-    }
-    
-    fn read_file(args: serde_json::Value) -> ToolResult {
-        let path = args.get("path")
-            .and_then(|p| p.as_str())
-            .unwrap_or("");
-        
-        match fs::read_to_string(path) {
-            Ok(content) => {
-                let output = format!("File: {}\n\n{}", path, content);
-                ToolResult {
-                    success: true,
-                    output,
-                    error: None,
-                    requires_confirmation: false,
-                }
-            }
-            Err(e) => ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!("Failed to read file: {}", e)),
-                requires_confirmation: false,
-            }
-        }
-    }
-
-    fn execute_bash(args: serde_json::Value) -> ToolResult {
-        let command = args.get("command")
-            .and_then(|c| c.as_str())
-            .unwrap_or("");
-        
-        let working_dir = args.get("working_directory")
-            .and_then(|d| d.as_str())
-            .unwrap_or(".");
-        
-        if command.is_empty() {
-            return ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("No command provided".to_string()),
-                requires_confirmation: false,
-            };
-        }
-
-        // Log the command execution attempt
-        log_message(&format!("EXECUTE_BASH ATTEMPT: command='{}', cwd='{}'", command, working_dir));
-        
-        // Return a result that requires confirmation
-        ToolResult {
-            success: false,
-            output: format!("Command requires confirmation: {}", command),
-            error: None,
-            requires_confirmation: true,
-        }
-    }
-}
-
-// ============ OLLAMA CLIENT WITH TOOL SUPPORT ============
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct OllamaChatMessage {
-    role: String,
-    content: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tool_calls: Option<Vec<OllamaToolCall>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tool_name: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct OllamaToolCall {
-    function: OllamaFunction,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct OllamaFunction {
-    name: String,
-    arguments: serde_json::Value,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct OllamaChatResponse {
-    message: OllamaResponseMessage,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct OllamaResponseMessage {
-    role: String,
-    content: Option<String>,
-    #[serde(default)]
-    tool_calls: Option<Vec<OllamaToolCall>>,
-}
-
-#[derive(Clone)]
-struct OllamaClient {
-    client: reqwest::Client,
-    base_url: String,
-}
-
-impl OllamaClient {
-    fn new(base_url: Option<String>) -> Self {
-        Self {
-            client: reqwest::Client::new(),
-            base_url: base_url.unwrap_or_else(|| "http://localhost:11434".to_string()),
-        }
-    }
-
-    async fn chat_with_context(
-        &self,
-        model: &str,
-        messages: Vec<OllamaChatMessage>,
-        tools: Option<Vec<Tool>>,
-    ) -> Result<OllamaChatResponse, Box<dyn std::error::Error>> {
-        let url = format!("{}/api/chat", self.base_url);
-        
-        let mut request_body = serde_json::json!({
-            "model": model,
-            "messages": messages,
-            "stream": false,
-        });
-
-        if let Some(tools) = tools {
-            let tool_definitions: Vec<serde_json::Value> = tools.iter().map(|tool| {
-                serde_json::json!({
-                    "type": "function",
-                    "function": {
-                        "name": tool.name,
-                        "description": tool.description,
-                        "parameters": {
-                            "type": tool.parameters.param_type,
-                            "properties": tool.parameters.properties,
-                            "required": tool.parameters.required,
-                        }
-                    }
-                })
-            }).collect();
-            request_body["tools"] = serde_json::Value::Array(tool_definitions);
-        }
-
-        log_message(&format!("SENDING to Ollama: {}", serde_json::to_string_pretty(&request_body).unwrap_or_default()));
-
-        let response = self
-            .client
-            .post(&url)
-            .json(&request_body)
-            .send()
-            .await?;
-
-        if !response.status().is_success() {
-            let error_text = response.text().await?;
-            log_message(&format!("Ollama ERROR: {}", error_text));
-            return Err(format!("Ollama API error: {}", error_text).into());
-        }
-
-        let chat_response: OllamaChatResponse = response.json().await?;
-        log_message(&format!("RECEIVED from Ollama: {}", serde_json::to_string_pretty(&chat_response).unwrap_or_default()));
-        Ok(chat_response)
-    }
-
-    async fn generate_streaming(
-        &self,
-        model: &str,
-        messages: Vec<OllamaChatMessage>,
-        tx: mpsc::UnboundedSender<String>,
-    ) -> Result<String, Box<dyn std::error::Error>> {
-        let url = format!("{}/api/chat", self.base_url);
-        
-        let request_body = serde_json::json!({
-            "model": model,
-            "messages": messages,
-            "stream": true,
-        });
-
-        log_message(&format!("STREAMING to Ollama: {}", serde_json::to_string_pretty(&request_body).unwrap_or_default()));
-
-        let response = self
-            .client
-            .post(&url)
-            .json(&request_body)
-            .send()
-            .await?;
-
-        if !response.status().is_success() {
-            let error_text = response.text().await?;
-            log_message(&format!("Ollama STREAM ERROR: {}", error_text));
-            return Err(format!("Ollama API error: {}", error_text).into());
-        }
-
-        let bytes_stream = response.bytes_stream();
-        let mut result = String::new();
-        tokio::pin!(bytes_stream);
-
-        while let Some(chunk) = bytes_stream.next().await {
-            let chunk = chunk?;
-            let chunk_str = String::from_utf8_lossy(&chunk);
-            
-            for line in chunk_str.lines() {
-                if line.is_empty() {
-                    continue;
-                }
-                log_message(&format!("STREAM chunk: {}", line));
-                if let Ok(resp) = serde_json::from_str::<serde_json::Value>(line) {
-                    if let Some(response) = resp.get("message").and_then(|m| m.get("content")).and_then(|c| c.as_str()) {
-                        result.push_str(response);
-                        let _ = tx.send(result.clone());
-                    }
-                    if let Some(done) = resp.get("done").and_then(|d| d.as_bool()) {
-                        if done {
-                            log_message(&format!("STREAM complete, final: {}", result));
-                            let _ = tx.send(result.clone());
-                            let _ = tx.send("__DONE__".to_string());
-                            return Ok(result);
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(result)
-    }
-
-    async fn list_models(&self) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-        let url = format!("{}/api/tags", self.base_url);
-        let response = self.client.get(&url).send().await?;
-        
-        if !response.status().is_success() {
-            return Err(format!("HTTP error: {}", response.status()).into());
-        }
-
-        #[derive(Deserialize)]
-        struct ModelList {
-            models: Vec<ModelInfo>,
-        }
-
-        #[derive(Deserialize)]
-        struct ModelInfo {
-            name: String,
-        }
-
-        let model_list: ModelList = response.json().await?;
-        Ok(model_list.models.into_iter().map(|m| m.name).collect())
-    }
-}
-
-// ============ MARKDOWN RENDERER ============
-
-struct MarkdownRenderer;
-
-impl MarkdownRenderer {
-    fn render(text: &str) -> Text<'static> {
-        let mut result: Vec<Line<'static>> = Vec::new();
-        let mut in_code_block = false;
-        let mut code_lines: Vec<String> = Vec::new();
-        let mut code_lang: Option<String> = None;
-        let text = text.to_string();
-        
-        for line in text.lines() {
-            let line = line.trim_end();
-            
-            if line.trim().starts_with("```") {
-                if !in_code_block {
-                    in_code_block = true;
-                    code_lines.clear();
-                    let lang = line.trim().strip_prefix("```").unwrap_or("").trim();
-                    if !lang.is_empty() {
-                        code_lang = Some(lang.to_string());
-                    } else {
-                        code_lang = None;
-                    }
-                } else {
-                    in_code_block = false;
-                    if let Some(ref lang) = code_lang {
-                        let label = format!(" [{}] ", lang);
-                        result.push(Line::styled(
-                            label,
-                            Style::default()
-                                .fg(Color::Yellow)
-                                .bg(Color::Rgb(0, 0, 139))
-                                .add_modifier(Modifier::BOLD),
-                        ));
-                    }
-                    for code_line in &code_lines {
-                        result.push(Line::styled(
-                            code_line.clone(),
-                            Style::default()
-                                .fg(Color::White)
-                                .bg(Color::Rgb(0, 0, 139)),
-                        ));
-                    }
-                    code_lines.clear();
-                }
-                continue;
-            }
-            
-            if in_code_block {
-                code_lines.push(line.to_string());
-                continue;
-            }
-            
-            if line.is_empty() {
-                result.push(Line::from(""));
-                continue;
-            }
-            
-            if let Some(rest) = line.strip_prefix("# ") {
-                if !result.is_empty() {
-                    result.push(Line::from(""));
-                }
-                result.push(Line::styled(
-                    rest.to_string(),
-                    Style::default()
-                        .fg(Color::Magenta)
-                        .add_modifier(Modifier::BOLD),
-                ));
-                continue;
-            }
-            if let Some(rest) = line.strip_prefix("## ") {
-                if !result.is_empty() {
-                    result.push(Line::from(""));
-                }
-                result.push(Line::styled(
-                    rest.to_string(),
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                ));
-                continue;
-            }
-            if let Some(rest) = line.strip_prefix("### ") {
-                if !result.is_empty() {
-                    result.push(Line::from(""));
-                }
-                result.push(Line::styled(
-                    rest.to_string(),
-                    Style::default()
-                        .fg(Color::Blue)
-                        .add_modifier(Modifier::BOLD),
-                ));
-                continue;
-            }
-            
-            if let Some(rest) = line.strip_prefix("- ") {
-                result.push(Line::from(format!("• {}", rest)));
-                continue;
-            }
-            if let Some(rest) = line.strip_prefix("* ") {
-                result.push(Line::from(format!("• {}", rest)));
-                continue;
-            }
-            
-            if let Some(rest) = line.strip_prefix("1. ") {
-                result.push(Line::from(format!("1. {}", rest)));
-                continue;
-            }
-            
-            if line.trim() == "---" || line.trim() == "***" || line.trim() == "___" {
-                result.push(Line::from("─".repeat(50)));
-                continue;
-            }
-            
-            let mut spans: Vec<Span<'static>> = Vec::new();
-            let mut current_text = String::new();
-            let mut chars = line.chars().peekable();
-            let mut in_bold = false;
-            let mut in_italic = false;
-            let mut in_code = false;
-            
-            while let Some(c) = chars.next() {
-                if c == '*' && chars.peek() == Some(&'*') {
-                    chars.next();
-                    if !current_text.is_empty() {
-                        let span_style = if in_bold || in_italic {
-                            let mut s = Style::default();
-                            if in_bold { s = s.add_modifier(Modifier::BOLD); }
-                            if in_italic { s = s.add_modifier(Modifier::ITALIC); }
-                            s
-                        } else {
-                            Style::default()
-                        };
-                        spans.push(Span::styled(std::mem::take(&mut current_text), span_style));
-                    }
-                    in_bold = !in_bold;
-                } else if c == '*' {
-                    if !current_text.is_empty() {
-                        let span_style = if in_bold || in_italic {
-                            let mut s = Style::default();
-                            if in_bold { s = s.add_modifier(Modifier::BOLD); }
-                            if in_italic { s = s.add_modifier(Modifier::ITALIC); }
-                            s
-                        } else {
-                            Style::default()
-                        };
-                        spans.push(Span::styled(std::mem::take(&mut current_text), span_style));
-                    }
-                    in_italic = !in_italic;
-                } else if c == '`' {
-                    if !current_text.is_empty() {
-                        let span_style = if in_bold || in_italic {
-                            let mut s = Style::default();
-                            if in_bold { s = s.add_modifier(Modifier::BOLD); }
-                            if in_italic { s = s.add_modifier(Modifier::ITALIC); }
-                            s
-                        } else {
-                            Style::default()
-                        };
-                        spans.push(Span::styled(std::mem::take(&mut current_text), span_style));
-                    }
-                    in_code = !in_code;
-                } else {
-                    current_text.push(c);
-                }
-            }
-            
-            if !current_text.is_empty() {
-                let span_style = if in_bold || in_italic || in_code {
-                    let mut s = Style::default();
-                    if in_bold { s = s.add_modifier(Modifier::BOLD); }
-                    if in_italic { s = s.add_modifier(Modifier::ITALIC); }
-                    if in_code { 
-                        s = s.fg(Color::Green).bg(Color::Rgb(30, 30, 30));
-                    }
-                    s
-                } else {
-                    Style::default()
-                };
-                spans.push(Span::styled(current_text, span_style));
-            }
-            
-            if !spans.is_empty() {
-                result.push(Line::from(spans));
-            } else {
-                result.push(Line::from(line.to_string()));
-            }
-        }
-        
-        Text::from(result)
-    }
-}
-
-// ============ MENU SYSTEM ============
-
-#[derive(Debug, Clone, PartialEq)]
-enum MenuItem {
-    File(Vec<FileSubMenuItem>),
-    Options(Vec<OptionsSubMenuItem>),
-    Help(HelpSubMenu),
-}
-
-#[derive(Debug, Clone, PartialEq)]
-enum FileSubMenuItem {
-    Save,
-    Load,
-    Exit,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-enum OptionsSubMenuItem {
-    ChatMode,
-    AgentMode,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-enum HelpSubMenu {
-    About,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-enum MenuAction {
-    Save,
-    Load,
-    Exit,
-    ChatMode,
-    AgentMode,
-    About,
-    None,
-}
-
-// ============ BASH CONFIRMATION ============
-
-#[derive(Debug, Clone)]
-struct BashConfirmation {
-    command: String,
-    working_dir: String,
-}
-
-// ============ FILE BROWSER ============
-
-#[derive(Debug, Clone)]
-struct FileBrowserState {
-    path: String,
-    entries: Vec<FileEntry>,
-    selected: usize,
-    scroll_offset: usize,
-}
-
-#[derive(Debug, Clone)]
-struct FileEntry {
-    name: String,
-    is_dir: bool,
-    is_symlink: bool,
-}
-
-// ============ APP MODE ============
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum AppMode {
-    Chat,
-    Agent,
-}
-
-#[derive(Debug, Clone)]
-struct MenuState {
-    active: bool,
-    selected_menu: usize,
-    selected_subitem: usize,
-    menus: Vec<MenuItem>,
-    menu_positions: Vec<(u16, u16)>,
-    menu_bar_rect: Rect,
-}
-
-impl MenuState {
-    fn new() -> Self {
-        Self {
-            active: false,
-            selected_menu: 0,
-            selected_subitem: 0,
-            menus: vec![
-                MenuItem::File(vec![
-                    FileSubMenuItem::Save,
-                    FileSubMenuItem::Load,
-                    FileSubMenuItem::Exit,
-                ]),
-                MenuItem::Options(vec![
-                    OptionsSubMenuItem::ChatMode,
-                    OptionsSubMenuItem::AgentMode,
-                ]),
-                MenuItem::Help(HelpSubMenu::About),
-            ],
-            menu_positions: Vec::new(),
-            menu_bar_rect: Rect::default(),
-        }
-    }
-
-    fn get_submenu_items(&self, menu_index: usize) -> Vec<String> {
-        match self.menus.get(menu_index) {
-            Some(MenuItem::File(items)) => {
-                items.iter().map(|item| match item {
-                    FileSubMenuItem::Save => "Save".to_string(),
-                    FileSubMenuItem::Load => "Load".to_string(),
-                    FileSubMenuItem::Exit => "Exit".to_string(),
-                }).collect()
-            }
-            Some(MenuItem::Options(items)) => {
-                items.iter().map(|item| match item {
-                    OptionsSubMenuItem::ChatMode => "Chat Mode".to_string(),
-                    OptionsSubMenuItem::AgentMode => "Agent Mode".to_string(),
-                }).collect()
-            }
-            Some(MenuItem::Help(HelpSubMenu::About)) => vec!["About".to_string()],
-            None => vec![],
-        }
-    }
-
-    fn select_subitem(&mut self, menu_index: usize, sub_index: usize) -> MenuAction {
-        match self.menus.get(menu_index) {
-            Some(MenuItem::File(items)) => {
-                if let Some(item) = items.get(sub_index) {
-                    match item {
-                        FileSubMenuItem::Save => return MenuAction::Save,
-                        FileSubMenuItem::Load => return MenuAction::Load,
-                        FileSubMenuItem::Exit => return MenuAction::Exit,
-                    }
-                }
-            }
-            Some(MenuItem::Options(items)) => {
-                if let Some(item) = items.get(sub_index) {
-                    match item {
-                        OptionsSubMenuItem::ChatMode => return MenuAction::ChatMode,
-                        OptionsSubMenuItem::AgentMode => return MenuAction::AgentMode,
-                    }
-                }
-            }
-            Some(MenuItem::Help(HelpSubMenu::About)) => return MenuAction::About,
-            None => {}
-        }
-        MenuAction::None
-    }
-
-    fn navigate(&mut self, direction: i32) {
-        if !self.active {
-            return;
-        }
-        
-        let menu_count = self.menus.len();
-        if menu_count == 0 {
-            return;
-        }
-
-        if self.selected_subitem == 0 {
-            let new_index = (self.selected_menu as i32 + direction).rem_euclid(menu_count as i32) as usize;
-            self.selected_menu = new_index;
-            self.selected_subitem = 0;
-        } else {
-            let sub_items = self.get_submenu_items(self.selected_menu);
-            let sub_count = sub_items.len();
-            if sub_count > 0 {
-                let new_index = (self.selected_subitem as i32 + direction - 1).rem_euclid(sub_count as i32) as usize;
-                self.selected_subitem = new_index + 1;
-            }
-        }
-    }
-
-    fn activate(&mut self) {
-        self.active = true;
-        self.selected_subitem = 1;
-    }
-
-    fn deactivate(&mut self) {
-        self.active = false;
-        self.selected_subitem = 0;
-    }
-
-    fn toggle(&mut self) {
-        if self.active {
-            self.deactivate();
-        } else {
-            self.activate();
-        }
-    }
-}
-
-// ============ TOOL SYSTEM ============
-
-#[derive(Debug, Clone, Serialize)]
-struct ToolCall {
-    name: String,
-    arguments: serde_json::Value,
-    timestamp: String,
-}
-
-struct ToolSystem;
-
-impl ToolSystem {
-    fn log_tool_call(name: &str, arguments: serde_json::Value) {
-        let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-        let tool_call = ToolCall {
-            name: name.to_string(),
-            arguments,
-            timestamp,
-        };
-        
-        let log_entry = serde_json::to_string_pretty(&tool_call).unwrap_or_else(|_| format!("{:?}", tool_call));
-        
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open("tools.log")
-            .unwrap_or_else(|_| {
-                fs::File::create("tools.log").unwrap()
-            });
-        
-        writeln!(file, "{}\n---\n", log_entry).unwrap_or(());
-    }
-}
-
-// ============ CLOUD API CLIENTS ============
-
-#[derive(Clone)]
-struct DeepSeekClient {
-    client: reqwest::Client,
-    api_key: String,
-    base_url: String,
-    model_id: String,
-}
-
-impl DeepSeekClient {
-    fn new(config: &CloudModelConfig, api_key: String) -> Self {
-        Self {
-            client: reqwest::Client::new(),
-            api_key,
-            base_url: config.base_url.clone(),
-            model_id: config.model_id.clone(),
-        }
-    }
-
-    async fn chat_with_context(
-        &self,
-        messages: Vec<OllamaChatMessage>,
-        tools: Vec<Tool>,
-    ) -> Result<String, Box<dyn std::error::Error>> {
-        let url = format!("{}/v1/chat/completions", self.base_url);
-        
-        let tool_definitions: Vec<serde_json::Value> = tools.iter().map(|tool| {
-            serde_json::json!({
-                "type": "function",
-                "function": {
-                    "name": tool.name,
-                    "description": tool.description,
-                    "parameters": {
-                        "type": tool.parameters.param_type,
-                        "properties": tool.parameters.properties,
-                        "required": tool.parameters.required,
-                    }
-                }
-            })
-        }).collect();
-        
-        let deepseek_messages: Vec<serde_json::Value> = messages.iter().map(|msg| {
-            serde_json::json!({
-                "role": msg.role,
-                "content": msg.content
-            })
-        }).collect();
-        
-        let request_body = serde_json::json!({
-            "model": self.model_id,
-            "messages": deepseek_messages,
-            "tools": tool_definitions,
-            "tool_choice": "auto",
-            "stream": false,
-        });
-
-        log_message(&format!("DEEPSEEK sending: {}", serde_json::to_string_pretty(&request_body).unwrap_or_default()));
-
-        let response = self
-            .client
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .header("Content-Type", "application/json")
-            .json(&request_body)
-            .send()
-            .await?;
-
-        if !response.status().is_success() {
-            let error_text = response.text().await?;
-            log_message(&format!("DEEPSEEK error: {}", error_text));
-            return Err(format!("DeepSeek API error: {}", error_text).into());
-        }
-
-        let json_response: serde_json::Value = response.json().await?;
-        log_message(&format!("DEEPSEEK received: {}", serde_json::to_string_pretty(&json_response).unwrap_or_default()));
-        
-        if let Some(tool_calls) = json_response["choices"][0]["message"]["tool_calls"].as_array() {
-            if !tool_calls.is_empty() {
-                let mut tool_results = Vec::new();
-                for tool_call in tool_calls {
-                    let tool_name = tool_call["function"]["name"].as_str().unwrap_or("");
-                    let tool_args_str = tool_call["function"]["arguments"].as_str().unwrap_or("{}");
-                    let tool_args: serde_json::Value = serde_json::from_str(tool_args_str).unwrap_or(serde_json::json!({}));
-                    
-                    let result = ToolEngine::execute_tool(tool_name, tool_args.clone());
-                    tool_results.push(format!(
-                        "Tool: {}\nArguments: {}\nResult: {}\n",
-                        tool_name,
-                        serde_json::to_string_pretty(&tool_args).unwrap_or_default(),
-                        if result.success { result.output } else { result.error.unwrap_or_default() }
-                    ));
-                }
-                return Ok(format!("🔧 Tool Execution Results:\n\n{}", tool_results.join("\n---\n")));
-            }
-        }
-        
-        let content = json_response["choices"][0]["message"]["content"]
-            .as_str()
-            .unwrap_or("No response from DeepSeek")
-            .to_string();
-        
-        Ok(content)
-    }
-}
-
-#[derive(Clone)]
-struct MistralClient {
-    client: reqwest::Client,
-    api_key: String,
-    base_url: String,
-    model_id: String,
-}
-
-impl MistralClient {
-    fn new(config: &CloudModelConfig, api_key: String) -> Self {
-        Self {
-            client: reqwest::Client::new(),
-            api_key,
-            base_url: config.base_url.clone(),
-            model_id: config.model_id.clone(),
-        }
-    }
-
-    async fn chat_with_context(
-        &self,
-        messages: Vec<OllamaChatMessage>,
-        tools: Vec<Tool>,
-    ) -> Result<String, Box<dyn std::error::Error>> {
-        let url = format!("{}/v1/chat/completions", self.base_url);
-        
-        let tool_definitions: Vec<serde_json::Value> = tools.iter().map(|tool| {
-            serde_json::json!({
-                "type": "function",
-                "function": {
-                    "name": tool.name,
-                    "description": tool.description,
-                    "parameters": {
-                        "type": tool.parameters.param_type,
-                        "properties": tool.parameters.properties,
-                        "required": tool.parameters.required,
-                    }
-                }
-            })
-        }).collect();
-        
-        let mistral_messages: Vec<serde_json::Value> = messages.iter().map(|msg| {
-            serde_json::json!({
-                "role": msg.role,
-                "content": msg.content
-            })
-        }).collect();
-        
-        let request_body = serde_json::json!({
-            "model": self.model_id,
-            "messages": mistral_messages,
-            "tools": tool_definitions,
-            "tool_choice": "auto",
-            "stream": false,
-        });
-
-        log_message(&format!("MISTRAL sending: {}", serde_json::to_string_pretty(&request_body).unwrap_or_default()));
-
-        let response = self
-            .client
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .header("Content-Type", "application/json")
-            .json(&request_body)
-            .send()
-            .await?;
-
-        if !response.status().is_success() {
-            let error_text = response.text().await?;
-            log_message(&format!("MISTRAL error: {}", error_text));
-            return Err(format!("Mistral API error: {}", error_text).into());
-        }
-
-        let json_response: serde_json::Value = response.json().await?;
-        log_message(&format!("MISTRAL received: {}", serde_json::to_string_pretty(&json_response).unwrap_or_default()));
-        
-        if let Some(tool_calls) = json_response["choices"][0]["message"]["tool_calls"].as_array() {
-            if !tool_calls.is_empty() {
-                let mut tool_results = Vec::new();
-                for tool_call in tool_calls {
-                    let tool_name = tool_call["function"]["name"].as_str().unwrap_or("");
-                    let tool_args_str = tool_call["function"]["arguments"].as_str().unwrap_or("{}");
-                    let tool_args: serde_json::Value = serde_json::from_str(tool_args_str).unwrap_or(serde_json::json!({}));
-                    
-                    let result = ToolEngine::execute_tool(tool_name, tool_args.clone());
-                    tool_results.push(format!(
-                        "Tool: {}\nArguments: {}\nResult: {}\n",
-                        tool_name,
-                        serde_json::to_string_pretty(&tool_args).unwrap_or_default(),
-                        if result.success { result.output } else { result.error.unwrap_or_default() }
-                    ));
-                }
-                return Ok(format!("🔧 Tool Execution Results:\n\n{}", tool_results.join("\n---\n")));
-            }
-        }
-        
-        let content = json_response["choices"][0]["message"]["content"]
-            .as_str()
-            .unwrap_or("No response from Mistral")
-            .to_string();
-        
-        Ok(content)
-    }
-}
-
-// ============ APP ============
-
-#[derive(Clone)]
-struct App {
-    input: String,
-    output: String,
-    is_loading: bool,
-    model: String,
-    models: Vec<String>,
-    error: Option<String>,
-    menu: MenuState,
-    show_about: bool,
-    status_message: Option<String>,
-    history: Vec<String>,
-    history_index: usize,
-    mode: AppMode,
-    scroll_offset: usize,
-    max_scroll: usize,
-    auto_scroll: bool,
-    ollama_client: OllamaClient,
-    cloud_configs: Vec<CloudModelConfig>,
-    api_keys: HashMap<String, String>,
-    deepseek_clients: Vec<DeepSeekClient>,
-    mistral_clients: Vec<MistralClient>,
-    streaming_buffer: String,
-    has_model_line: bool,
-    conversation: Vec<OllamaChatMessage>,
-    bash_confirmation: Option<BashConfirmation>,
-    file_browser: Option<FileBrowserState>,
-}
-
-impl App {
-    fn new(ollama_client: OllamaClient, cloud_configs: Vec<CloudModelConfig>) -> Self {
-        let api_keys = load_api_keys();
-        let mut deepseek_clients = Vec::new();
-        let mut mistral_clients = Vec::new();
-        
-        for config in &cloud_configs {
-            if let Some(api_key) = api_keys.get(&config.name) {
-                match config.api_type {
-                    CloudApiType::DeepSeek => {
-                        deepseek_clients.push(DeepSeekClient::new(config, api_key.clone()));
-                    }
-                    CloudApiType::Mistral => {
-                        mistral_clients.push(MistralClient::new(config, api_key.clone()));
-                    }
-                }
-            }
-        }
-        
-        Self {
-            input: String::new(),
-            output: String::new(),
-            is_loading: false,
-            model: "llama2".to_string(),
-            models: Vec::new(),
-            error: None,
-            menu: MenuState::new(),
-            show_about: false,
-            status_message: None,
-            history: Vec::new(),
-            history_index: 0,
-            mode: AppMode::Chat,
-            scroll_offset: 0,
-            max_scroll: 0,
-            auto_scroll: true,
-            ollama_client,
-            cloud_configs,
-            api_keys,
-            deepseek_clients,
-            mistral_clients,
-            streaming_buffer: String::new(),
-            has_model_line: false,
-            conversation: Vec::new(),
-            bash_confirmation: None,
-            file_browser: None,
-        }
-    }
-
-    fn get_cloud_models(&self) -> Vec<String> {
-        let mut cloud_models = Vec::new();
-        for config in &self.cloud_configs {
-            if self.api_keys.contains_key(&config.name) {
-                cloud_models.push(config.name.clone());
-            }
-        }
-        cloud_models
-    }
-
-    fn is_cloud_model(&self, model: &str) -> bool {
-        model.starts_with("cloud@")
-    }
-
-    fn get_cloud_config(&self, model: &str) -> Option<&CloudModelConfig> {
-        self.cloud_configs.iter().find(|c| c.name == model)
-    }
-
-    fn get_model_display(&self) -> String {
-        if self.model.starts_with("cloud@") {
-            if let Some(config) = self.get_cloud_config(&self.model) {
-                config.display_name.clone()
-            } else {
-                self.model.clone()
-            }
-        } else {
-            self.model.clone()
-        }
-    }
-
-    fn handle_menu_action(&mut self, action: MenuAction) {
-        match action {
-            MenuAction::Save => {
-                self.save_conversation();
-            }
-            MenuAction::Load => {
-                self.open_file_browser();
-            }
-            MenuAction::Exit => {
-                self.cleanup_and_exit();
-            }
-            MenuAction::ChatMode => {
-                self.mode = AppMode::Chat;
-                self.status_message = Some("💬 Switched to Chat Mode".to_string());
-            }
-            MenuAction::AgentMode => {
-                self.mode = AppMode::Agent;
-                self.status_message = Some("🤖 Switched to Agent Mode - Tools are available".to_string());
-            }
-            MenuAction::About => {
-                self.show_about = true;
-                self.status_message = Some("ℹ️ About".to_string());
-            }
-            MenuAction::None => {}
-        }
-        self.menu.deactivate();
-    }
-
-    fn cleanup_and_exit(&self) {
+use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event, MouseButton, MouseEventKind};
+use crossterm::execute;
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
+
+use pulldown_cmark::{
+    CodeBlockKind, Event as MdEvent, Options as MdOptions, Parser as MdParser, Tag, TagEnd,
+};
+
+use ratatui::prelude::*;
+use ratatui::layout::Offset;
+use ratatui::widgets::*;
+
+mod app;
+mod config;
+mod ui;
+use app::{ActiveMenu, App, ChatMessage, FileDialogFocus, Focus, InputMode, ModelDialogFocus, SaveDialogFocus};
+use config::Config;
+use ui::Button;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let original_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
         let _ = disable_raw_mode();
         let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
-        process::exit(0);
-    }
+        original_hook(info);
+    }));
 
-    fn save_conversation(&mut self) {
-        if self.conversation.is_empty() {
-            self.status_message = Some("⚠️ No conversation to save".to_string());
-            return;
-        }
-
-        let entries: Vec<ConversationEntry> = self.conversation.iter().map(|msg| {
-            ConversationEntry {
-                role: msg.role.clone(),
-                content: msg.content.clone(),
-                timestamp: Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
-            }
-        }).collect();
-
-        let export = ConversationExport {
-            messages: entries,
-            model: self.model.clone(),
-            mode: format!("{:?}", self.mode),
-            timestamp: Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
-        };
-
-        match serde_json::to_string_pretty(&export) {
-            Ok(json_content) => {
-                match fs::write("conversation.json", &json_content) {
-                    Ok(_) => {
-                        self.status_message = Some("✅ Conversation saved to conversation.json".to_string());
-                    }
-                    Err(e) => {
-                        self.status_message = Some(format!("❌ Failed to save: {}", e));
-                    }
-                }
-            }
-            Err(e) => {
-                self.status_message = Some(format!("❌ Failed to serialize: {}", e));
-            }
-        }
-    }
-
-    fn open_file_browser(&mut self) {
-        match self.list_files(".") {
-            Ok(entries) => {
-                self.file_browser = Some(FileBrowserState {
-                    path: ".".to_string(),
-                    entries,
-                    selected: 0,
-                    scroll_offset: 0,
-                });
-                self.status_message = Some("📂 Select a conversation file to load".to_string());
-            }
-            Err(e) => {
-                self.status_message = Some(format!("❌ {}", e));
-            }
-        }
-    }
-
-    fn list_files(&self, path: &str) -> Result<Vec<FileEntry>, String> {
-        let mut entries = Vec::new();
-        let path = if path.is_empty() { "." } else { path };
-        
-        match fs::read_dir(path) {
-            Ok(read_dir) => {
-                for entry in read_dir {
-                    if let Ok(entry) = entry {
-                        let name = entry.file_name().to_string_lossy().to_string();
-                        let is_dir = entry.path().is_dir();
-                        let is_symlink = entry.path().is_symlink();
-                        entries.push(FileEntry { name, is_dir, is_symlink });
-                    }
-                }
-                entries.sort_by(|a, b| {
-                    if a.is_dir && !b.is_dir { std::cmp::Ordering::Less }
-                    else if !a.is_dir && b.is_dir { std::cmp::Ordering::Greater }
-                    else { a.name.cmp(&b.name) }
-                });
-                Ok(entries)
-            }
-            Err(e) => Err(format!("Failed to read directory: {}", e)),
-        }
-    }
-
-    fn load_conversation(&mut self, path: &str) -> Result<String, String> {
-        let content = fs::read_to_string(path)
-            .map_err(|e| format!("Failed to read file: {}", e))?;
-        
-        // Try to parse as JSON export
-        if let Ok(export) = serde_json::from_str::<ConversationExport>(&content) {
-            self.conversation.clear();
-            for entry in export.messages {
-                self.conversation.push(OllamaChatMessage {
-                    role: entry.role,
-                    content: entry.content,
-                    tool_calls: None,
-                    tool_name: None,
-                });
-            }
-            self.model = export.model;
-            // Parse mode from string
-            if export.mode.contains("Agent") {
-                self.mode = AppMode::Agent;
-            } else {
-                self.mode = AppMode::Chat;
-            }
-            return Ok(format!("✅ Loaded {} messages from {}", self.conversation.len(), path));
-        }
-        
-        // Try to parse legacy format
-        let mut loaded = 0;
-        self.conversation.clear();
-        
-        for line in content.lines() {
-            if let Some(rest) = line.strip_prefix("USER: ") {
-                self.conversation.push(OllamaChatMessage {
-                    role: "user".to_string(),
-                    content: rest.to_string(),
-                    tool_calls: None,
-                    tool_name: None,
-                });
-                loaded += 1;
-            } else if let Some(rest) = line.strip_prefix("ASSISTANT: ") {
-                self.conversation.push(OllamaChatMessage {
-                    role: "assistant".to_string(),
-                    content: rest.to_string(),
-                    tool_calls: None,
-                    tool_name: None,
-                });
-                loaded += 1;
-            } else if let Some(rest) = line.strip_prefix("MODEL: ") {
-                self.conversation.push(OllamaChatMessage {
-                    role: "assistant".to_string(),
-                    content: rest.to_string(),
-                    tool_calls: None,
-                    tool_name: None,
-                });
-                loaded += 1;
-            }
-        }
-        
-        if loaded > 0 {
-            Ok(format!("✅ Loaded {} messages from {}", loaded, path))
-        } else {
-            Err("No valid conversation found in file".to_string())
-        }
-    }
-
-    fn previous_history(&mut self) -> Option<String> {
-        if self.history_index > 0 {
-            self.history_index -= 1;
-            Some(self.history[self.history_index].clone())
-        } else {
-            None
-        }
-    }
-    
-    fn next_history(&mut self) -> Option<String> {
-        if self.history_index < self.history.len() - 1 {
-            self.history_index += 1;
-            Some(self.history[self.history_index].clone())
-        } else if self.history_index == self.history.len() - 1 {
-            self.history_index = self.history.len();
-            Some(String::new())
-        } else {
-            None
-        }
-    }
-
-    fn add_to_history(&mut self, prompt: String) {
-        self.history.push(prompt);
-        self.history_index = self.history.len();
-    }
-
-    fn scroll_to_bottom(&mut self) {
-        self.scroll_offset = self.max_scroll;
-        self.auto_scroll = true;
-    }
-
-    fn update_max_scroll(&mut self, total_lines: usize, viewport_lines: usize) {
-        if total_lines > viewport_lines {
-            self.max_scroll = total_lines - viewport_lines;
-        } else {
-            self.max_scroll = 0;
-        }
-        
-        if self.auto_scroll {
-            self.scroll_offset = self.max_scroll;
-        }
-    }
-
-    fn append_to_conversation(&mut self, role: &str, content: &str) {
-        if content.is_empty() {
-            return;
-        }
-        log_message(&format!("APPEND to conversation: role={}, content_len={}", role, content.len()));
-        let msg = OllamaChatMessage {
-            role: role.to_string(),
-            content: content.to_string(),
-            tool_calls: None,
-            tool_name: None,
-        };
-        self.conversation.push(msg);
-        if self.conversation.len() > 50 {
-            self.conversation.drain(0..10);
-        }
-        log_message(&format!("CONVERSATION now has {} messages", self.conversation.len()));
-    }
-
-    fn get_available_tools_info(&self) -> String {
-        let tools = vec![
-            ("list_directory", "List contents of a directory", vec!["path"]),
-            ("read_file", "Read contents of a file", vec!["path"]),
-            ("execute_bash", "Execute a bash command (requires confirmation)", vec!["command"]),
-        ];
-        
-        let mut output = "🔧 Available Tools:\n\n".to_string();
-        for (name, desc, params) in tools {
-            output.push_str(&format!("📌 {}\n   {}\n   Parameters: {}\n\n", 
-                name, desc, params.join(", ")));
-        }
-        output
-    }
-
-    fn execute_bash_with_confirmation(&mut self, command: &str, working_dir: &str) {
-        self.bash_confirmation = Some(BashConfirmation {
-            command: command.to_string(),
-            working_dir: working_dir.to_string(),
-        });
-        self.status_message = Some("⚡ Confirm command execution".to_string());
-    }
-
-    fn confirm_bash_execution(&mut self, confirmed: bool) {
-        if let Some(conf) = self.bash_confirmation.take() {
-            if confirmed {
-                self.execute_bash_command(&conf.command, &conf.working_dir);
-            } else {
-                let error_msg = format!("bash: {}: command not found (execution declined)", conf.command);
-                self.append_to_conversation("assistant", &error_msg);
-                if !self.output.is_empty() && !self.output.ends_with('\n') {
-                    self.output.push('\n');
-                }
-                self.output.push_str(&error_msg);
-                self.status_message = Some("⛔ Command execution declined".to_string());
-            }
-        }
-        self.bash_confirmation = None;
-    }
-
-    fn execute_bash_command(&mut self, command: &str, working_dir: &str) {
-        log_message(&format!("EXECUTING BASH: command='{}', cwd='{}'", command, working_dir));
-        
-        let output = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(command)
-            .current_dir(working_dir)
-            .output();
-        
-        match output {
-            Ok(output) => {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                let result = if stdout.is_empty() && stderr.is_empty() {
-                    "Command executed successfully (no output)".to_string()
-                } else if !stdout.is_empty() && !stderr.is_empty() {
-                    format!("stdout:\n{}\nstderr:\n{}", stdout, stderr)
-                } else if !stdout.is_empty() {
-                    stdout.to_string()
-                } else {
-                    stderr.to_string()
-                };
-                
-                let output_text = format!("🔧 Command: {}\nResult:\n{}", command, result);
-                self.append_to_conversation("assistant", &output_text);
-                if !self.output.is_empty() && !self.output.ends_with('\n') {
-                    self.output.push('\n');
-                }
-                self.output.push_str(&output_text);
-                self.status_message = Some("✅ Command executed".to_string());
-            }
-            Err(e) => {
-                let error_msg = format!("❌ Failed to execute command: {}", e);
-                self.append_to_conversation("assistant", &error_msg);
-                if !self.output.is_empty() && !self.output.ends_with('\n') {
-                    self.output.push('\n');
-                }
-                self.output.push_str(&error_msg);
-                self.status_message = Some(error_msg);
-            }
-        }
-    }
-
-    async fn process_chat_request(&mut self, prompt: String, tx: mpsc::UnboundedSender<String>) -> String {
-        log_message(&format!("PROCESS CHAT: {}", prompt));
-        
-        self.append_to_conversation("user", &prompt);
-
-        if self.is_cloud_model(&self.model) {
-            let config = match self.get_cloud_config(&self.model) {
-                Some(c) => c,
-                None => return format!("❌ Cloud model not found: {}", self.model),
-            };
-
-            let tools = vec![
-                Tool::list_directory(),
-                Tool::read_file(),
-                Tool::execute_bash(),
-            ];
-
-            let response = match config.api_type {
-                CloudApiType::DeepSeek => {
-                    for client in &self.deepseek_clients {
-                        match client.chat_with_context(self.conversation.clone(), tools.clone()).await {
-                            Ok(response) => {
-                                self.append_to_conversation("assistant", &response);
-                                return response;
-                            }
-                            Err(e) => return format!("❌ DeepSeek error: {}", e),
-                        }
-                    }
-                    "❌ No DeepSeek client configured".to_string()
-                }
-                CloudApiType::Mistral => {
-                    for client in &self.mistral_clients {
-                        match client.chat_with_context(self.conversation.clone(), tools.clone()).await {
-                            Ok(response) => {
-                                self.append_to_conversation("assistant", &response);
-                                return response;
-                            }
-                            Err(e) => return format!("❌ Mistral error: {}", e),
-                        }
-                    }
-                    "❌ No Mistral client configured".to_string()
-                }
-            };
-            self.append_to_conversation("assistant", &response);
-            return response;
-        }
-
-        if self.mode == AppMode::Agent {
-            return self.process_agent_request().await;
-        }
-
-        let model_display = self.get_model_display();
-        self.streaming_buffer.clear();
-        let _ = tx.send(format!("MODEL_LINE:{}", model_display));
-        
-        let mut final_response = String::new();
-        
-        match self.ollama_client.generate_streaming(
-            &self.model,
-            self.conversation.clone(),
-            tx.clone(),
-        ).await {
-            Ok(response) => {
-                final_response = response;
-                log_message(&format!("STREAMING complete, response_len={}", final_response.len()));
-                if !final_response.is_empty() {
-                    self.append_to_conversation("assistant", &final_response);
-                }
-                final_response
-            }
-            Err(e) => {
-                let error_msg = format!("❌ Error: {}", e);
-                self.append_to_conversation("assistant", &error_msg);
-                error_msg
-            }
-        }
-    }
-
-    async fn process_agent_request(&mut self) -> String {
-        let tools = vec![
-            Tool::list_directory(),
-            Tool::read_file(),
-            Tool::execute_bash(),
-        ];
-
-        let max_iterations = 5;
-        let mut iteration = 0;
-
-        loop {
-            iteration += 1;
-            if iteration > max_iterations {
-                let msg = "⚠️ Max tool iterations reached".to_string();
-                self.append_to_conversation("assistant", &msg);
-                return msg;
-            }
-
-            let response = match self.ollama_client.chat_with_context(
-                &self.model,
-                self.conversation.clone(),
-                Some(tools.clone()),
-            ).await {
-                Ok(r) => r,
-                Err(e) => {
-                    let msg = format!("❌ Error: {}", e);
-                    self.append_to_conversation("assistant", &msg);
-                    return msg;
-                }
-            };
-
-            let response_message = response.message;
-
-            if let Some(tool_calls) = response_message.tool_calls {
-                if !tool_calls.is_empty() {
-                    self.conversation.push(OllamaChatMessage {
-                        role: "assistant".to_string(),
-                        content: String::new(),
-                        tool_calls: Some(tool_calls.clone()),
-                        tool_name: None,
-                    });
-
-                    let mut tool_results = Vec::new();
-                    let mut requires_confirmation = false;
-                    
-                    for tool_call in &tool_calls {
-                        let tool_name = &tool_call.function.name;
-                        let args = tool_call.function.arguments.clone();
-                        
-                        ToolSystem::log_tool_call(tool_name, args.clone());
-                        
-                        let result = ToolEngine::execute_tool(tool_name, args);
-                        
-                        if result.requires_confirmation && tool_name == "execute_bash" {
-                            requires_confirmation = true;
-                            // Extract command and working_dir from args
-                            let command = tool_call.function.arguments.get("command")
-                                .and_then(|c| c.as_str())
-                                .unwrap_or("");
-                            let working_dir = tool_call.function.arguments.get("working_directory")
-                                .and_then(|d| d.as_str())
-                                .unwrap_or(".");
-                            
-                            if !command.is_empty() {
-                                self.execute_bash_with_confirmation(command, working_dir);
-                                let pending_msg = format!("⚡ Command pending confirmation: {}\nPress Enter to execute, ESC to decline", command);
-                                self.append_to_conversation("assistant", &pending_msg);
-                                if !self.output.is_empty() && !self.output.ends_with('\n') {
-                                    self.output.push('\n');
-                                }
-                                self.output.push_str(&pending_msg);
-                                return pending_msg;
-                            }
-                        }
-                        
-                        tool_results.push((tool_name.clone(), result));
-                    }
-
-                    if requires_confirmation {
-                        // Wait for user confirmation
-                        // The confirmation will be handled in the event loop
-                        continue;
-                    }
-
-                    for (tool_name, result) in tool_results {
-                        let content = if result.success {
-                            result.output
-                        } else {
-                            format!("Error: {}", result.error.unwrap_or_default())
-                        };
-                        
-                        self.conversation.push(OllamaChatMessage {
-                            role: "tool".to_string(),
-                            content,
-                            tool_calls: None,
-                            tool_name: Some(tool_name),
-                        });
-                    }
-
-                    continue;
-                }
-            }
-
-            if let Some(content) = response_message.content {
-                self.append_to_conversation("assistant", &content);
-                return content;
-            } else {
-                let msg = "No response from model".to_string();
-                self.append_to_conversation("assistant", &msg);
-                return msg;
-            }
-        }
-    }
-}
-
-// ============ COMMAND HANDLER ============
-
-async fn handle_command(
-    prompt: &str,
-    app: &mut App,
-    ollama_client: &OllamaClient,
-    tx: &mpsc::UnboundedSender<String>,
-) -> bool {
-    match prompt {
-        "/help" => {
-            let response = "📋 Available commands:\n\n/list - List available models\n/use <model> - Switch to a specific model\n/context - Show current conversation context\n/tools - List available tools\n/load - Load conversation from file\n/quit or /q or /exit - Quit the application\n/help - Show this help message".to_string();
-            let _ = tx.send(response);
-            true
-        }
-        "/tools" => {
-            let response = app.get_available_tools_info();
-            let _ = tx.send(response);
-            true
-        }
-        "/load" => {
-            app.open_file_browser();
-            let _ = tx.send("📂 File browser opened. Select a conversation file to load.".to_string());
-            true
-        }
-        "/quit" | "/q" | "/exit" => {
-            app.cleanup_and_exit();
-            true
-        }
-        "/list" => {
-            app.status_message = Some("📋 Fetching model list...".to_string());
-            app.auto_scroll = true;
-            let client = ollama_client.clone();
-            let tx = tx.clone();
-            let cloud_models = app.get_cloud_models();
-            tokio::spawn(async move {
-                match client.list_models().await {
-                    Ok(models) => {
-                        let mut response = "📋 Available models:\n\n".to_string();
-                        for model in &models {
-                            response.push_str(&format!("   {}\n", model));
-                        }
-                        for model in &cloud_models {
-                            response.push_str(&format!("☁️  {}\n", model));
-                        }
-                        response.push_str("\n☁️  = Cloud model (requires API key in config.keys)");
-                        let _ = tx.send(response);
-                    }
-                    Err(e) => {
-                        let _ = tx.send(format!("❌ Error listing models: {}", e));
-                    }
-                }
-            });
-            true
-        }
-        "/context" => {
-            log_message(&format!("CONTEXT command - conversation len: {}", app.conversation.len()));
-            if app.conversation.is_empty() {
-                let response = "📭 No conversation context yet. Start chatting to build context!".to_string();
-                let _ = tx.send(response);
-            } else {
-                let mut response = "📚 Current Conversation Context:\n\n".to_string();
-                for (i, msg) in app.conversation.iter().enumerate() {
-                    let role_emoji = match msg.role.as_str() {
-                        "user" => "👤",
-                        "assistant" => "🤖",
-                        "tool" => "🔧",
-                        _ => "📝",
-                    };
-                    let content_preview = if msg.content.len() > 100 {
-                        format!("{}...", &msg.content[..100])
-                    } else {
-                        msg.content.clone()
-                    };
-                    response.push_str(&format!("{}. {} {}: \n   {}\n\n", 
-                        i + 1, 
-                        role_emoji, 
-                        msg.role.to_uppercase(),
-                        content_preview
-                    ));
-                }
-                response.push_str(&format!("📊 Total messages: {}", app.conversation.len()));
-                let _ = tx.send(response);
-            }
-            true
-        }
-        cmd if cmd.starts_with("/use ") => {
-            let model = cmd.strip_prefix("/use ").unwrap().trim();
-            if !model.is_empty() {
-                let model_name = model.to_string();
-                
-                let is_cloud = app.is_cloud_model(&model_name);
-                let cloud_config = if is_cloud {
-                    app.get_cloud_config(&model_name).cloned()
-                } else {
-                    None
-                };
-                
-                let found_model = app.models.iter().find(|m| {
-                    **m == model_name ||
-                    m.starts_with(&format!("{}:", &model_name)) ||
-                    m.starts_with(&model_name)
-                });
-                
-                if let Some(config) = cloud_config {
-                    if app.api_keys.contains_key(&model_name) {
-                        app.model = model_name.clone();
-                        let display_name = config.display_name.clone();
-                        app.status_message = Some(format!("🔄 Switched to cloud model: {}", display_name));
-                        let response = format!("🔄 Switched to cloud model: {}\n", display_name);
-                        let _ = tx.send(response);
-                    } else {
-                        let msg = format!("❌ No API key found for {} in {}\nAdd a line: {}:your_key_here", 
-                            config.display_name, CONFIG_FILE, model_name);
-                        app.status_message = Some(msg.clone());
-                        let _ = tx.send(msg);
-                    }
-                } else if let Some(found) = found_model {
-                    app.model = found.clone();
-                    let found_clone = found.clone();
-                    app.status_message = Some(format!("🔄 Switched to model: {}", found_clone));
-                    let response = format!("🔄 Switched to model: {}\n", found_clone);
-                    let _ = tx.send(response);
-                } else {
-                    let models_list = app.models.join(", ");
-                    let msg = format!("❌ Model not found: {}. Available: {}", model_name, models_list);
-                    app.status_message = Some(msg.clone());
-                    let _ = tx.send(msg);
-                }
-            }
-            true
-        }
-        _ => false,
-    }
-}
-
-// ============ UI RENDER FUNCTIONS ============
-
-fn render_file_browser(f: &mut Frame, app: &App) {
-    if app.file_browser.is_none() {
-        return;
-    }
-    
-    let browser = app.file_browser.as_ref().unwrap();
-    let area = f.area();
-    
-    let dialog_width = (area.width * 2 / 3).min(50);
-    let dialog_height = (area.height * 2 / 3).min(20);
-    let dialog_x = (area.width - dialog_width) / 2;
-    let dialog_y = (area.height - dialog_height) / 2;
-    
-    let dialog_area = Rect {
-        x: dialog_x,
-        y: dialog_y,
-        width: dialog_width,
-        height: dialog_height,
-    };
-    
-    f.render_widget(Clear, dialog_area);
-    
-    let mut content = vec![
-        Line::from(Span::styled(
-            "📂 Load Conversation File",
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-        )),
-        Line::from(format!("Path: {}", browser.path)),
-        Line::from(""),
-    ];
-    
-    let visible_count = (dialog_height - 6) as usize;
-    let start = browser.scroll_offset;
-    let end = (start + visible_count).min(browser.entries.len());
-    
-    for (i, entry) in browser.entries.iter().enumerate().skip(start).take(end - start) {
-        let prefix = if entry.is_dir { "📁 " } else if entry.is_symlink { "🔗 " } else { "📄 " };
-        let display = format!("{}{}", prefix, entry.name);
-        let is_selected = i == browser.selected;
-        let style = if is_selected {
-            Style::default().fg(Color::Black).bg(Color::White).add_modifier(Modifier::BOLD)
-        } else if entry.is_dir {
-            Style::default().fg(Color::Cyan)
-        } else if entry.is_symlink {
-            Style::default().fg(Color::Yellow)
-        } else {
-            Style::default().fg(Color::White)
-        };
-        content.push(Line::styled(display, style));
-    }
-    
-    content.push(Line::from(""));
-    content.push(Line::from(Span::styled(
-        "↑/↓ navigate • Enter select • ESC cancel",
-        Style::default().fg(Color::DarkGray),
-    )));
-    
-    let text = Text::from(content);
-    let paragraph = Paragraph::new(text)
-        .block(Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan))
-            .title(" 📂 Load File "))
-        .wrap(Wrap { trim: true });
-    
-    f.render_widget(paragraph, dialog_area);
-}
-
-fn render_menu_bar(f: &mut Frame, app: &mut App, area: Rect) {
-    app.menu.menu_bar_rect = area;
-    
-    let menu_labels = vec!["File", "Options", "Help"];
-    let mut x_pos = area.x;
-    
-    app.menu.menu_positions.clear();
-    
-    for (i, label) in menu_labels.iter().enumerate() {
-        let is_selected = app.menu.active && app.menu.selected_menu == i && app.menu.selected_subitem == 0;
-        
-        let display = if is_selected {
-            format!("[{}] ", label)
-        } else {
-            format!(" {}  ", label)
-        };
-        
-        let width = display.len() as u16;
-        app.menu.menu_positions.push((x_pos, area.y));
-        x_pos += width;
-        
-        let style = if is_selected {
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::White)
-                .add_modifier(Modifier::BOLD)
-        } else if app.menu.active && app.menu.selected_menu == i {
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD)
-        };
-        
-        let paragraph = Paragraph::new(display)
-            .style(style);
-        f.render_widget(paragraph, Rect {
-            x: x_pos - width,
-            y: area.y,
-            width,
-            height: 1,
-        });
-    }
-}
-
-fn render_menu_popup(f: &mut Frame, app: &App) {
-    if !app.menu.active {
-        return;
-    }
-
-    let area = f.area();
-    let menu_index = app.menu.selected_menu;
-    
-    let (menu_x, menu_y) = if menu_index < app.menu.menu_positions.len() {
-        app.menu.menu_positions[menu_index]
-    } else {
-        (area.x + 1, area.y + 1)
-    };
-    
-    let sub_items = app.menu.get_submenu_items(menu_index);
-    if sub_items.is_empty() {
-        return;
-    }
-    
-    let menu_width = 20;
-    let menu_height = sub_items.len() as u16 + 2;
-    
-    let popup_area = Rect {
-        x: menu_x,
-        y: menu_y + 1,
-        width: menu_width,
-        height: menu_height,
-    };
-
-    f.render_widget(Clear, popup_area);
-
-    let mut content = Vec::new();
-    for (i, item) in sub_items.iter().enumerate() {
-        let is_selected = app.menu.selected_subitem == i + 1;
-        let display_item = if is_selected {
-            format!("▶ {}", item)
-        } else {
-            format!("  {}", item)
-        };
-        content.push(display_item);
-    }
-
-    let menu_text = Text::from(content.join("\n"));
-    let paragraph = Paragraph::new(menu_text)
-        .block(Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan)))
-        .style(Style::default().fg(Color::White));
-    
-    f.render_widget(paragraph, popup_area);
-}
-
-fn render_about_dialog(f: &mut Frame, app: &App) {
-    if !app.show_about {
-        return;
-    }
-
-    let area = f.area();
-    
-    let dialog_width = (area.width * 2 / 5).min(40);
-    let dialog_height = 8;
-    
-    let dialog_x = (area.width - dialog_width) / 2;
-    let dialog_y = (area.height - dialog_height) / 2;
-    
-    let dialog_area = Rect {
-        x: dialog_x,
-        y: dialog_y,
-        width: dialog_width,
-        height: dialog_height,
-    };
-
-    f.render_widget(Clear, dialog_area);
-
-    let about_content = vec![
-        Line::from(Span::styled(
-            "Ollama TUI Client",
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-        )),
-        Line::from(""),
-        Line::from("Version: 0.6.0"),
-        Line::from(""),
-        Line::from("A terminal-based client for Ollama"),
-        Line::from("with cloud model support."),
-        Line::from(""),
-        Line::from(Span::styled(
-            "Press Enter or ESC to close",
-            Style::default().fg(Color::DarkGray),
-        )),
-    ];
-
-    let about_text = Text::from(about_content);
-    let paragraph = Paragraph::new(about_text)
-        .block(Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan))
-            .title(" ℹ️ About "))
-        .alignment(Alignment::Center)
-        .wrap(Wrap { trim: true });
-    
-    f.render_widget(paragraph, dialog_area);
-}
-
-// ============ BASH CONFIRMATION DIALOG ============
-
-fn render_bash_confirmation(f: &mut Frame, app: &App) {
-    if app.bash_confirmation.is_none() {
-        return;
-    }
-    
-    let conf = app.bash_confirmation.as_ref().unwrap();
-    let area = f.area();
-    
-    let dialog_width = (area.width * 3 / 4).min(60);
-    let dialog_height = 7;
-    let dialog_x = (area.width - dialog_width) / 2;
-    let dialog_y = (area.height - dialog_height) / 2;
-    
-    let dialog_area = Rect {
-        x: dialog_x,
-        y: dialog_y,
-        width: dialog_width,
-        height: dialog_height,
-    };
-    
-    f.render_widget(Clear, dialog_area);
-    
-    let content = vec![
-        Line::from(Span::styled(
-            "⚠️ Confirm Command Execution",
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-        )),
-        Line::from(""),
-        Line::from(format!("Command: {}", conf.command)),
-        Line::from(""),
-        Line::from("  [ ESC / Decline ]  ←  →  [ Enter / Execute ]"),
-        Line::from(Span::styled(
-            "Use ←/→ to select, Enter to confirm, ESC to cancel",
-            Style::default().fg(Color::DarkGray),
-        )),
-    ];
-    
-    let text = Text::from(content);
-    let paragraph = Paragraph::new(text)
-        .block(Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Yellow))
-            .title(" ⚡ Command Confirmation "))
-        .alignment(Alignment::Center)
-        .wrap(Wrap { trim: true });
-    
-    f.render_widget(paragraph, dialog_area);
-}
-
-// ============ UI RENDERING ============
-
-fn ui(f: &mut Frame, app: &mut App) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .margin(1)
-        .constraints([
-            Constraint::Length(1),
-            Constraint::Min(1),
-            Constraint::Length(3),
-            Constraint::Length(1),
-        ].as_ref())
-        .split(f.area());
-
-    render_menu_bar(f, app, chunks[0]);
-
-    let mode_indicator = match app.mode {
-        AppMode::Chat => "💬 CHAT MODE",
-        AppMode::Agent => "🤖 AGENT MODE (Tools available)",
-    };
-    
-    let model_display = app.get_model_display();
-    let model_display_with_cloud = if app.model.starts_with("cloud@") {
-        format!("☁️ {}", model_display)
-    } else {
-        model_display.clone()
-    };
-    
-    let output_area = chunks[1];
-    let output_block = Block::default()
-        .borders(Borders::ALL)
-        .title(format!("📝 Response [{}] - {}", mode_indicator, model_display_with_cloud));
-    
-    if let Some(err) = &app.error {
-        let error_text = Paragraph::new(format!("❌ Error: {}", err))
-            .style(Style::default().fg(Color::Red))
-            .block(output_block)
-            .wrap(Wrap { trim: true });
-        f.render_widget(error_text, output_area);
-    } else {
-        let content_height = if !app.output.is_empty() {
-            let text = MarkdownRenderer::render(&app.output);
-            text.height()
-        } else {
-            0
-        };
-        
-        let viewport_height = output_area.height.saturating_sub(2) as usize;
-        
-        app.update_max_scroll(content_height, viewport_height);
-        
-        let visible_text = if !app.output.is_empty() {
-            let full_text = MarkdownRenderer::render(&app.output);
-            let start = app.scroll_offset.min(content_height.saturating_sub(1));
-            let end = (start + viewport_height).min(content_height);
-            
-            let mut visible_lines = Vec::new();
-            for i in start..end {
-                if let Some(line) = full_text.lines.get(i) {
-                    visible_lines.push(line.clone());
-                }
-            }
-            Text::from(visible_lines)
-        } else {
-            Text::default()
-        };
-        
-        let paragraph = Paragraph::new(visible_text)
-            .block(output_block)
-            .wrap(Wrap { trim: true });
-        f.render_widget(paragraph, output_area);
-        
-        if content_height > viewport_height {
-            let scrollbar_area = Rect {
-                x: output_area.x + output_area.width - 2,
-                y: output_area.y + 1,
-                width: 1,
-                height: output_area.height.saturating_sub(2),
-            };
-            
-            let mut scrollbar_state = ScrollbarState::default()
-                .content_length(content_height)
-                .position(app.scroll_offset);
-            
-            f.render_stateful_widget(
-                Scrollbar::default()
-                    .orientation(ScrollbarOrientation::VerticalRight)
-                    .begin_symbol(Some("↑"))
-                    .end_symbol(Some("↓"))
-                    .track_symbol(Some("│"))
-                    .thumb_symbol("█"),
-                scrollbar_area,
-                &mut scrollbar_state,
-            );
-        }
-    }
-
-    let input_block = Block::default()
-        .borders(Borders::ALL)
-        .title("✏️ Input");
-    let input_text = app.input.clone();
-    let input = Paragraph::new(input_text)
-        .style(Style::default().fg(Color::White))
-        .block(input_block)
-        .wrap(Wrap { trim: true });
-    f.render_widget(input, chunks[2]);
-
-    let status_text = if let Some(msg) = &app.status_message {
-        msg.clone()
-    } else if let Some(err) = &app.error {
-        format!("❌ {}", err)
-    } else if app.is_loading {
-        "⏳ Processing request...".to_string()
-    } else {
-        let cloud_indicator = if app.model.starts_with("cloud@") { "☁️ " } else { "" };
-        let tools_indicator = if app.mode == AppMode::Agent { " 🔧" } else { "" };
-        let context_indicator = if !app.conversation.is_empty() { " 📚" } else { "" };
-        format!("🤖 {}{}{}{} | Ctrl+S to save | F9 for menu | /help for commands", 
-            cloud_indicator,
-            app.get_model_display(), 
-            tools_indicator,
-            context_indicator
-        )
-    };
-    let status = Paragraph::new(status_text)
-        .style(Style::default().fg(Color::DarkGray))
-        .alignment(Alignment::Center);
-    f.render_widget(status, chunks[3]);
-
-    render_file_browser(f, app);
-    render_bash_confirmation(f, app);
-    render_menu_popup(f, app);
-    render_about_dialog(f, app);
-
-    if !app.menu.active && !app.show_about {
-        let cursor_x = chunks[2].x + 1 + app.input.len() as u16;
-        let cursor_y = chunks[2].y + 1;
-        f.set_cursor_position((cursor_x, cursor_y));
-    }
-}
-
-// ============ MAIN ============
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    log_message("=== APP STARTED ===");
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
+    terminal.clear()?;
 
-    let (tx, mut rx) = mpsc::unbounded_channel::<String>();
-    
-    let ollama_client = OllamaClient::new(None);
-    let cloud_configs = CloudModelConfig::get_default_configs();
-    
-    let mut app = App::new(ollama_client.clone(), cloud_configs);
-    
-    match ollama_client.list_models().await {
-        Ok(models) => {
-            let mut all_models = models.clone();
-            let cloud_models = app.get_cloud_models();
-            all_models.extend(cloud_models);
-            
-            if !all_models.is_empty() {
-                app.models = all_models;
-                app.model = models[0].clone();
-                let cloud_count = app.get_cloud_models().len();
-                app.status_message = Some(format!(
-                    "✅ Connected - {} local models, {} cloud models available", 
-                    models.len() - cloud_count,
-                    cloud_count
-                ));
-            }
-        }
-        Err(e) => {
-            app.error = Some(format!("Failed to connect to Ollama: {}", e));
-        }
-    }
-    
-    let app = Arc::new(Mutex::new(app));
-    let app_clone = app.clone();
-    
-    let res = run_app(&mut terminal, app_clone, &mut rx, ollama_client, tx).await;
+    let mut app = App::new(Config::load());
+    let result = run_app(&mut terminal, &mut app);
 
     disable_raw_mode()?;
     execute!(
@@ -2391,415 +48,1498 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     terminal.show_cursor()?;
 
-    if let Err(err) = res {
-        println!("{:?}", err);
+    if let Err(e) = result {
+        eprintln!("Error: {}", e);
     }
 
-    log_message("=== APP EXITED ===");
     Ok(())
 }
 
-async fn run_app(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    app_arc: Arc<Mutex<App>>,
-    rx: &mut mpsc::UnboundedReceiver<String>,
-    ollama_client: OllamaClient,
-    tx: mpsc::UnboundedSender<String>,
-) -> io::Result<()> {
-    let tx_clone = tx.clone();
-    
+fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> io::Result<()>
+where
+    io::Error: From<<B as Backend>::Error>,
+{
     loop {
-        // Render the UI
-        {
-            let mut app = app_arc.lock().await;
-            terminal.draw(|f| ui(f, &mut *app))?;
+        terminal.draw(|f| ui(f, app))?;
+
+        if event::poll(Duration::from_millis(50))? {
+            match event::read()? {
+                Event::Key(key) => {
+                    app.handle_key(key);
+                }
+                Event::Mouse(mouse) => match mouse.kind {
+                    MouseEventKind::ScrollUp => app.scroll_up(),
+                    MouseEventKind::ScrollDown => app.scroll_down(),
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        let size = terminal.size()?;
+                        app.handle_click(mouse.column, mouse.row, size.width, size.height);
+                    }
+                    _ => {}
+                },
+                _ => {}
+            }
+            while event::poll(Duration::ZERO)? {
+                match event::read()? {
+                    Event::Key(key) => {
+                        app.handle_key(key);
+                    }
+                    Event::Mouse(mouse) => match mouse.kind {
+                        MouseEventKind::ScrollUp => app.scroll_up(),
+                        MouseEventKind::ScrollDown => app.scroll_down(),
+                        MouseEventKind::Down(MouseButton::Left) => {
+                            let size = terminal.size()?;
+                            app.handle_click(mouse.column, mouse.row, size.width, size.height);
+                        }
+                        _ => {}
+                    },
+                    _ => {}
+                }
+            }
         }
 
-        // Process all pending channel messages
-        while let Ok(chunk) = rx.try_recv() {
-            let mut app = app_arc.lock().await;
-            
-            if chunk == "__DONE__" {
-                log_message("RECEIVED DONE marker");
-                app.is_loading = false;
-                app.status_message = None;
-                app.auto_scroll = true;
-                app.has_model_line = false;
-                continue;
-            }
+        app.check_responses();
+        app.check_model_responses();
 
-            if chunk.starts_with("MODEL_LINE:") {
-                let model_name = chunk.strip_prefix("MODEL_LINE:").unwrap_or("").to_string();
-                let new_line = format!("{}: ", model_name);
-                if !app.output.is_empty() && !app.output.ends_with('\n') {
-                    app.output.push('\n');
-                }
-                app.output.push_str(&new_line);
-                app.has_model_line = true;
-                app.auto_scroll = true;
-                continue;
-            }
+        if app.should_quit {
+            return Ok(());
+        }
+    }
+}
 
-            if app.has_model_line {
-                let chunk_clone = chunk.clone();
-                app.streaming_buffer = chunk_clone;
-                let model_display = app.get_model_display();
-                let model_prefix = format!("{}:", model_display);
-                
-                let lines: Vec<&str> = app.output.lines().collect();
-                let mut model_line_index = None;
-                for (i, line) in lines.iter().enumerate().rev() {
-                    if line.starts_with(&model_prefix) {
-                        model_line_index = Some(i);
-                        break;
-                    }
+fn ui(f: &mut Frame, app: &mut App) {
+    let area = f.area();
+
+    let main_chunks = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(1),
+        Constraint::Length(1),
+    ])
+    .split(area);
+
+    render_menu_bar(f, app, main_chunks[0]);
+    render_keybar(f, app, main_chunks[2]);
+
+    let content_chunks =
+        Layout::vertical([Constraint::Min(3), Constraint::Length(5)]).split(main_chunks[1]);
+
+    render_output(f, app, content_chunks[0]);
+    render_input(f, app, content_chunks[1]);
+
+    if app.active_menu != ActiveMenu::None {
+        render_submenu(f, app, main_chunks[0]);
+    }
+
+    if app.show_about {
+        render_about_popup(f, area);
+    }
+
+    if app.show_model_dialog {
+        render_model_dialog(f, app, area);
+    }
+
+    if app.show_file_dialog {
+        render_file_dialog(f, app, area);
+    }
+
+    if app.show_save_dialog {
+        render_save_dialog(f, app, area);
+    }
+}
+
+fn render_menu_bar(f: &mut Frame, app: &App, area: Rect) {
+    let normal_style = Style::default().fg(Color::White).bg(Color::DarkGray);
+    let selected_style = Style::default().fg(Color::Black).bg(Color::White);
+
+    let file_style = if app.active_menu == ActiveMenu::File {
+        selected_style
+    } else {
+        normal_style
+    };
+    let options_style = if app.active_menu == ActiveMenu::Options {
+        selected_style
+    } else {
+        normal_style
+    };
+    let help_style = if app.active_menu == ActiveMenu::Help {
+        selected_style
+    } else {
+        normal_style
+    };
+
+    let agentic_indicator = if app.agentic_mode {
+        Span::styled(
+            " [AGENTIC] ",
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
+        Span::styled(" ", normal_style)
+    };
+
+    let menu_bar = Line::from(vec![
+        Span::styled(" File ", file_style),
+        Span::styled(" ", normal_style),
+        Span::styled(" Options ", options_style),
+        Span::styled(" ", normal_style),
+        Span::styled(" Help ", help_style),
+        agentic_indicator,
+    ]);
+
+    f.render_widget(Paragraph::new(menu_bar).style(normal_style), area);
+}
+
+fn render_output(f: &mut Frame, app: &mut App, area: Rect) {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
+    for msg in &app.messages {
+        match msg {
+            ChatMessage::User(text) => {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        " > ",
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        text.clone(),
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ]));
+                lines.push(Line::from(""));
+            }
+            ChatMessage::Assistant(text) => {
+                let mut md_lines = render_markdown(text);
+                lines.append(&mut md_lines);
+            }
+            ChatMessage::System(text) => {
+                for text_line in text.lines() {
+                    lines.push(Line::from(Span::styled(
+                        format!("  {}", text_line),
+                        Style::default()
+                            .fg(Color::DarkGray)
+                            .add_modifier(Modifier::ITALIC),
+                    )));
                 }
-                
-                let streaming_content = app.streaming_buffer.clone();
-                
-                if let Some(idx) = model_line_index {
-                    let mut new_output = lines[..idx].join("\n");
-                    if !new_output.is_empty() {
-                        new_output.push('\n');
-                    }
-                    new_output.push_str(&format!("{}: {}", model_display, streaming_content));
-                    app.output = new_output;
+                lines.push(Line::from(""));
+            }
+            ChatMessage::App(text) => {
+                for text_line in text.lines() {
+                    lines.push(Line::from(Span::styled(
+                        format!("  {}", text_line),
+                        Style::default()
+                            .fg(Color::DarkGray)
+                            .add_modifier(Modifier::ITALIC),
+                    )));
+                }
+                lines.push(Line::from(""));
+            }
+            ChatMessage::FileContent { name, content } => {
+                lines.push(Line::from(Span::styled(
+                    format!("  \u{1F4C4} {}", name),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                )));
+                let mut md_lines = render_markdown(content);
+                lines.append(&mut md_lines);
+                lines.push(Line::from(""));
+            }
+            ChatMessage::ToolCall { name, arguments } => {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        " \u{2699} ",
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        format!("TOOL CALL: {}", name),
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ]));
+                let pretty_args = serde_json::from_str::<serde_json::Value>(arguments)
+                    .ok()
+                    .and_then(|v| serde_json::to_string_pretty(&v).ok())
+                    .unwrap_or_else(|| arguments.to_string());
+                for arg_line in pretty_args.lines() {
+                    lines.push(Line::from(Span::styled(
+                        format!("    {}", arg_line),
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                }
+                lines.push(Line::from(""));
+            }
+            ChatMessage::ToolResult { name, content } => {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        " \u{2714} ",
+                        Style::default()
+                            .fg(Color::Green)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        format!("RESULT: {}", name),
+                        Style::default()
+                            .fg(Color::Green)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ]));
+                let preview = if content.len() > 500 {
+                    format!("{}... ({} bytes total)", &content[..500], content.len())
                 } else {
-                    let full_line = format!("{}: {}", model_display, streaming_content);
-                    if !app.output.contains(&full_line) {
-                        if !app.output.is_empty() && !app.output.ends_with('\n') {
-                            app.output.push('\n');
-                        }
-                        app.output.push_str(&full_line);
-                    }
+                    content.to_string()
+                };
+                for result_line in preview.lines().take(20) {
+                    lines.push(Line::from(Span::styled(
+                        format!("    {}", result_line),
+                        Style::default().fg(Color::DarkGray),
+                    )));
                 }
-                app.auto_scroll = true;
-                app.status_message = None;
-            } else {
-                log_message(&format!("Command result: {}", chunk));
-                if !app.output.is_empty() && !app.output.ends_with('\n') {
-                    app.output.push('\n');
+                if content.lines().count() > 20 {
+                    lines.push(Line::from(Span::styled(
+                        format!("    ... ({} more lines)", content.lines().count() - 20),
+                        Style::default().fg(Color::DarkGray),
+                    )));
                 }
-                app.output.push_str(&chunk);
-                app.auto_scroll = true;
-                app.status_message = None;
-            }
-        }
-
-        // Process events with improved responsiveness
-        // Use a shorter poll timeout (16ms = ~60 FPS) and process multiple events per frame
-        if event::poll(Duration::from_millis(16))? {
-            // Process up to 10 events per frame to clear the queue
-            for _ in 0..10 {
-                match event::read() {
-                    Ok(Event::Key(key)) => {
-                        let mut app = app_arc.lock().await;
-                        match key.code {
-                            KeyCode::Char('q') if key.modifiers == crossterm::event::KeyModifiers::CONTROL => {
-                                app.cleanup_and_exit();
-                            }
-                            KeyCode::Char('s') if key.modifiers == crossterm::event::KeyModifiers::CONTROL => {
-                                if !app.is_loading {
-                                    app.save_conversation();
-                                }
-                            }
-                            KeyCode::F(9) => {
-                                app.menu.toggle();
-                                if app.menu.active {
-                                    app.show_about = false;
-                                }
-                            }
-                            KeyCode::Esc => {
-                                if let Some(_) = app.bash_confirmation {
-                                    app.confirm_bash_execution(false);
-                                } else if let Some(_) = app.file_browser {
-                                    app.file_browser = None;
-                                    app.status_message = Some("❌ Load cancelled".to_string());
-                                } else if app.menu.active {
-                                    app.menu.deactivate();
-                                } else if app.show_about {
-                                    app.show_about = false;
-                                }
-                            }
-                            KeyCode::PageUp => {
-                                if app.scroll_offset > 0 {
-                                    app.scroll_offset = app.scroll_offset.saturating_sub(10);
-                                    app.auto_scroll = false;
-                                }
-                            }
-                            KeyCode::PageDown => {
-                                if app.scroll_offset < app.max_scroll {
-                                    app.scroll_offset = (app.scroll_offset + 10).min(app.max_scroll);
-                                    app.auto_scroll = false;
-                                }
-                            }
-                            KeyCode::Home => {
-                                app.scroll_offset = 0;
-                                app.auto_scroll = false;
-                            }
-                            KeyCode::End => {
-                                app.scroll_offset = app.max_scroll;
-                                app.auto_scroll = true;
-                            }
-                            KeyCode::Up => {
-                                if app.menu.active {
-                                    app.menu.navigate(-1);
-                                } else if let Some(browser) = &mut app.file_browser {
-                                    if browser.selected > 0 {
-                                        browser.selected -= 1;
-                                        if browser.selected < browser.scroll_offset {
-                                            browser.scroll_offset = browser.selected;
-                                        }
-                                    }
-                                } else if !app.show_about && !app.is_loading {
-                                    if let Some(prev) = app.previous_history() {
-                                        app.input = prev;
-                                    }
-                                }
-                            }
-                            KeyCode::Down => {
-                                if app.menu.active {
-                                    if app.menu.selected_subitem == 0 {
-                                        app.menu.selected_subitem = 1;
-                                    } else {
-                                        app.menu.navigate(1);
-                                    }
-                                } else if let Some(browser) = &mut app.file_browser {
-                                    if browser.selected + 1 < browser.entries.len() {
-                                        browser.selected += 1;
-                                        let visible_count = (browser.entries.len() - 1).min(14);
-                                        if browser.selected > browser.scroll_offset + visible_count {
-                                            browser.scroll_offset = browser.selected - visible_count;
-                                        }
-                                    }
-                                } else if !app.show_about && !app.is_loading {
-                                    if let Some(next) = app.next_history() {
-                                        app.input = next;
-                                    }
-                                }
-                            }
-                            KeyCode::Left => {
-                                if app.menu.active {
-                                    app.menu.selected_subitem = 0;
-                                    app.menu.navigate(-1);
-                                }
-                            }
-                            KeyCode::Right => {
-                                if app.menu.active {
-                                    app.menu.selected_subitem = 0;
-                                    app.menu.navigate(1);
-                                }
-                            }
-                            KeyCode::Enter => {
-                                if app.show_about {
-                                    app.show_about = false;
-                                } else if let Some(browser) = &mut app.file_browser.take() {
-                                    if let Some(entry) = browser.entries.get(browser.selected) {
-                                        let new_path = if browser.path == "." {
-                                            entry.name.clone()
-                                        } else {
-                                            format!("{}/{}", browser.path, entry.name)
-                                        };
-                                        
-                                        if entry.is_dir {
-                                            match app.list_files(&new_path) {
-                                                Ok(entries) => {
-                                                    app.file_browser = Some(FileBrowserState {
-                                                        path: new_path,
-                                                        entries,
-                                                        selected: 0,
-                                                        scroll_offset: 0,
-                                                    });
-                                                }
-                                                Err(e) => {
-                                                    app.status_message = Some(format!("❌ {}", e));
-                                                    app.file_browser = None;
-                                                }
-                                            }
-                                        } else {
-                                            let result = app.load_conversation(&new_path);
-                                            match result {
-                                                Ok(msg) => {
-                                                    app.status_message = Some(msg);
-                                                    if !app.output.is_empty() && !app.output.ends_with('\n') {
-                                                        app.output.push('\n');
-                                                    }
-                                                    app.output.push_str(&format!("📂 Loaded conversation from {}\n", new_path));
-                                                    app.file_browser = None;
-                                                }
-                                                Err(e) => {
-                                                    app.status_message = Some(format!("❌ {}", e));
-                                                    app.file_browser = None;
-                                                }
-                                            }
-                                        }
-                                    } else {
-                                        app.file_browser = None;
-                                    }
-                                } else if let Some(_) = app.bash_confirmation {
-                                    app.confirm_bash_execution(true);
-                                } else if app.menu.active {
-                                    if app.menu.selected_subitem > 0 {
-                                        let menu = &mut app.menu;
-                                        let menu_index = menu.selected_menu;
-                                        let sub_index = menu.selected_subitem - 1;
-                                        let action = menu.select_subitem(menu_index, sub_index);
-                                        app.handle_menu_action(action);
-                                    }
-                                } else if !app.input.is_empty() && !app.is_loading {
-                                    let prompt = app.input.clone();
-                                    app.input.clear();
-                                    
-                                    if prompt.starts_with('/') {
-                                        let handled = handle_command(&prompt, &mut app, &ollama_client, &tx_clone).await;
-                                        if handled {
-                                            continue;
-                                        }
-                                    }
-                                    
-                                    if !app.output.is_empty() && !app.output.ends_with('\n') {
-                                        app.output.push('\n');
-                                    }
-                                    app.output.push_str(&format!("USER: {}", prompt));
-                                    
-                                    app.add_to_history(prompt.clone());
-                                    app.is_loading = true;
-                                    app.status_message = Some("⏳ Processing request...".to_string());
-                                    app.auto_scroll = true;
-                                    app.has_model_line = false;
-                                    
-                                    let app_clone = app_arc.clone();
-                                    let tx = tx_clone.clone();
-                                    let prompt_clone = prompt.clone();
-                                    
-                                    tokio::spawn(async move {
-                                        let mut app = app_clone.lock().await;
-                                        log_message(&format!("SPAWNED task for: {}", prompt_clone));
-                                        let response = app.process_chat_request(prompt_clone, tx.clone()).await;
-                                        log_message(&format!("Task complete, sending response"));
-                                        let _ = tx.send(response);
-                                    });
-                                }
-                            }
-                            KeyCode::Char(c) => {
-                                if !app.menu.active && !app.show_about && app.file_browser.is_none() && app.bash_confirmation.is_none() {
-                                    app.input.push(c);
-                                }
-                            }
-                            KeyCode::Backspace => {
-                                if !app.menu.active && !app.show_about && app.file_browser.is_none() && app.bash_confirmation.is_none() {
-                                    app.input.pop();
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                    Ok(Event::Mouse(mouse)) => {
-                        let mut app = app_arc.lock().await;
-                        match mouse.kind {
-                            MouseEventKind::ScrollUp => {
-                                if app.menu.active {
-                                    app.menu.navigate(-1);
-                                } else if !app.show_about && app.scroll_offset > 0 {
-                                    app.scroll_offset = app.scroll_offset.saturating_sub(3);
-                                    app.auto_scroll = false;
-                                }
-                            }
-                            MouseEventKind::ScrollDown => {
-                                if app.menu.active {
-                                    app.menu.navigate(1);
-                                } else if !app.show_about && app.scroll_offset < app.max_scroll {
-                                    app.scroll_offset = (app.scroll_offset + 3).min(app.max_scroll);
-                                    app.auto_scroll = false;
-                                }
-                            }
-                            MouseEventKind::Down(MouseButton::Left) => {
-                                if app.show_about {
-                                    let area = terminal.get_frame().area();
-                                    let dialog_width = (area.width * 2 / 5).min(40);
-                                    let dialog_height = 8;
-                                    let dialog_x = (area.width - dialog_width) / 2;
-                                    let dialog_y = (area.height - dialog_height) / 2;
-                                    
-                                    let dialog_area = Rect {
-                                        x: dialog_x,
-                                        y: dialog_y,
-                                        width: dialog_width,
-                                        height: dialog_height,
-                                    };
-                                    
-                                    if mouse.column < dialog_area.x || mouse.column > dialog_area.x + dialog_area.width
-                                        || mouse.row < dialog_area.y || mouse.row > dialog_area.y + dialog_area.height {
-                                        app.show_about = false;
-                                    }
-                                    continue;
-                                }
-                                
-                                let menu_bar = app.menu.menu_bar_rect;
-                                
-                                if mouse.row == menu_bar.y && mouse.column >= menu_bar.x && mouse.column < menu_bar.x + menu_bar.width {
-                                    let click_x = mouse.column - menu_bar.x;
-                                    
-                                    let menu_idx = if click_x < 8 {
-                                        0
-                                    } else if click_x < 18 {
-                                        1
-                                    } else {
-                                        2
-                                    };
-                                    
-                                    if !app.menu.active || app.menu.selected_menu != menu_idx {
-                                        app.menu.activate();
-                                        app.menu.selected_menu = menu_idx;
-                                        app.menu.selected_subitem = 1;
-                                    } else {
-                                        app.menu.deactivate();
-                                    }
-                                    continue;
-                                }
-                                
-                                if app.menu.active {
-                                    let menu_index = app.menu.selected_menu;
-                                    let sub_items = app.menu.get_submenu_items(menu_index);
-                                    if !sub_items.is_empty() {
-                                        let (menu_x, menu_y) = if menu_index < app.menu.menu_positions.len() {
-                                            app.menu.menu_positions[menu_index]
-                                        } else {
-                                            (2, 2)
-                                        };
-                                        
-                                        let submenu_area = Rect {
-                                            x: menu_x,
-                                            y: menu_y + 1,
-                                            width: 20,
-                                            height: sub_items.len() as u16 + 2,
-                                        };
-                                        
-                                        if mouse.column >= submenu_area.x && mouse.column <= submenu_area.x + submenu_area.width
-                                            && mouse.row >= submenu_area.y && mouse.row <= submenu_area.y + submenu_area.height {
-                                            let sub_index = (mouse.row - submenu_area.y - 1) as usize;
-                                            if sub_index < sub_items.len() {
-                                                let action = app.menu.select_subitem(
-                                                    menu_index,
-                                                    sub_index
-                                                );
-                                                app.handle_menu_action(action);
-                                            }
-                                        } else {
-                                            app.menu.deactivate();
-                                        }
-                                    } else {
-                                        app.menu.deactivate();
-                                    }
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                    Ok(_) => {}
-                    Err(_) => break, // No more events in queue
-                }
+                lines.push(Line::from(""));
             }
         }
     }
+
+    if app.is_loading && !app.streaming_text.is_empty() {
+        let mut md_lines = render_markdown(&app.streaming_text);
+        lines.append(&mut md_lines);
+    } else if app.is_loading {
+        lines.push(Line::from(Span::styled(
+            "  Streaming response...",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::SLOW_BLINK),
+        )));
+    }
+
+    let output_width = area.width.saturating_sub(4) as usize;
+    let lines = wrap_and_justify_lines(lines, output_width);
+
+    let total_lines = lines.len() as u16;
+    let visible_height = area.height.saturating_sub(2);
+    let max_scroll = total_lines.saturating_sub(visible_height);
+    let scroll = app.scroll_offset.min(max_scroll);
+    app.scroll_offset = scroll;
+
+    let focus_style = if app.focus == Focus::Output {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Output ")
+        .border_style(focus_style);
+
+    let paragraph = Paragraph::new(lines).block(block).scroll((scroll, 0));
+
+    let content_area = Rect {
+        x: area.x,
+        y: area.y,
+        width: area.width.saturating_sub(1),
+        height: area.height,
+    };
+    f.render_widget(paragraph, content_area);
+
+    let scrollbar_area = Rect {
+        x: area.x + area.width - 1,
+        y: area.y,
+        width: 1,
+        height: area.height,
+    };
+
+    let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+        .begin_symbol(Some("▲"))
+        .end_symbol(Some("▼"))
+        .track_symbol(Some("│"))
+        .thumb_style(
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        )
+        .track_style(Style::default().fg(Color::DarkGray));
+
+    let mut scrollbar_state = ScrollbarState::new(max_scroll as usize).position(scroll as usize);
+    f.render_stateful_widget(scrollbar, scrollbar_area, &mut scrollbar_state);
+}
+
+fn render_input(f: &mut Frame, app: &App, area: Rect) {
+    let stats_str = if app.token_stats.prompt_tokens > 0 || app.token_stats.response_tokens > 0 {
+        format!(
+            " in:{} out:{} {}ms ",
+            app.token_stats.prompt_tokens,
+            app.token_stats.response_tokens,
+            app.token_stats.total_duration_ms,
+        )
+    } else {
+        String::new()
+    };
+
+    let (title, border_style) = match (&app.input_mode, &app.focus) {
+        (InputMode::Input, Focus::Input) => (
+            format!(" Input (Alt+Enter: send){} ", stats_str),
+            Style::default().fg(Color::Green),
+        ),
+        (_, Focus::Input) => (
+            format!(" Input (i or Enter to type){} ", stats_str),
+            Style::default().fg(Color::Yellow),
+        ),
+        _ => (
+            format!(" Input (i or Enter to type){} ", stats_str),
+            Style::default().fg(Color::DarkGray),
+        ),
+    };
+
+    let inner_h = area.height.saturating_sub(2) as usize;
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .border_style(border_style);
+
+    if app.input_text.is_empty() && app.input_mode != InputMode::Input {
+        let placeholder = Paragraph::new(vec![
+            Line::from(Span::styled(
+                "Type a message...",
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::ITALIC),
+            )),
+        ])
+        .block(block);
+        f.render_widget(placeholder, area);
+        render_send_button(f, app, area);
+        return;
+    }
+
+    let lines = app.input_text.lines().collect::<Vec<_>>();
+    let (cur_row, cur_col) = app.cursor_row_col();
+    let total_lines = lines.len();
+
+    let scroll_row = if total_lines > inner_h && inner_h > 0 {
+        if cur_row + 1 > inner_h {
+            cur_row + 2 - inner_h
+        } else {
+            0
+        }
+    } else {
+        0
+    };
+
+    let display_lines: Vec<Line> = lines
+        .iter()
+        .enumerate()
+        .skip(scroll_row)
+        .take(inner_h)
+        .map(|(row_idx, line)| {
+            let chars: Vec<char> = line.chars().collect();
+            let mut spans: Vec<Span> = Vec::new();
+
+            let sel_range = app.selection_range();
+
+            for (col_idx, c) in chars.iter().enumerate() {
+                let char_pos = app.pos_from_row_col(row_idx, col_idx);
+                let is_cursor = app.input_mode == InputMode::Input
+                    && row_idx == cur_row
+                    && col_idx == cur_col;
+                let is_selected = sel_range
+                    .map_or(false, |(start, end)| char_pos >= start && char_pos < end);
+
+                let style = if is_cursor && is_selected {
+                    Style::default().bg(Color::Rgb(100, 100, 255)).fg(Color::White)
+                } else if is_cursor {
+                    Style::default().bg(Color::White).fg(Color::Black)
+                } else if is_selected {
+                    Style::default().bg(Color::Rgb(50, 50, 150)).fg(Color::White)
+                } else {
+                    Style::default()
+                };
+                spans.push(Span::styled(c.to_string(), style));
+            }
+
+            if app.input_mode == InputMode::Input && row_idx == cur_row && cur_col == chars.len()
+            {
+                spans.push(Span::styled(" ", Style::default().bg(Color::White)));
+            }
+
+            Line::from(spans)
+        })
+        .collect();
+
+    let paragraph = Paragraph::new(display_lines).block(block);
+
+    f.render_widget(paragraph, area);
+    render_send_button(f, app, area);
+}
+
+fn render_send_button(f: &mut Frame, app: &App, area: Rect) {
+    let has_text = !app.input_text.trim().is_empty();
+    let btn_x = area.x + area.width.saturating_sub(13);
+    let btn_y = area.y + area.height.saturating_sub(1);
+
+    let send_btn = Button::new("send", btn_x, btn_y, has_text, Color::DarkGray, Color::Green);
+
+    let (btn_text, btn_style) = send_btn.render();
+    let btn_area = Rect {
+        x: btn_x,
+        y: btn_y,
+        width: send_btn.width,
+        height: 1,
+    };
+
+    f.render_widget(Clear, btn_area);
+    f.render_widget(Paragraph::new(Line::from(Span::styled(btn_text, btn_style))), btn_area);
+}
+
+fn render_keybar(f: &mut Frame, app: &App, area: Rect) {
+    let agentic_label = if app.agentic_mode {
+        " AGENTIC "
+    } else {
+        ""
+    };
+
+    let focus_label = match app.focus {
+        Focus::Output => " [OUTPUT] ",
+        Focus::Input => " [INPUT] ",
+    };
+
+    let text = match app.input_mode {
+        InputMode::Normal => {
+            if !app.status_message.is_empty() {
+                format!(
+                    " {} | q:Quit i:Input Tab:Menu Ctrl+S:Save{}{}",
+                    app.status_message, agentic_label, focus_label
+                )
+            } else {
+                format!(
+                    " q:Quit  i:Input  F9/Tab:Menu  Ctrl+S:Save  Mouse:Click/Scroll{}{}",
+                    agentic_label, focus_label
+                )
+            }
+        }
+        InputMode::Input => {
+            format!(
+                " Alt+Enter:Send  Enter:Newline  \u{2190}\u{2191}\u{2193}\u{2192}:Cursor{}",
+                agentic_label
+            )
+        }
+        InputMode::Menu => " \u{2190}\u{2192}:Navigate  \u{2191}\u{2193}:Select  Enter:Open  Esc:Close"
+            .to_string(),
+    };
+
+    let keybar = Paragraph::new(Line::from(Span::styled(
+        text,
+        Style::default().fg(Color::White).bg(Color::DarkGray),
+    )))
+    .style(Style::default().bg(Color::DarkGray));
+
+    f.render_widget(keybar, area);
+}
+
+fn render_submenu(f: &mut Frame, app: &App, menu_bar_area: Rect) {
+    let items = app.menu_item_names();
+    if items.is_empty() {
+        return;
+    }
+
+    let menu_width = items.iter().map(|s| s.len()).max().unwrap_or(10) as u16 + 4;
+    let x_offset = match app.active_menu {
+        ActiveMenu::File => 0,
+        ActiveMenu::Options => 7,
+        ActiveMenu::Help => 17,
+        _ => 0,
+    };
+
+    let popup_area = Rect {
+        x: menu_bar_area.x + x_offset,
+        y: menu_bar_area.y + 1,
+        width: menu_width,
+        height: (items.len() as u16) + 2,
+    };
+
+    let list_items: Vec<ListItem> = items
+        .iter()
+        .enumerate()
+        .map(|(i, name)| {
+            let style = if i == app.menu_selection {
+                Style::default().fg(Color::Black).bg(Color::White)
+            } else {
+                Style::default()
+            };
+            ListItem::new(Line::from(Span::styled(format!(" {} ", name), style)))
+        })
+        .collect();
+
+    let list = List::new(list_items).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::White))
+            .style(Style::default().bg(Color::Black)),
+    );
+
+    f.render_widget(Clear, popup_area);
+    f.render_widget(list, popup_area);
+}
+
+fn dialog_block(title: &str) -> Block<'static> {
+    Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" {} ", title))
+        .border_style(Style::default().fg(Color::Cyan))
+        .style(Style::default().bg(Color::Black))
+        .shadow(Shadow::new(dimmed()).offset(Offset::new(1, 1)))
+}
+
+fn render_about_popup(f: &mut Frame, area: Rect) {
+    let popup_width = 50.min(area.width.saturating_sub(4));
+    let popup_height = 10.min(area.height.saturating_sub(4));
+    let popup_area = Rect {
+        x: (area.width.saturating_sub(popup_width)) / 2,
+        y: (area.height.saturating_sub(popup_height)) / 2,
+        width: popup_width,
+        height: popup_height,
+    };
+
+    f.render_widget(Clear, popup_area);
+    f.render_widget(dialog_block("About"), popup_area);
+
+    let inner = popup_area.inner(Margin::new(1, 1));
+
+    let about_text = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            "  Rustama",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from("  A terminal interface for Ollama LLM."),
+        Line::from("  Supports markdown rendering and saving."),
+        Line::from(""),
+        Line::from("  Built with ratatui + crossterm"),
+        Line::from(""),
+    ];
+
+    let text_area = Rect {
+        x: inner.x,
+        y: inner.y,
+        width: inner.width,
+        height: inner.height - 1,
+    };
+    f.render_widget(Paragraph::new(about_text), text_area);
+
+    let btn_y = inner.y + inner.height - 1;
+    let ok_btn = Button::new(
+        "OK",
+        inner.x + 20,
+        btn_y,
+        true,
+        Color::Cyan,
+        Color::Cyan,
+    );
+
+    let (ok_text, ok_style) = ok_btn.render();
+    let buttons = Line::from(vec![
+        Span::raw("                    "),
+        Span::styled(ok_text, ok_style),
+        Span::raw("                    "),
+    ]);
+
+    let btn_area = Rect {
+        x: inner.x,
+        y: btn_y,
+        width: inner.width,
+        height: 1,
+    };
+    f.render_widget(Paragraph::new(buttons), btn_area);
+}
+
+fn render_model_dialog(f: &mut Frame, app: &App, area: Rect) {
+    let model_count = app.available_models.len().min(12) as u16;
+    let dialog_w = 56u16;
+    let dialog_h = model_count + 7;
+
+    let popup_area = Rect {
+        x: (area.width.saturating_sub(dialog_w)) / 2,
+        y: (area.height.saturating_sub(dialog_h)) / 2,
+        width: dialog_w,
+        height: dialog_h,
+    };
+
+    let inner = popup_area.inner(Margin::new(1, 1));
+    f.render_widget(Clear, popup_area);
+    f.render_widget(dialog_block("Select Model"), popup_area);
+
+    if app.available_models.is_empty() {
+        let loading = Paragraph::new(Line::from(Span::styled(
+            "  Loading models...",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::SLOW_BLINK),
+        )));
+        f.render_widget(loading, inner);
+        return;
+    }
+
+    let list_height = model_count;
+    let list_area = Rect {
+        x: inner.x,
+        y: inner.y,
+        width: inner.width,
+        height: list_height,
+    };
+
+    let items: Vec<ListItem> = app
+        .available_models
+        .iter()
+        .enumerate()
+        .take(model_count as usize)
+        .map(|(i, name)| {
+            let is_current = name == &app.model_name;
+            let is_selected = i == app.model_dialog_selection;
+
+            let mut spans = Vec::new();
+            if is_selected {
+                spans.push(Span::styled(
+                    " > ",
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            } else {
+                spans.push(Span::styled("   ", Style::default()));
+            }
+
+            let name_style = if is_current {
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD)
+            } else if is_selected {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::White)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            };
+
+            let display_name = if name.len() > 46 {
+                format!("{}...", &name[..43])
+            } else {
+                name.clone()
+            };
+
+            spans.push(Span::styled(display_name, name_style));
+
+            if is_current {
+                spans.push(Span::styled(
+                    " (current)",
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::ITALIC),
+                ));
+            }
+
+            ListItem::new(Line::from(spans))
+        })
+        .collect();
+
+    let list = List::new(items);
+    f.render_widget(list, list_area);
+
+    let btn_y = inner.y + list_height + 1;
+    let confirm_btn = Button::new(
+        "Confirm",
+        inner.x + 10,
+        btn_y,
+        app.model_dialog_focus == ModelDialogFocus::Confirm,
+        Color::Green,
+        Color::Green,
+    );
+    let cancel_btn = Button::new(
+        "Cancel",
+        inner.x + 24,
+        btn_y,
+        app.model_dialog_focus == ModelDialogFocus::Cancel,
+        Color::Red,
+        Color::Red,
+    );
+
+    let (confirm_text, confirm_style) = confirm_btn.render();
+    let (cancel_text, cancel_style) = cancel_btn.render();
+
+    let buttons = Line::from(vec![
+        Span::raw("          "),
+        Span::styled(confirm_text, confirm_style),
+        Span::raw("   "),
+        Span::styled(cancel_text, cancel_style),
+        Span::raw("          "),
+    ]);
+
+    let btn_area = Rect {
+        x: inner.x,
+        y: btn_y,
+        width: inner.width,
+        height: 1,
+    };
+    f.render_widget(Paragraph::new(buttons), btn_area);
+}
+
+fn render_file_dialog(f: &mut Frame, app: &App, area: Rect) {
+    let entry_count = app.file_dialog_entries.len().min(12) as u16;
+    let dialog_w = 60u16;
+    let dialog_h = entry_count + 5;
+
+    let popup_area = Rect {
+        x: (area.width.saturating_sub(dialog_w)) / 2,
+        y: (area.height.saturating_sub(dialog_h)) / 2,
+        width: dialog_w,
+        height: dialog_h,
+    };
+
+    f.render_widget(Clear, popup_area);
+    f.render_widget(dialog_block("Load File"), popup_area);
+
+    let inner = popup_area.inner(Margin::new(1, 1));
+
+    let path_display = app.file_dialog_path.display().to_string();
+    let path_str = if path_display.len() > (inner.width as usize) {
+        format!("...{}", &path_display[path_display.len() - inner.width as usize + 3..])
+    } else {
+        path_display
+    };
+    let path_line = Paragraph::new(Line::from(Span::styled(
+        format!("  {}", path_str),
+        Style::default().fg(Color::DarkGray),
+    )));
+    let path_area = Rect {
+        x: inner.x,
+        y: inner.y,
+        width: inner.width,
+        height: 1,
+    };
+    f.render_widget(path_line, path_area);
+
+    let list_y = inner.y + 1;
+    let list_h = entry_count;
+    let list_area = Rect {
+        x: inner.x,
+        y: list_y,
+        width: inner.width,
+        height: list_h,
+    };
+
+    let visible_start = app.file_dialog_scroll;
+    let visible_end = (visible_start + list_h as usize).min(app.file_dialog_entries.len());
+
+    let items: Vec<ListItem> = app.file_dialog_entries[visible_start..visible_end]
+        .iter()
+        .enumerate()
+        .map(|(i, (name, is_dir))| {
+            let real_idx = visible_start + i;
+            let is_selected = real_idx == app.file_dialog_selection;
+
+            let mut spans = Vec::new();
+            if is_selected {
+                spans.push(Span::styled(
+                    " > ",
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            } else {
+                spans.push(Span::styled("   ", Style::default()));
+            }
+
+            let icon = if name == ".." {
+                "  "
+            } else if *is_dir {
+                "/ "
+            } else {
+                "  "
+            };
+
+            let name_style = if is_selected {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::White)
+                    .add_modifier(Modifier::BOLD)
+            } else if *is_dir {
+                Style::default()
+                    .fg(Color::Blue)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            };
+
+            spans.push(Span::styled(icon, name_style));
+            spans.push(Span::styled(name.clone(), name_style));
+
+            ListItem::new(Line::from(spans))
+        })
+        .collect();
+
+    let list = List::new(items);
+    f.render_widget(list, list_area);
+
+    let btn_y = inner.y + list_h + 2;
+    let open_btn = Button::new(
+        "Open",
+        inner.x + 8,
+        btn_y,
+        app.file_dialog_focus == FileDialogFocus::Open,
+        Color::Green,
+        Color::Green,
+    );
+    let cancel_btn = Button::new(
+        "Cancel",
+        inner.x + 21,
+        btn_y,
+        app.file_dialog_focus == FileDialogFocus::Cancel,
+        Color::Red,
+        Color::Red,
+    );
+
+    let (open_text, open_style) = open_btn.render();
+    let (cancel_text, cancel_style) = cancel_btn.render();
+
+    let buttons = Line::from(vec![
+        Span::raw("        "),
+        Span::styled(open_text, open_style),
+        Span::raw("     "),
+        Span::styled(cancel_text, cancel_style),
+        Span::raw("        "),
+    ]);
+
+    let btn_area = Rect {
+        x: inner.x,
+        y: btn_y,
+        width: inner.width,
+        height: 1,
+    };
+    f.render_widget(Paragraph::new(buttons), btn_area);
+}
+
+fn render_save_dialog(f: &mut Frame, app: &App, area: Rect) {
+    let dialog_w: u16 = 60;
+    let dialog_h: u16 = 7;
+
+    let popup_area = Rect {
+        x: (area.width.saturating_sub(dialog_w)) / 2,
+        y: (area.height.saturating_sub(dialog_h)) / 2,
+        width: dialog_w,
+        height: dialog_h,
+    };
+
+    f.render_widget(Clear, popup_area);
+    f.render_widget(dialog_block("Save As"), popup_area);
+
+    let inner = popup_area.inner(Margin::new(1, 1));
+
+    let label = Paragraph::new(Line::from(Span::styled(
+        "  File path:",
+        Style::default().fg(Color::White),
+    )));
+    let label_area = Rect {
+        x: inner.x,
+        y: inner.y,
+        width: inner.width,
+        height: 1,
+    };
+    f.render_widget(label, label_area);
+
+    let path_style = if app.save_dialog_focus == SaveDialogFocus::Path {
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::White)
+    } else {
+        Style::default().fg(Color::White).bg(Color::Rgb(40, 40, 40))
+    };
+
+    let path_display = if app.save_dialog_path.is_empty() && app.save_dialog_focus == SaveDialogFocus::Path {
+        format!("{} ", " ".repeat(app.save_dialog_cursor))
+    } else {
+        let chars: Vec<char> = app.save_dialog_path.chars().collect();
+        let mut display = String::new();
+        for (i, c) in chars.iter().enumerate() {
+            if i == app.save_dialog_cursor && app.save_dialog_focus == SaveDialogFocus::Path {
+                display.push_str(&format!("[{}]", c));
+            } else {
+                display.push(*c);
+            }
+        }
+        if app.save_dialog_cursor == chars.len() && app.save_dialog_focus == SaveDialogFocus::Path {
+            display.push(' ');
+        }
+        display
+    };
+
+    let path_line = Paragraph::new(Line::from(Span::styled(
+        format!("  {}", path_display),
+        path_style,
+    )));
+    let path_area = Rect {
+        x: inner.x,
+        y: inner.y + 2,
+        width: inner.width,
+        height: 1,
+    };
+    f.render_widget(path_line, path_area);
+
+    let btn_y = inner.y + 4;
+    let save_btn = Button::new(
+        "Save",
+        inner.x + 10,
+        btn_y,
+        app.save_dialog_focus == SaveDialogFocus::Save,
+        Color::Green,
+        Color::Green,
+    );
+    let cancel_btn = Button::new(
+        "Cancel",
+        inner.x + 23,
+        btn_y,
+        app.save_dialog_focus == SaveDialogFocus::Cancel,
+        Color::Red,
+        Color::Red,
+    );
+
+    let (save_text, save_style) = save_btn.render();
+    let (cancel_text, cancel_style) = cancel_btn.render();
+
+    let buttons = Line::from(vec![
+        Span::raw("          "),
+        Span::styled(save_text, save_style),
+        Span::raw("     "),
+        Span::styled(cancel_text, cancel_style),
+        Span::raw("          "),
+    ]);
+
+    let btn_area = Rect {
+        x: inner.x,
+        y: btn_y,
+        width: inner.width,
+        height: 1,
+    };
+    f.render_widget(Paragraph::new(buttons), btn_area);
+}
+
+fn flush_line(lines: &mut Vec<Line<'static>>, spans: &mut Vec<Span<'static>>) {
+    if !spans.is_empty() {
+        let collected: Vec<Span> = spans.drain(..).collect();
+        lines.push(Line::from(collected));
+    }
+}
+
+fn render_markdown(text: &str) -> Vec<Line<'static>> {
+    let mut md_options = MdOptions::empty();
+    md_options.insert(MdOptions::ENABLE_STRIKETHROUGH);
+    md_options.insert(MdOptions::ENABLE_TABLES);
+
+    let filtered: Vec<&str> = text
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                return true;
+            }
+            if trimmed.starts_with('+')
+                && trimmed.ends_with('+')
+                && trimmed.chars().all(|c| c == '+' || c == '-' || c == ' ')
+            {
+                return false;
+            }
+            true
+        })
+        .collect();
+
+    let cleaned = normalize_code_fences(&filtered).join("\n");
+
+    let parser = MdParser::new_ext(&cleaned, md_options);
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut current_spans: Vec<Span<'static>> = Vec::new();
+    let mut bold = false;
+    let mut italic = false;
+    let mut in_code_block = false;
+    let mut code_block_lang: Option<String> = None;
+    let mut code_block_text = String::new();
+    let mut in_table = false;
+    let mut table_headers: Vec<String> = Vec::new();
+    let mut table_rows: Vec<Vec<String>> = Vec::new();
+    let mut current_row: Vec<String> = Vec::new();
+    let mut is_header_row = false;
+
+    for event in parser {
+        match event {
+            MdEvent::Start(tag) => match tag {
+                Tag::Heading { level, .. } => {
+                    flush_line(&mut lines, &mut current_spans);
+                    let prefix = match level {
+                        pulldown_cmark::HeadingLevel::H1 => "# ",
+                        pulldown_cmark::HeadingLevel::H2 => "## ",
+                        pulldown_cmark::HeadingLevel::H3 => "### ",
+                        pulldown_cmark::HeadingLevel::H4 => "#### ",
+                        pulldown_cmark::HeadingLevel::H5 => "##### ",
+                        pulldown_cmark::HeadingLevel::H6 => "###### ",
+                    };
+                    current_spans.push(Span::styled(
+                        prefix.to_string(),
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    ));
+                    bold = true;
+                }
+                Tag::CodeBlock(kind) => {
+                    flush_line(&mut lines, &mut current_spans);
+                    in_code_block = true;
+                    code_block_text.clear();
+                    code_block_lang = match kind {
+                        CodeBlockKind::Fenced(lang) if !lang.is_empty() => {
+                            Some(lang.to_string())
+                        }
+                        _ => None,
+                    };
+                    let header = match &code_block_lang {
+                        Some(lang) => format!("[{}]", lang.to_uppercase()),
+                        None => "[CODE]".to_string(),
+                    };
+                    lines.push(Line::from(Span::styled(
+                        header,
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .bg(Color::Rgb(30, 60, 120)),
+                    )));
+                }
+                Tag::Table(_alignment) => {
+                    flush_line(&mut lines, &mut current_spans);
+                    in_table = true;
+                    table_headers.clear();
+                    table_rows.clear();
+                    current_row.clear();
+                    is_header_row = true;
+                }
+                Tag::TableHead => {
+                    is_header_row = true;
+                    current_row.clear();
+                }
+                Tag::TableRow => {
+                    current_row.clear();
+                }
+                Tag::TableCell => {}
+                Tag::Emphasis => italic = true,
+                Tag::Strong => bold = true,
+                Tag::Item => {
+                    flush_line(&mut lines, &mut current_spans);
+                    current_spans.push(Span::styled(
+                        "  • ",
+                        Style::default().fg(Color::Green),
+                    ));
+                }
+                _ => {}
+            },
+            MdEvent::End(tag_end) => match tag_end {
+                TagEnd::Paragraph => {
+                    flush_line(&mut lines, &mut current_spans);
+                    lines.push(Line::from(""));
+                }
+                TagEnd::Heading(_) => {
+                    bold = false;
+                    flush_line(&mut lines, &mut current_spans);
+                    lines.push(Line::from(""));
+                }
+                TagEnd::CodeBlock => {
+                    in_code_block = false;
+                    let code_lines = highlight_code(&code_block_text, code_block_lang.as_deref());
+                    for line in code_lines {
+                        lines.push(line);
+                    }
+                    lines.push(Line::from(""));
+                }
+                TagEnd::Table => {
+                    if !table_headers.is_empty() {
+                        let col_widths: Vec<usize> = table_headers
+                            .iter()
+                            .enumerate()
+                            .map(|(i, h)| {
+                                let data_max = table_rows
+                                    .iter()
+                                    .filter_map(|r| r.get(i))
+                                    .map(|c| c.len())
+                                    .max()
+                                    .unwrap_or(0);
+                                h.len().max(data_max).max(3)
+                            })
+                            .collect();
+
+                        let border_style = Style::default().fg(Color::DarkGray);
+
+                        // Top border: ┌───┬───┬───┐
+                        let mut top = String::from("┌");
+                        for (i, &w) in col_widths.iter().enumerate() {
+                            top.push_str(&"─".repeat(w + 2));
+                            if i < col_widths.len() - 1 {
+                                top.push('┬');
+                            }
+                        }
+                        top.push('┐');
+                        lines.push(Line::from(Span::styled(top, border_style)));
+
+                        // Header row: │ a │ b │ c │
+                        let mut header_spans: Vec<Span> = Vec::new();
+                        for (i, h) in table_headers.iter().enumerate() {
+                            let w = col_widths[i];
+                            let padded = format!("{:<width$}", h, width = w);
+                            header_spans.push(Span::styled(
+                                format!("│ {} ", padded),
+                                Style::default()
+                                    .fg(Color::White)
+                                    .bg(Color::Rgb(60, 60, 80))
+                                    .add_modifier(Modifier::BOLD),
+                            ));
+                        }
+                        header_spans.push(Span::styled("│", border_style));
+                        lines.push(Line::from(header_spans));
+
+                        // Separator: ├───┼───┼───┤
+                        let mut sep = String::from("├");
+                        for (i, &w) in col_widths.iter().enumerate() {
+                            sep.push_str(&"─".repeat(w + 2));
+                            if i < col_widths.len() - 1 {
+                                sep.push('┼');
+                            }
+                        }
+                        sep.push('┤');
+                        lines.push(Line::from(Span::styled(sep, border_style)));
+
+                        // Data rows: │ x │ y │ z │
+                        for row in &table_rows {
+                            let mut row_spans: Vec<Span> = Vec::new();
+                            for (i, cell) in row.iter().enumerate() {
+                                let w = col_widths.get(i).copied().unwrap_or(10);
+                                let padded = format!("{:<width$}", cell, width = w);
+                                row_spans.push(Span::styled(
+                                    format!("│ {} ", padded),
+                                    Style::default(),
+                                ));
+                            }
+                            row_spans.push(Span::styled("│", border_style));
+                            lines.push(Line::from(row_spans));
+                        }
+
+                        // Bottom border: └───┴───┴───┘
+                        let mut bottom = String::from("└");
+                        for (i, &w) in col_widths.iter().enumerate() {
+                            bottom.push_str(&"─".repeat(w + 2));
+                            if i < col_widths.len() - 1 {
+                                bottom.push('┴');
+                            }
+                        }
+                        bottom.push('┘');
+                        lines.push(Line::from(Span::styled(bottom, border_style)));
+                        lines.push(Line::from(""));
+                    }
+                    in_table = false;
+                }
+                TagEnd::TableHead => {
+                    table_headers = current_row.clone();
+                    is_header_row = false;
+                }
+                TagEnd::TableRow => {
+                    if !is_header_row {
+                        table_rows.push(current_row.clone());
+                    }
+                    is_header_row = false;
+                }
+                TagEnd::TableCell => {
+                    let cell_text = current_spans
+                        .iter()
+                        .map(|s| s.content.to_string())
+                        .collect::<String>();
+                    current_row.push(cell_text);
+                    current_spans.clear();
+                }
+                TagEnd::Emphasis => italic = false,
+                TagEnd::Strong => bold = false,
+                TagEnd::Item => {
+                    flush_line(&mut lines, &mut current_spans);
+                }
+                _ => {}
+            },
+            MdEvent::Text(text) => {
+                if in_code_block {
+                    code_block_text.push_str(&text);
+                } else {
+                    let style = if in_table && is_header_row {
+                        Style::default()
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        let mut s = Style::default();
+                        if bold {
+                            s = s.add_modifier(Modifier::BOLD);
+                        }
+                        if italic {
+                            s = s.add_modifier(Modifier::ITALIC);
+                        }
+                        s
+                    };
+                    current_spans.push(Span::styled(text.to_string(), style));
+                }
+            }
+            MdEvent::Code(code) => {
+                current_spans.push(Span::styled(
+                    format!("`{}`", code),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .bg(Color::Rgb(40, 40, 60)),
+                ));
+            }
+            MdEvent::SoftBreak | MdEvent::HardBreak => {
+                if in_code_block {
+                    code_block_text.push('\n');
+                } else if in_table {
+                    current_spans.clear();
+                } else {
+                    flush_line(&mut lines, &mut current_spans);
+                }
+            }
+            MdEvent::Rule => {
+                flush_line(&mut lines, &mut current_spans);
+                lines.push(Line::from(Span::styled(
+                    "─────────────────────────────────────",
+                    Style::default().fg(Color::DarkGray),
+                )));
+                lines.push(Line::from(""));
+            }
+            _ => {}
+        }
+    }
+
+    flush_line(&mut lines, &mut current_spans);
+
+    if lines.is_empty() {
+        lines.push(Line::from(""));
+    }
+
+    lines
+}
+
+fn span_display_width(span: &Span) -> usize {
+    span.content.chars().count()
+}
+
+fn wrap_and_justify_lines(lines: Vec<Line<'static>>, width: usize) -> Vec<Line<'static>> {
+    let mut result = Vec::new();
+    let mut para: Vec<Line<'static>> = Vec::new();
+
+    for line in lines {
+        let w: usize = line.spans.iter().map(|s| span_display_width(s)).sum();
+        let is_code = line.spans.iter().any(|s| s.style.bg == Some(Color::Rgb(30, 60, 120)));
+        if w == 0 {
+            if !para.is_empty() {
+                justify_paragraph_into(&mut result, &para, width);
+                para.clear();
+            }
+            result.push(line);
+        } else if is_code {
+            if !para.is_empty() {
+                justify_paragraph_into(&mut result, &para, width);
+                para.clear();
+            }
+            result.push(line);
+        } else if w <= width {
+            para.push(line);
+        } else {
+            para.extend(wrap_single_line(line, width));
+        }
+    }
+    if !para.is_empty() {
+        justify_paragraph_into(&mut result, &para, width);
+    }
+    result
+}
+
+fn justify_paragraph_into(out: &mut Vec<Line<'static>>, lines: &[Line<'static>], width: usize) {
+    let last = lines.len() - 1;
+    for (i, line) in lines.iter().enumerate() {
+        let w: usize = line.spans.iter().map(|s| span_display_width(s)).sum();
+        let is_indented = line
+            .spans
+            .first()
+            .map(|s| s.content.starts_with(' '))
+            .unwrap_or(false);
+        if i < last && w < width && !is_indented {
+            out.push(Line::from(distribute_spaces(&line.spans, w, width)));
+        } else {
+            out.push(line.clone());
+        }
+    }
+}
+
+fn distribute_spaces(
+    spans: &[Span<'static>],
+    current_w: usize,
+    target_w: usize,
+) -> Vec<Span<'static>> {
+    let extra = target_w - current_w;
+    let gaps: Vec<usize> = spans
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.content.chars().all(|c| c == ' '))
+        .map(|(i, _)| i)
+        .collect();
+
+    if gaps.is_empty() {
+        return spans.to_vec();
+    }
+
+    let per_gap = extra / gaps.len();
+    let remainder = extra % gaps.len();
+    let mut result = Vec::with_capacity(spans.len());
+    let mut gap_idx = 0;
+
+    for (i, span) in spans.iter().enumerate() {
+        if gaps.contains(&i) {
+            let add = if gap_idx < remainder { 1 } else { 0 };
+            let total = 1 + per_gap + add;
+            result.push(Span::styled(" ".repeat(total), span.style));
+            gap_idx += 1;
+        } else {
+            result.push(span.clone());
+        }
+    }
+    result
+}
+
+fn wrap_single_line(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
+    let mut tokens: Vec<(String, Style)> = Vec::new();
+    for span in &line.spans {
+        let text = span.content.to_string();
+        let style = span.style;
+        for (i, part) in text.split(' ').enumerate() {
+            if i > 0 {
+                tokens.push((" ".to_string(), style));
+            }
+            if !part.is_empty() {
+                tokens.push((part.to_string(), style));
+            }
+        }
+    }
+
+    let mut lines = Vec::new();
+    let mut cur: Vec<Span<'static>> = Vec::new();
+    let mut cur_w = 0;
+
+    for (text, style) in tokens {
+        let tw = text.chars().count();
+        if cur_w + tw > width && cur_w > 0 {
+            lines.push(Line::from(std::mem::take(&mut cur)));
+            cur_w = 0;
+        }
+        cur.push(Span::styled(text, style));
+        cur_w += tw;
+    }
+    if !cur.is_empty() {
+        lines.push(Line::from(cur));
+    }
+    lines
+}
+
+fn highlight_code(code: &str, lang: Option<&str>) -> Vec<Line<'static>> {
+    use syntect::easy::HighlightLines;
+    use syntect::highlighting::ThemeSet;
+    use syntect::parsing::SyntaxSet;
+
+    let ss = SyntaxSet::load_defaults_newlines();
+    let ts = ThemeSet::load_defaults();
+
+    let syntax = lang
+        .and_then(|l| ss.find_syntax_by_token(l))
+        .unwrap_or_else(|| ss.find_syntax_plain_text());
+
+    let mut h = HighlightLines::new(syntax, &ts.themes["base16-ocean.dark"]);
+
+    let bg = Color::Rgb(30, 60, 120);
+    let mut result: Vec<Line<'static>> = Vec::new();
+
+    for line in code.lines() {
+        let ranges = h.highlight_line(line, &ss).unwrap_or_default();
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        for (style, text) in ranges {
+            let fg = Color::Rgb(
+                style.foreground.r,
+                style.foreground.g,
+                style.foreground.b,
+            );
+            spans.push(Span::styled(
+                text.to_string(),
+                Style::default().fg(fg).bg(bg),
+            ));
+        }
+        result.push(Line::from(spans));
+    }
+
+    if code.ends_with('\n') || code.is_empty() {
+        result.push(Line::from(Span::styled(" ", Style::default().bg(bg))));
+    }
+
+    result
+}
+
+fn normalize_code_fences(lines: &[&str]) -> Vec<String> {
+    let mut result = Vec::new();
+    let mut in_code_block = false;
+    let mut fence_indent: usize = 0;
+
+    for line in lines {
+        if in_code_block {
+            let trimmed = line.trim_start();
+            let current_indent = line.len() - trimmed.len();
+
+            if trimmed.starts_with("```") && current_indent <= fence_indent {
+                in_code_block = false;
+                result.push(format!("{}{}", " ".repeat(fence_indent), trimmed));
+                continue;
+            }
+
+            if line.trim().is_empty() {
+                result.push(format!("{}{}", " ".repeat(fence_indent), ""));
+            } else if current_indent < fence_indent {
+                result.push(format!("{}{}", " ".repeat(fence_indent), trimmed));
+            } else {
+                result.push(line.to_string());
+            }
+        } else {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("```") {
+                let indent = line.len() - trimmed.len();
+                if indent > 0 {
+                    in_code_block = true;
+                    fence_indent = indent;
+                    result.push(line.to_string());
+                    continue;
+                }
+            }
+            result.push(line.to_string());
+        }
+    }
+    result
 }
