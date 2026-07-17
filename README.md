@@ -20,17 +20,6 @@ Rustama is a modern, terminal-based interface for interacting with [Ollama](http
 - Ollama service running locally or remotely
 - Terminal with support for modern ANSI escape codes
 
-## Dependencies
-
-- **ratatui** `0.28` - Terminal UI framework
-- **crossterm** `0.28` - Terminal manipulation
-- **tokio** `1.41` - Async runtime with full features
-- **reqwest** `0.12` - HTTP client with JSON and streaming support
-- **serde/serde_json** `1.0` - JSON serialization
-- **chrono** `0.4` - Date and time handling
-- **futures-util** `0.3` - Async utilities
-- **bytes** `1.0` - Byte utilities
-- **tokio-stream** `0.1` - Stream utilities
 
 ## Installation
 
