@@ -1,9 +1,9 @@
 use std::io;
 use std::time::Duration;
 
-use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event, MouseButton, MouseEventKind};
-use crossterm::execute;
-use crossterm::terminal::{
+use ratatui::crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event, MouseButton, MouseEventKind};
+use ratatui::crossterm::execute;
+use ratatui::crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 
@@ -12,15 +12,14 @@ use pulldown_cmark::{
 };
 
 use ratatui::prelude::*;
-use ratatui::layout::Offset;
 use ratatui::widgets::*;
 
 mod app;
 mod config;
 mod ui;
-use app::{ActiveMenu, App, ChatMessage, FileDialogFocus, Focus, InputMode, ModelDialogFocus, SaveDialogFocus};
+use app::{ActiveMenu, App, ChatMessage, FileDialogFocus, FileDialogMode, Focus, InputMode, ModelDialogFocus, SaveDialogFocus};
+use ui::{dialog_block, Button, FileActionDialog, Theme};
 use config::Config;
-use ui::Button;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let original_hook = std::panic::take_hook();
@@ -130,11 +129,19 @@ fn ui(f: &mut Frame, app: &mut App) {
     }
 
     if app.show_about {
-        render_about_popup(f, area);
+        render_about_popup(f, area, &app.theme);
+    }
+
+    if app.show_quit_confirm {
+        render_quit_confirm_popup(f, area, &app.theme);
     }
 
     if app.show_model_dialog {
         render_model_dialog(f, app, area);
+    }
+
+    if app.show_load_dialog {
+        render_load_dialog(f, app, area);
     }
 
     if app.show_file_dialog {
@@ -169,15 +176,20 @@ fn render_menu_bar(f: &mut Frame, app: &App, area: Rect) {
     let agentic_indicator = if app.agentic_mode {
         Span::styled(
             " [AGENTIC] ",
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(app.theme.list_selected_fg)
+                        .bg(app.theme.list_selected_indicator_bg)
+                        .add_modifier(Modifier::BOLD),
         )
     } else {
         Span::styled(" ", normal_style)
     };
 
+    let now = chrono::Local::now();
+    let clock = format!("  {}  ", now.format("%H:%M"));
+    let clock_len = clock.len() as u16;
+    let used = 6 + 1 + 8 + 1 + 5 + 1 + agentic_indicator.width() as u16;
+    let pad = area.width.saturating_sub(used + clock_len);
     let menu_bar = Line::from(vec![
         Span::styled(" File ", file_style),
         Span::styled(" ", normal_style),
@@ -185,154 +197,206 @@ fn render_menu_bar(f: &mut Frame, app: &App, area: Rect) {
         Span::styled(" ", normal_style),
         Span::styled(" Help ", help_style),
         agentic_indicator,
+        Span::styled(" ".repeat(pad as usize), normal_style),
+        Span::styled(clock, Style::default().fg(Color::White).bg(Color::DarkGray)),
     ]);
 
     f.render_widget(Paragraph::new(menu_bar).style(normal_style), area);
 }
 
 fn render_output(f: &mut Frame, app: &mut App, area: Rect) {
-    let mut lines: Vec<Line<'static>> = Vec::new();
+    let streaming_len = if app.is_loading { app.streaming_text.len() } else { 0 };
+    let streaming_thinking_len = if app.is_loading { app.streaming_thinking.len() } else { 0 };
+    let output_width = area.width.saturating_sub(4) as usize;
 
-    for msg in &app.messages {
-        match msg {
-            ChatMessage::User(text) => {
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        " > ",
+    let history_changed = app.messages.len() != app.cached_msg_count
+        || app.cached_width as usize != output_width;
+    let streaming_changed = app.is_loading
+        && (streaming_len != app.cached_streaming_len
+            || streaming_thinking_len != app.cached_streaming_thinking_len);
+
+    if history_changed {
+        let mut hist: Vec<Line<'static>> = Vec::new();
+
+        for msg in &app.messages {
+            match msg {
+                ChatMessage::User(text) => {
+                    for line in text.lines() {
+                        hist.push(Line::from(vec![
+                            Span::styled(
+                                " > ",
+                                Style::default()
+                                    .fg(Color::Cyan)
+                                    .add_modifier(Modifier::BOLD),
+                            ),
+                            Span::styled(
+                                line.to_string(),
+                                Style::default()
+                                    .fg(Color::Cyan)
+                                    .add_modifier(Modifier::BOLD),
+                            ),
+                        ]));
+                    }
+                    hist.push(Line::from(""));
+                }
+                ChatMessage::Assistant(text) => {
+                    let mut md_lines = render_markdown(text);
+                    hist.append(&mut md_lines);
+                }
+                ChatMessage::System(text) => {
+                    for text_line in text.lines() {
+                        hist.push(Line::from(Span::styled(
+                            format!("  {}", text_line),
+                            Style::default()
+                                .fg(Color::DarkGray)
+                                .add_modifier(Modifier::ITALIC),
+                        )));
+                    }
+                    hist.push(Line::from(""));
+                }
+                ChatMessage::App(text) => {
+                    for text_line in text.lines() {
+                        hist.push(Line::from(Span::styled(
+                            format!("  {}", text_line),
+                            Style::default()
+                                .fg(Color::DarkGray)
+                                .add_modifier(Modifier::ITALIC),
+                        )));
+                    }
+                    hist.push(Line::from(""));
+                }
+                ChatMessage::Thinking(text) => {
+                    for text_line in text.lines() {
+                        hist.push(Line::from(Span::styled(
+                            format!("  {}", text_line),
+                            Style::default()
+                                .fg(app.theme.thinking_fg)
+                                .add_modifier(Modifier::ITALIC),
+                        )));
+                    }
+                    hist.push(Line::from(""));
+                }
+                ChatMessage::FileContent { name, content } => {
+                    hist.push(Line::from(Span::styled(
+                        format!("  \u{1F4C4} {}", name),
                         Style::default()
                             .fg(Color::Cyan)
                             .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(
-                        text.clone(),
-                        Style::default()
-                            .fg(Color::Cyan)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                ]));
-                lines.push(Line::from(""));
-            }
-            ChatMessage::Assistant(text) => {
-                let mut md_lines = render_markdown(text);
-                lines.append(&mut md_lines);
-            }
-            ChatMessage::System(text) => {
-                for text_line in text.lines() {
-                    lines.push(Line::from(Span::styled(
-                        format!("  {}", text_line),
-                        Style::default()
-                            .fg(Color::DarkGray)
-                            .add_modifier(Modifier::ITALIC),
                     )));
+                    let mut md_lines = render_markdown(content);
+                    hist.append(&mut md_lines);
+                    hist.push(Line::from(""));
                 }
-                lines.push(Line::from(""));
-            }
-            ChatMessage::App(text) => {
-                for text_line in text.lines() {
-                    lines.push(Line::from(Span::styled(
-                        format!("  {}", text_line),
-                        Style::default()
-                            .fg(Color::DarkGray)
-                            .add_modifier(Modifier::ITALIC),
-                    )));
+                ChatMessage::ToolCall { name, arguments, .. } => {
+                    hist.push(Line::from(vec![
+                        Span::styled(
+                            " \u{2699} ",
+                            Style::default()
+                                .fg(Color::Yellow)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(
+                            format!("TOOL CALL: {}", name),
+                            Style::default()
+                                .fg(Color::Yellow)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                    ]));
+                    let pretty_args = serde_json::from_str::<serde_json::Value>(arguments)
+                        .ok()
+                        .and_then(|v| serde_json::to_string_pretty(&v).ok())
+                        .unwrap_or_else(|| arguments.to_string());
+                    for arg_line in pretty_args.lines() {
+                        hist.push(Line::from(Span::styled(
+                            format!("    {}", arg_line),
+                            Style::default().fg(Color::DarkGray),
+                        )));
+                    }
+                    hist.push(Line::from(""));
                 }
-                lines.push(Line::from(""));
-            }
-            ChatMessage::FileContent { name, content } => {
-                lines.push(Line::from(Span::styled(
-                    format!("  \u{1F4C4} {}", name),
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                )));
-                let mut md_lines = render_markdown(content);
-                lines.append(&mut md_lines);
-                lines.push(Line::from(""));
-            }
-            ChatMessage::ToolCall { name, arguments } => {
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        " \u{2699} ",
-                        Style::default()
-                            .fg(Color::Yellow)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(
-                        format!("TOOL CALL: {}", name),
-                        Style::default()
-                            .fg(Color::Yellow)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                ]));
-                let pretty_args = serde_json::from_str::<serde_json::Value>(arguments)
-                    .ok()
-                    .and_then(|v| serde_json::to_string_pretty(&v).ok())
-                    .unwrap_or_else(|| arguments.to_string());
-                for arg_line in pretty_args.lines() {
-                    lines.push(Line::from(Span::styled(
-                        format!("    {}", arg_line),
-                        Style::default().fg(Color::DarkGray),
-                    )));
+                ChatMessage::ToolResult { name, content, .. } => {
+                    hist.push(Line::from(vec![
+                        Span::styled(
+                            " \u{2714} ",
+                            Style::default()
+                                .fg(Color::Green)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(
+                            format!("RESULT: {}", name),
+                            Style::default()
+                                .fg(Color::Green)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                    ]));
+                    let preview = if content.len() > 500 {
+                        format!("{}... ({} bytes total)", &content[..500], content.len())
+                    } else {
+                        content.to_string()
+                    };
+                    for result_line in preview.lines().take(20) {
+                        hist.push(Line::from(Span::styled(
+                            format!("    {}", result_line),
+                            Style::default().fg(Color::DarkGray),
+                        )));
+                    }
+                    if content.lines().count() > 20 {
+                        hist.push(Line::from(Span::styled(
+                            format!("    ... ({} more lines)", content.lines().count() - 20),
+                            Style::default().fg(Color::DarkGray),
+                        )));
+                    }
+                    hist.push(Line::from(""));
                 }
-                lines.push(Line::from(""));
-            }
-            ChatMessage::ToolResult { name, content } => {
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        " \u{2714} ",
-                        Style::default()
-                            .fg(Color::Green)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(
-                        format!("RESULT: {}", name),
-                        Style::default()
-                            .fg(Color::Green)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                ]));
-                let preview = if content.len() > 500 {
-                    format!("{}... ({} bytes total)", &content[..500], content.len())
-                } else {
-                    content.to_string()
-                };
-                for result_line in preview.lines().take(20) {
-                    lines.push(Line::from(Span::styled(
-                        format!("    {}", result_line),
-                        Style::default().fg(Color::DarkGray),
-                    )));
-                }
-                if content.lines().count() > 20 {
-                    lines.push(Line::from(Span::styled(
-                        format!("    ... ({} more lines)", content.lines().count() - 20),
-                        Style::default().fg(Color::DarkGray),
-                    )));
-                }
-                lines.push(Line::from(""));
             }
         }
+
+        app.cached_output = hist;
+        app.cached_msg_count = app.messages.len();
+        app.cached_width = area.width;
     }
 
-    if app.is_loading && !app.streaming_text.is_empty() {
-        let mut md_lines = render_markdown(&app.streaming_text);
-        lines.append(&mut md_lines);
-    } else if app.is_loading {
-        lines.push(Line::from(Span::styled(
-            "  Streaming response...",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::SLOW_BLINK),
-        )));
+    if history_changed || streaming_changed {
+        let mut lines = app.cached_output.clone();
+        if app.is_loading && !app.streaming_thinking.is_empty() {
+            for think_line in app.streaming_thinking.lines() {
+                lines.push(Line::from(Span::styled(
+                    format!("  {}", think_line),
+                    Style::default()
+                        .fg(app.theme.thinking_fg)
+                        .add_modifier(Modifier::ITALIC),
+                )));
+            }
+            lines.push(Line::from(""));
+        }
+        if app.is_loading && !app.streaming_text.is_empty() {
+            let mut md_lines = render_markdown(&app.streaming_text);
+            lines.append(&mut md_lines);
+        } else if app.is_loading && app.streaming_thinking.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "  Streaming response...",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::SLOW_BLINK),
+            )));
+        }
+        app.cached_streaming_len = streaming_len;
+        app.cached_streaming_thinking_len = streaming_thinking_len;
+        app.cached_wrapped = wrap_and_justify_lines(&lines, output_width);
     }
 
-    let output_width = area.width.saturating_sub(4) as usize;
-    let lines = wrap_and_justify_lines(lines, output_width);
+    let lines = &app.cached_wrapped;
 
     let total_lines = lines.len() as u16;
     let visible_height = area.height.saturating_sub(2);
     let max_scroll = total_lines.saturating_sub(visible_height);
-    let scroll = app.scroll_offset.min(max_scroll);
-    app.scroll_offset = scroll;
+    if app.auto_scroll {
+        app.scroll_offset = max_scroll;
+    } else {
+        let scroll = app.scroll_offset.min(max_scroll);
+        app.scroll_offset = scroll;
+    }
+    let scroll = app.scroll_offset;
 
     let focus_style = if app.focus == Focus::Output {
         Style::default().fg(Color::Cyan)
@@ -345,7 +409,7 @@ fn render_output(f: &mut Frame, app: &mut App, area: Rect) {
         .title(" Output ")
         .border_style(focus_style);
 
-    let paragraph = Paragraph::new(lines).block(block).scroll((scroll, 0));
+    let paragraph = Paragraph::new(lines.as_slice()).block(block).scroll((scroll, 0));
 
     let content_area = Rect {
         x: area.x,
@@ -380,9 +444,10 @@ fn render_output(f: &mut Frame, app: &mut App, area: Rect) {
 fn render_input(f: &mut Frame, app: &App, area: Rect) {
     let stats_str = if app.token_stats.prompt_tokens > 0 || app.token_stats.response_tokens > 0 {
         format!(
-            " in:{} out:{} {}ms ",
+            " in:{} out:{} {:.1}t/s {}ms ",
             app.token_stats.prompt_tokens,
             app.token_stats.response_tokens,
+            app.token_stats.tokens_per_sec,
             app.token_stats.total_duration_ms,
         )
     } else {
@@ -404,90 +469,19 @@ fn render_input(f: &mut Frame, app: &App, area: Rect) {
         ),
     };
 
-    let inner_h = area.height.saturating_sub(2) as usize;
-
     let block = Block::default()
         .borders(Borders::ALL)
         .title(title)
         .border_style(border_style);
 
-    if app.input_text.is_empty() && app.input_mode != InputMode::Input {
-        let placeholder = Paragraph::new(vec![
-            Line::from(Span::styled(
-                "Type a message...",
-                Style::default()
-                    .fg(Color::DarkGray)
-                    .add_modifier(Modifier::ITALIC),
-            )),
-        ])
-        .block(block);
-        f.render_widget(placeholder, area);
-        render_send_button(f, app, area);
-        return;
-    }
-
-    let lines = app.input_text.lines().collect::<Vec<_>>();
-    let (cur_row, cur_col) = app.cursor_row_col();
-    let total_lines = lines.len();
-
-    let scroll_row = if total_lines > inner_h && inner_h > 0 {
-        if cur_row + 1 > inner_h {
-            cur_row + 2 - inner_h
-        } else {
-            0
-        }
-    } else {
-        0
-    };
-
-    let display_lines: Vec<Line> = lines
-        .iter()
-        .enumerate()
-        .skip(scroll_row)
-        .take(inner_h)
-        .map(|(row_idx, line)| {
-            let chars: Vec<char> = line.chars().collect();
-            let mut spans: Vec<Span> = Vec::new();
-
-            let sel_range = app.selection_range();
-
-            for (col_idx, c) in chars.iter().enumerate() {
-                let char_pos = app.pos_from_row_col(row_idx, col_idx);
-                let is_cursor = app.input_mode == InputMode::Input
-                    && row_idx == cur_row
-                    && col_idx == cur_col;
-                let is_selected = sel_range
-                    .map_or(false, |(start, end)| char_pos >= start && char_pos < end);
-
-                let style = if is_cursor && is_selected {
-                    Style::default().bg(Color::Rgb(100, 100, 255)).fg(Color::White)
-                } else if is_cursor {
-                    Style::default().bg(Color::White).fg(Color::Black)
-                } else if is_selected {
-                    Style::default().bg(Color::Rgb(50, 50, 150)).fg(Color::White)
-                } else {
-                    Style::default()
-                };
-                spans.push(Span::styled(c.to_string(), style));
-            }
-
-            if app.input_mode == InputMode::Input && row_idx == cur_row && cur_col == chars.len()
-            {
-                spans.push(Span::styled(" ", Style::default().bg(Color::White)));
-            }
-
-            Line::from(spans)
-        })
-        .collect();
-
-    let paragraph = Paragraph::new(display_lines).block(block);
-
-    f.render_widget(paragraph, area);
+    let mut textarea = app.textarea.clone();
+    textarea.set_block(block);
+    f.render_widget(&textarea, area);
     render_send_button(f, app, area);
 }
 
 fn render_send_button(f: &mut Frame, app: &App, area: Rect) {
-    let has_text = !app.input_text.trim().is_empty();
+    let has_text = !app.textarea.lines().join("").trim().is_empty();
     let btn_x = area.x + area.width.saturating_sub(13);
     let btn_y = area.y + area.height.saturating_sub(1);
 
@@ -521,19 +515,19 @@ fn render_keybar(f: &mut Frame, app: &App, area: Rect) {
         InputMode::Normal => {
             if !app.status_message.is_empty() {
                 format!(
-                    " {} | q:Quit i:Input Tab:Menu Ctrl+S:Save{}{}",
+                    " {} | F9:Menu F10:Quit Ctrl+S:Save{}{}",
                     app.status_message, agentic_label, focus_label
                 )
             } else {
                 format!(
-                    " q:Quit  i:Input  F9/Tab:Menu  Ctrl+S:Save  Mouse:Click/Scroll{}{}",
+                    " F9:Menu  F10:Quit  Ctrl+S:Save  Mouse:Click/Scroll{}{}",
                     agentic_label, focus_label
                 )
             }
         }
         InputMode::Input => {
             format!(
-                " Alt+Enter:Send  Enter:Newline  \u{2190}\u{2191}\u{2193}\u{2192}:Cursor{}",
+                " Enter:Send  Alt+Enter:Newline  \u{2190}\u{2191}\u{2193}\u{2192}:Cursor{}",
                 agentic_label
             )
         }
@@ -595,16 +589,7 @@ fn render_submenu(f: &mut Frame, app: &App, menu_bar_area: Rect) {
     f.render_widget(list, popup_area);
 }
 
-fn dialog_block(title: &str) -> Block<'static> {
-    Block::default()
-        .borders(Borders::ALL)
-        .title(format!(" {} ", title))
-        .border_style(Style::default().fg(Color::Cyan))
-        .style(Style::default().bg(Color::Black))
-        .shadow(Shadow::new(dimmed()).offset(Offset::new(1, 1)))
-}
-
-fn render_about_popup(f: &mut Frame, area: Rect) {
+fn render_about_popup(f: &mut Frame, area: Rect, theme: &Theme) {
     let popup_width = 50.min(area.width.saturating_sub(4));
     let popup_height = 10.min(area.height.saturating_sub(4));
     let popup_area = Rect {
@@ -615,23 +600,24 @@ fn render_about_popup(f: &mut Frame, area: Rect) {
     };
 
     f.render_widget(Clear, popup_area);
-    f.render_widget(dialog_block("About"), popup_area);
+    f.render_widget(dialog_block("About", theme), popup_area);
 
     let inner = popup_area.inner(Margin::new(1, 1));
 
+    let version = env!("CARGO_PKG_VERSION");
     let about_text = vec![
         Line::from(""),
         Line::from(Span::styled(
-            "  Rustama",
+            format!("Rustama v{}", version),
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
-        Line::from("  A terminal interface for Ollama LLM."),
-        Line::from("  Supports markdown rendering and saving."),
+        Line::from("A terminal interface for Ollama LLM."),
+        Line::from("Supports markdown rendering and saving."),
         Line::from(""),
-        Line::from("  Built with ratatui + crossterm"),
+        Line::from("Built with ratatui + crossterm"),
         Line::from(""),
     ];
 
@@ -641,7 +627,7 @@ fn render_about_popup(f: &mut Frame, area: Rect) {
         width: inner.width,
         height: inner.height - 1,
     };
-    f.render_widget(Paragraph::new(about_text), text_area);
+    f.render_widget(Paragraph::new(about_text).alignment(Alignment::Center), text_area);
 
     let btn_y = inner.y + inner.height - 1;
     let ok_btn = Button::new(
@@ -669,6 +655,61 @@ fn render_about_popup(f: &mut Frame, area: Rect) {
     f.render_widget(Paragraph::new(buttons), btn_area);
 }
 
+fn render_quit_confirm_popup(f: &mut Frame, area: Rect, theme: &Theme) {
+    let popup_width = 40.min(area.width.saturating_sub(4));
+    let popup_height = 8.min(area.height.saturating_sub(4));
+    let popup_area = Rect {
+        x: (area.width.saturating_sub(popup_width)) / 2,
+        y: (area.height.saturating_sub(popup_height)) / 2,
+        width: popup_width,
+        height: popup_height,
+    };
+
+    f.render_widget(Clear, popup_area);
+    f.render_widget(dialog_block("Confirm Quit", theme), popup_area);
+
+    let inner = popup_area.inner(Margin::new(1, 1));
+
+    let text = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            "  Are you sure you want to quit?",
+            Style::default().fg(Color::White),
+        )),
+        Line::from(""),
+    ];
+
+    let text_area = Rect {
+        x: inner.x,
+        y: inner.y,
+        width: inner.width,
+        height: inner.height - 1,
+    };
+    f.render_widget(Paragraph::new(text), text_area);
+
+    let btn_y = inner.y + inner.height - 1;
+    let yes_btn = Button::new("Yes", inner.x + 10, btn_y, true, Color::Cyan, Color::Cyan);
+    let no_btn = Button::new("No", inner.x + 22, btn_y, true, Color::Cyan, Color::Cyan);
+
+    let (yes_text, yes_style) = yes_btn.render();
+    let (no_text, no_style) = no_btn.render();
+    let buttons = Line::from(vec![
+        Span::raw("         "),
+        Span::styled(yes_text, yes_style),
+        Span::raw("  "),
+        Span::styled(no_text, no_style),
+        Span::raw("          "),
+    ]);
+
+    let btn_area = Rect {
+        x: inner.x,
+        y: btn_y,
+        width: inner.width,
+        height: 1,
+    };
+    f.render_widget(Paragraph::new(buttons), btn_area);
+}
+
 fn render_model_dialog(f: &mut Frame, app: &App, area: Rect) {
     let model_count = app.available_models.len().min(12) as u16;
     let dialog_w = 56u16;
@@ -683,7 +724,7 @@ fn render_model_dialog(f: &mut Frame, app: &App, area: Rect) {
 
     let inner = popup_area.inner(Margin::new(1, 1));
     f.render_widget(Clear, popup_area);
-    f.render_widget(dialog_block("Select Model"), popup_area);
+    f.render_widget(dialog_block("Select Model", &app.theme), popup_area);
 
     if app.available_models.is_empty() {
         let loading = Paragraph::new(Line::from(Span::styled(
@@ -804,7 +845,10 @@ fn render_model_dialog(f: &mut Frame, app: &App, area: Rect) {
 fn render_file_dialog(f: &mut Frame, app: &App, area: Rect) {
     let entry_count = app.file_dialog_entries.len().min(12) as u16;
     let dialog_w = 60u16;
-    let dialog_h = entry_count + 5;
+    let dialog_h = entry_count + 6;
+
+    let is_load_session = app.file_dialog_mode == FileDialogMode::LoadSession;
+    let title = if is_load_session { "Load Session" } else { "Load File" };
 
     let popup_area = Rect {
         x: (area.width.saturating_sub(dialog_w)) / 2,
@@ -814,7 +858,7 @@ fn render_file_dialog(f: &mut Frame, app: &App, area: Rect) {
     };
 
     f.render_widget(Clear, popup_area);
-    f.render_widget(dialog_block("Load File"), popup_area);
+    f.render_widget(dialog_block(title, &app.theme), popup_area);
 
     let inner = popup_area.inner(Margin::new(1, 1));
 
@@ -826,7 +870,7 @@ fn render_file_dialog(f: &mut Frame, app: &App, area: Rect) {
     };
     let path_line = Paragraph::new(Line::from(Span::styled(
         format!("  {}", path_str),
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(app.theme.path_fg),
     )));
     let path_area = Rect {
         x: inner.x,
@@ -871,37 +915,44 @@ fn render_file_dialog(f: &mut Frame, app: &App, area: Rect) {
             let icon = if name == ".." {
                 "  "
             } else if *is_dir {
-                "/ "
+                "  "
             } else {
                 "  "
             };
 
+            let display_name = if *is_dir && name != ".." {
+                format!("{}/", name)
+            } else {
+                name.clone()
+            };
+
             let name_style = if is_selected {
                 Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::White)
+                    .fg(app.theme.list_selected_fg)
+                    .bg(app.theme.list_selected_bg)
                     .add_modifier(Modifier::BOLD)
             } else if *is_dir {
                 Style::default()
-                    .fg(Color::Blue)
+                    .fg(app.theme.dir_fg)
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::White)
+                Style::default().fg(app.theme.file_fg)
             };
 
             spans.push(Span::styled(icon, name_style));
-            spans.push(Span::styled(name.clone(), name_style));
+            spans.push(Span::styled(display_name, name_style));
 
             ListItem::new(Line::from(spans))
         })
         .collect();
 
-    let list = List::new(items);
+    let list = List::new(items).style(Style::default().bg(Color::Black));
     f.render_widget(list, list_area);
 
-    let btn_y = inner.y + list_h + 2;
+    let btn_y = inner.y + list_h + 1;
+    let btn_label = if is_load_session { "Load" } else { "Open" };
     let open_btn = Button::new(
-        "Open",
+        btn_label,
         inner.x + 8,
         btn_y,
         app.file_dialog_focus == FileDialogFocus::Open,
@@ -938,8 +989,37 @@ fn render_file_dialog(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_save_dialog(f: &mut Frame, app: &App, area: Rect) {
+    use ui::DialogDropdownState;
+
+    let dlg = match app.save_dialog_mode {
+        app::SaveDialogMode::SaveSession => {
+            let mut d = FileActionDialog::new("Save Session");
+            d.add_text_input("Session file:", &app.save_dialog_path, app.save_dialog_cursor, app.save_dialog_focus == SaveDialogFocus::Path);
+            d.add_button("Cancel", app.save_dialog_focus == SaveDialogFocus::Cancel);
+            d.add_button("Save", app.save_dialog_focus == SaveDialogFocus::Save);
+            d
+        }
+        app::SaveDialogMode::ExportChat => {
+            let mut d = FileActionDialog::new("Export As");
+            d.add_text_input("File path:", &app.save_dialog_path, app.save_dialog_cursor, app.save_dialog_focus == SaveDialogFocus::Path);
+            let fmt_state = DialogDropdownState {
+                focused: app.save_dialog_focus == SaveDialogFocus::Format,
+                expanded: app.show_format_dropdown,
+                selected: if app.export_format == app::ExportFormat::Markdown { 0 } else { 1 },
+            };
+            d.add_dropdown("Format", vec!["Markdown".to_string(), "Plain Text".to_string()], fmt_state);
+            d.add_button("Cancel", app.save_dialog_focus == SaveDialogFocus::Cancel);
+            d.add_button("Export", app.save_dialog_focus == SaveDialogFocus::Save);
+            d
+        }
+    };
+
+    let _ = dlg.render(f, area, &app.theme);
+}
+
+fn render_load_dialog(f: &mut Frame, app: &App, area: Rect) {
     let dialog_w: u16 = 60;
-    let dialog_h: u16 = 7;
+    let dialog_h: u16 = 6;
 
     let popup_area = Rect {
         x: (area.width.saturating_sub(dialog_w)) / 2,
@@ -949,12 +1029,12 @@ fn render_save_dialog(f: &mut Frame, app: &App, area: Rect) {
     };
 
     f.render_widget(Clear, popup_area);
-    f.render_widget(dialog_block("Save As"), popup_area);
+    f.render_widget(dialog_block("Load Session", &app.theme), popup_area);
 
     let inner = popup_area.inner(Margin::new(1, 1));
 
     let label = Paragraph::new(Line::from(Span::styled(
-        "  File path:",
+        "  Session file path:",
         Style::default().fg(Color::White),
     )));
     let label_area = Rect {
@@ -965,35 +1045,9 @@ fn render_save_dialog(f: &mut Frame, app: &App, area: Rect) {
     };
     f.render_widget(label, label_area);
 
-    let path_style = if app.save_dialog_focus == SaveDialogFocus::Path {
-        Style::default()
-            .fg(Color::Black)
-            .bg(Color::White)
-    } else {
-        Style::default().fg(Color::White).bg(Color::Rgb(40, 40, 40))
-    };
-
-    let path_display = if app.save_dialog_path.is_empty() && app.save_dialog_focus == SaveDialogFocus::Path {
-        format!("{} ", " ".repeat(app.save_dialog_cursor))
-    } else {
-        let chars: Vec<char> = app.save_dialog_path.chars().collect();
-        let mut display = String::new();
-        for (i, c) in chars.iter().enumerate() {
-            if i == app.save_dialog_cursor && app.save_dialog_focus == SaveDialogFocus::Path {
-                display.push_str(&format!("[{}]", c));
-            } else {
-                display.push(*c);
-            }
-        }
-        if app.save_dialog_cursor == chars.len() && app.save_dialog_focus == SaveDialogFocus::Path {
-            display.push(' ');
-        }
-        display
-    };
-
     let path_line = Paragraph::new(Line::from(Span::styled(
-        format!("  {}", path_display),
-        path_style,
+        format!("  {}", app.load_dialog_path),
+        Style::default().fg(Color::White).bg(Color::Rgb(40, 40, 40)),
     )));
     let path_area = Rect {
         x: inner.x,
@@ -1003,30 +1057,26 @@ fn render_save_dialog(f: &mut Frame, app: &App, area: Rect) {
     };
     f.render_widget(path_line, path_area);
 
+    let cursor_x = path_area.x + 2 + app.load_dialog_cursor as u16;
+    f.set_cursor_position(Position::new(cursor_x, path_area.y));
+
     let btn_y = inner.y + 4;
-    let save_btn = Button::new(
-        "Save",
-        inner.x + 10,
-        btn_y,
-        app.save_dialog_focus == SaveDialogFocus::Save,
-        Color::Green,
-        Color::Green,
-    );
+    let load_btn = Button::new("Load", inner.x + 10, btn_y, true, Color::Green, Color::Green);
     let cancel_btn = Button::new(
         "Cancel",
-        inner.x + 23,
+        inner.x + 22,
         btn_y,
-        app.save_dialog_focus == SaveDialogFocus::Cancel,
+        true,
         Color::Red,
         Color::Red,
     );
 
-    let (save_text, save_style) = save_btn.render();
+    let (load_text, load_style) = load_btn.render();
     let (cancel_text, cancel_style) = cancel_btn.render();
 
     let buttons = Line::from(vec![
         Span::raw("          "),
-        Span::styled(save_text, save_style),
+        Span::styled(load_text, load_style),
         Span::raw("     "),
         Span::styled(cancel_text, cancel_style),
         Span::raw("          "),
@@ -1346,7 +1396,7 @@ fn span_display_width(span: &Span) -> usize {
     span.content.chars().count()
 }
 
-fn wrap_and_justify_lines(lines: Vec<Line<'static>>, width: usize) -> Vec<Line<'static>> {
+fn wrap_and_justify_lines(lines: &[Line<'static>], width: usize) -> Vec<Line<'static>> {
     let mut result = Vec::new();
     let mut para: Vec<Line<'static>> = Vec::new();
 
@@ -1358,17 +1408,17 @@ fn wrap_and_justify_lines(lines: Vec<Line<'static>>, width: usize) -> Vec<Line<'
                 justify_paragraph_into(&mut result, &para, width);
                 para.clear();
             }
-            result.push(line);
+            result.push(line.clone());
         } else if is_code {
             if !para.is_empty() {
                 justify_paragraph_into(&mut result, &para, width);
                 para.clear();
             }
-            result.push(line);
+            result.push(line.clone());
         } else if w <= width {
-            para.push(line);
+            para.push(line.clone());
         } else {
-            para.extend(wrap_single_line(line, width));
+            para.extend(wrap_single_line(line.clone(), width));
         }
     }
     if !para.is_empty() {
@@ -1468,8 +1518,12 @@ fn highlight_code(code: &str, lang: Option<&str>) -> Vec<Line<'static>> {
     use syntect::highlighting::ThemeSet;
     use syntect::parsing::SyntaxSet;
 
-    let ss = SyntaxSet::load_defaults_newlines();
-    let ts = ThemeSet::load_defaults();
+    use std::sync::OnceLock;
+    static SS: OnceLock<SyntaxSet> = OnceLock::new();
+    static TS: OnceLock<ThemeSet> = OnceLock::new();
+
+    let ss = SS.get_or_init(|| SyntaxSet::load_defaults_newlines());
+    let ts = TS.get_or_init(|| ThemeSet::load_defaults());
 
     let syntax = lang
         .and_then(|l| ss.find_syntax_by_token(l))
