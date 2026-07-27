@@ -1100,8 +1100,8 @@ impl App {
                                     return;
                                 }
                                 Err(e) => {
-                                    log_to_file(is_logging, &log_file, &session_id, "STREAM_ERROR", &e.to_string());
-                                    let _ = tx.send(StreamChunk::Error(format!("Stream error: {}", e)));
+                                    log_to_file(is_logging, &log_file, &session_id, "STREAM_ERROR", &format!("{} | buffer: {:?}", e, buffer));
+                                    let _ = tx.send(StreamChunk::Error(format!("Stream error: {} | last bytes: {:?}", e, truncate(&buffer, 200))));
                                     return;
                                 }
                             }
@@ -1421,8 +1421,8 @@ impl App {
                                     return;
                                 }
                                 Err(e) => {
-                                    log_to_file(is_logging, &log_file, &session_id, "STREAM_ERROR", &e.to_string());
-                                    let _ = tx.send(StreamChunk::Error(format!("Stream error: {}", e)));
+                                    log_to_file(is_logging, &log_file, &session_id, "STREAM_ERROR", &format!("{} | buffer: {:?}", e, buffer));
+                                    let _ = tx.send(StreamChunk::Error(format!("Stream error: {} | last bytes: {:?}", e, truncate(&buffer, 200))));
                                     return;
                                 }
                             }
