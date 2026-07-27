@@ -764,6 +764,7 @@ impl App {
                         break;
                     }
                     Ok(StreamChunk::Error(msg)) => {
+                        let had_content = !self.streaming_thinking.is_empty() || !self.streaming_text.is_empty();
                         if !self.streaming_thinking.is_empty() {
                             self.messages
                                 .push(ChatMessage::Thinking(self.streaming_thinking.clone()));
@@ -774,7 +775,13 @@ impl App {
                                 .push(ChatMessage::Assistant(self.streaming_text.clone()));
                             self.streaming_text.clear();
                         }
-                        self.messages.push(ChatMessage::App(msg));
+                        if had_content {
+                            self.messages.push(ChatMessage::App(
+                                "⚠ Stream ended unexpectedly (partial response shown)".to_string(),
+                            ));
+                        } else {
+                            self.messages.push(ChatMessage::App(msg));
+                        }
                         self.is_loading = false;
                         self.status_message.clear();
                         self.response_rx = None;
