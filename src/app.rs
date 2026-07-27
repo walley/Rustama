@@ -137,6 +137,7 @@ pub enum StreamChunk {
     Thinking(String),
     Done(TokenStats),
     Error(String),
+    Status(String),
     ToolCalls(Vec<serde_json::Value>),
 }
 
@@ -629,6 +630,9 @@ impl App {
                     Ok(StreamChunk::Thinking(text)) => {
                         self.streaming_thinking.push_str(&text);
                         self.auto_scroll = true;
+                    }
+                    Ok(StreamChunk::Status(msg)) => {
+                        self.status_message = msg;
                     }
                     Ok(StreamChunk::ToolCalls(tool_calls)) => {
                         if !self.streaming_thinking.is_empty() {
@@ -3481,8 +3485,8 @@ async fn send_with_retry(
                     .and_then(|v| v.to_str().ok())
                     .and_then(|s| s.parse::<u64>().ok())
                     .unwrap_or_else(|| 2u64.pow(attempt) + 1);
-                let msg = format!("Rate limited (429), retrying in {}s (attempt {}/{})", delay_secs, attempt + 1, max_retries);
-                let _ = tx.send(StreamChunk::Error(format!("⚠ {}", msg)));
+                let msg = format!("⚠ Rate limited (429), retrying in {}s (attempt {}/{})", delay_secs, attempt + 1, max_retries);
+                let _ = tx.send(StreamChunk::Status(msg.clone()));
                 log_to_file(is_logging, log_file, session_id, "RETRY", &msg);
                 let _ = resp.text().await;
                 tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
@@ -3491,8 +3495,8 @@ async fn send_with_retry(
             Ok(resp) if resp.status().is_server_error() && attempt < max_retries => {
                 let status = resp.status();
                 let delay_secs = 2u64.pow(attempt) + 1;
-                let msg = format!("Server error ({}), retrying in {}s (attempt {}/{})", status, delay_secs, attempt + 1, max_retries);
-                let _ = tx.send(StreamChunk::Error(format!("⚠ {}", msg)));
+                let msg = format!("⚠ Server error ({}), retrying in {}s (attempt {}/{})", status, delay_secs, attempt + 1, max_retries);
+                let _ = tx.send(StreamChunk::Status(msg.clone()));
                 log_to_file(is_logging, log_file, session_id, "RETRY", &msg);
                 let _ = resp.text().await;
                 tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
@@ -3503,8 +3507,8 @@ async fn send_with_retry(
                 last_err = Some(e);
                 if attempt < max_retries {
                     let delay_secs = 2u64.pow(attempt) + 1;
-                    let msg = format!("Request error, retrying in {}s (attempt {}/{})", delay_secs, attempt + 1, max_retries);
-                    let _ = tx.send(StreamChunk::Error(format!("⚠ {}", msg)));
+                    let msg = format!("⚠ Request error, retrying in {}s (attempt {}/{})", delay_secs, attempt + 1, max_retries);
+                    let _ = tx.send(StreamChunk::Status(msg.clone()));
                     log_to_file(is_logging, log_file, session_id, "RETRY", &msg);
                     tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
                     continue;
