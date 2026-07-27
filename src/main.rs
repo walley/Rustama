@@ -290,12 +290,24 @@ fn render_output(f: &mut Frame, app: &mut App, area: Rect) {
                     hist.push(Line::from(""));
                 }
                 ChatMessage::Thinking(text) => {
+                    let mut in_code = false;
                     for text_line in text.lines() {
-                        hist.push(Line::from(Span::styled(
-                            format!("  {}", text_line),
+                        let trimmed = text_line.trim();
+                        if trimmed.starts_with("```") {
+                            in_code = !in_code;
+                        }
+                        let style = if in_code {
                             Style::default()
                                 .fg(app.theme.thinking_fg)
-                                .add_modifier(Modifier::ITALIC),
+                                .bg(Color::Rgb(30, 60, 120))
+                        } else {
+                            Style::default()
+                                .fg(app.theme.thinking_fg)
+                                .add_modifier(Modifier::ITALIC)
+                        };
+                        hist.push(Line::from(Span::styled(
+                            format!("  {}", text_line),
+                            style,
                         )));
                     }
                     hist.push(Line::from(""));
@@ -384,12 +396,24 @@ fn render_output(f: &mut Frame, app: &mut App, area: Rect) {
     if history_changed || streaming_changed {
         let mut lines = app.cached_output.clone();
         if app.is_loading && !app.streaming_thinking.is_empty() {
+            let mut in_code = false;
             for think_line in app.streaming_thinking.lines() {
-                lines.push(Line::from(Span::styled(
-                    format!("  {}", think_line),
+                let trimmed = think_line.trim();
+                if trimmed.starts_with("```") {
+                    in_code = !in_code;
+                }
+                let style = if in_code {
                     Style::default()
                         .fg(app.theme.thinking_fg)
-                        .add_modifier(Modifier::ITALIC),
+                        .bg(Color::Rgb(30, 60, 120))
+                } else {
+                    Style::default()
+                        .fg(app.theme.thinking_fg)
+                        .add_modifier(Modifier::ITALIC)
+                };
+                lines.push(Line::from(Span::styled(
+                    format!("  {}", think_line),
+                    style,
                 )));
             }
             lines.push(Line::from(""));
