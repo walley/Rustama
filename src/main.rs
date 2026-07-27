@@ -1594,13 +1594,8 @@ fn wrap_and_justify_lines(lines: &[Line<'static>], width: usize) -> Vec<Line<'st
     for line in lines {
         let w: usize = line.spans.iter().map(|s| span_display_width(s)).sum();
         let is_code = line.spans.iter().any(|s| s.style.bg == Some(Color::Rgb(30, 60, 120)));
-        if w == 0 {
-            if !para.is_empty() {
-                justify_paragraph_into(&mut result, &para, width);
-                para.clear();
-            }
-            result.push(line.clone());
-        } else if is_code {
+        let is_table = line.spans.iter().any(|s| s.content.contains('│') || s.content.contains('┌') || s.content.contains('└') || s.content.contains('├') || s.content.contains('┬') || s.content.contains('┴') || s.content.contains('┼'));
+        if w == 0 || is_code || is_table {
             if !para.is_empty() {
                 justify_paragraph_into(&mut result, &para, width);
                 para.clear();
