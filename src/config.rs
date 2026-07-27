@@ -12,6 +12,11 @@ pub struct Config {
     pub logging: bool,
     pub logfile: String,
     pub system_prompt: String,
+    pub proxy: Option<String>,
+    pub max_tool_rounds: usize,
+    pub temperature: f64,
+    pub top_p: f64,
+    pub top_k: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -33,6 +38,11 @@ impl Default for Config {
             logging: true,
             logfile: "rustama.log".to_string(),
             system_prompt: "You are a coding assistant with access to tools. When the user asks you to do something, use the available tools to accomplish the task. Always use tools when needed - do not just describe what you would do. Execute the actual tool calls. After using a tool, continue working until the task is complete.".to_string(),
+            proxy: None,
+            max_tool_rounds: 10,
+            temperature: 1.0,
+            top_p: 0.9,
+            top_k: 40,
         }
     }
 }
@@ -96,9 +106,20 @@ impl Config {
              # Log file path\n\
              logfile = {}\n\n\
              # System prompt (set via /setsystem command)\n\
-             system_prompt = {}\n",
+             system_prompt = {}\n\n\
+             # HTTP proxy URL (optional, e.g. http://proxy:8080)\n\
+             # proxy = http://proxy:8080\n\n\
+             # Max agentic tool rounds per request (1-100, default: 10)\n\
+             max_tool_rounds = {}\n\n\
+             # Sampling temperature (0.0-2.0, default: 1.0)\n\
+             temperature = {}\n\n\
+             # Top-p sampling (0.0-1.0, default: 0.9)\n\
+             top_p = {}\n\n\
+             # Top-k sampling (1-100, default: 40)\n\
+             top_k = {}\n",
             self.ollama_url, self.model, self.save_path, self.agentic, self.timeout_secs,
-            self.logging, self.logfile, self.system_prompt,
+            self.logging, self.logfile, self.system_prompt, self.max_tool_rounds,
+            self.temperature, self.top_p, self.top_k,
         )
     }
 
@@ -131,6 +152,42 @@ impl Config {
         }
         if let Some(v) = values.get("system_prompt") {
             cfg.system_prompt = v.clone();
+        }
+        if let Some(v) = values.get("proxy") {
+            let v = v.trim();
+            if v.is_empty() || v.eq_ignore_ascii_case("off") || v.eq_ignore_ascii_case("none") || v.eq_ignore_ascii_case("false") {
+                cfg.proxy = None;
+            } else {
+                cfg.proxy = Some(v.to_string());
+            }
+        }
+        if let Some(v) = values.get("max_tool_rounds") {
+            if let Ok(n) = v.parse::<usize>() {
+                if n >= 1 && n <= 100 {
+                    cfg.max_tool_rounds = n;
+                }
+            }
+        }
+        if let Some(v) = values.get("temperature") {
+            if let Ok(n) = v.parse::<f64>() {
+                if n >= 0.0 && n <= 2.0 {
+                    cfg.temperature = n;
+                }
+            }
+        }
+        if let Some(v) = values.get("top_p") {
+            if let Ok(n) = v.parse::<f64>() {
+                if n >= 0.0 && n <= 1.0 {
+                    cfg.top_p = n;
+                }
+            }
+        }
+        if let Some(v) = values.get("top_k") {
+            if let Ok(n) = v.parse::<u32>() {
+                if n >= 1 && n <= 100 {
+                    cfg.top_k = n;
+                }
+            }
         }
 
         cfg
@@ -166,6 +223,35 @@ impl Config {
         }
         Ok(())
     }
+
+    pub fn save(&self) -> Result<(), String> {
+        let dir = conf_dir().ok_or("Cannot determine config directory")?;
+        let conf_path = dir.join("rustama.conf");
+        fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let mut lines: Vec<String> = Vec::new();
+        lines.push("# Rustama configuration".to_string());
+        lines.push(String::new());
+        lines.push(format!("ollama_url = {}", self.ollama_url));
+        lines.push(format!("model = {}", self.model));
+        lines.push(format!("save_path = {}", self.save_path));
+        lines.push(format!("agentic = {}", self.agentic));
+        lines.push(format!("timeout_secs = {}", self.timeout_secs));
+        lines.push(format!("logging = {}", self.logging));
+        lines.push(format!("logfile = {}", self.logfile));
+        lines.push(format!("system_prompt = {}", self.system_prompt));
+        lines.push(String::new());
+        if let Some(ref proxy) = self.proxy {
+            lines.push(format!("proxy = {}", proxy));
+        } else {
+            lines.push("# proxy = off".to_string());
+        }
+        lines.push(format!("max_tool_rounds = {}", self.max_tool_rounds));
+        lines.push(format!("temperature = {}", self.temperature));
+        lines.push(format!("top_p = {}", self.top_p));
+        lines.push(format!("top_k = {}", self.top_k));
+        fs::write(&conf_path, lines.join("\n")).map_err(|e| e.to_string())?;
+        Ok(())
+    }
 }
 
 pub fn load_cloud_models() -> Vec<CloudModel> {
@@ -193,11 +279,15 @@ fn default_cloud_conf() -> String {
     "# Cloud models configuration\n\
      # Each model has its own section [model_name]\n\
      # Required fields: api_url, api_key\n\
-     # Optional: api_format (openai or mistral, default: openai)\n\
+     # Optional: api_model (actual model name sent to API, defaults to section name)\n\
      \n\
      [mistral-small]\n\
      api_url = https://api.mistral.ai/v1/chat/completions\n\
      api_key = XJUStDrci7RWGaYXPxKWJ0urj4vlYqKA\n\
+     \n\
+     [kimi-k3]\n\
+     api_url = https://api.moonshot.ai/v1/chat/completions\n\
+     api_key = YOUR_MOONSHOT_API_KEY\n\
      \n\
      "
     .to_string()

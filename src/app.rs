@@ -66,6 +66,18 @@ pub enum SaveDialogFocus {
     Cancel,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum SettingsFocus {
+    Proxy,
+    OllamaUrl,
+    Temperature,
+    TopP,
+    TopK,
+    MaxToolRounds,
+    Save,
+    Cancel,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(dead_code)]
 pub enum ChatMessage {
@@ -134,6 +146,8 @@ pub struct App {
     pub clipboard: Option<Clipboard>,
     pub scroll_offset: u16,
     pub auto_scroll: bool,
+    pub scrollbar_dragging: bool,
+    pub scrollbar_drag_start: Option<u16>,
     pub should_quit: bool,
     pub input_mode: InputMode,
     pub focus: Focus,
@@ -164,6 +178,7 @@ pub struct App {
     pub agentic_mode: bool,
     pub max_tool_rounds: usize,
     pub tool_round_count: usize,
+    pub tool_call_count: usize,
     pub pending_tool_calls: Vec<serde_json::Value>,
     pub tool_call_log: Vec<(String, String, String)>,
     pub temperature: f64,
@@ -178,6 +193,16 @@ pub struct App {
     pub show_load_dialog: bool,
     pub load_dialog_path: String,
     pub load_dialog_cursor: usize,
+    pub show_settings_dialog: bool,
+    pub settings_focus: SettingsFocus,
+    pub settings_proxy: String,
+    pub settings_ollama_url: String,
+    pub settings_temperature: String,
+    pub settings_top_p: String,
+    pub settings_top_k: String,
+    pub settings_max_tool_rounds: String,
+    pub settings_cursor: usize,
+    pub proxy: Option<String>,
     pub is_logging: bool,
     pub log_file: String,
     pub token_stats: TokenStats,
@@ -191,6 +216,7 @@ pub struct App {
     pub cached_streaming_len: usize,
     pub cached_streaming_thinking_len: usize,
     pub cached_width: u16,
+    pub terminal_height: u16,
     pub session_id: String,
     pub session_name: String,
 }
@@ -208,6 +234,8 @@ impl App {
             clipboard,
             scroll_offset: 0,
             auto_scroll: true,
+            scrollbar_dragging: false,
+            scrollbar_drag_start: None,
             should_quit: false,
             input_mode: InputMode::Input,
             focus: Focus::Input,
@@ -217,7 +245,7 @@ impl App {
             show_quit_confirm: false,
             is_loading: false,
             status_message: String::new(),
-            ollama_url: cfg.ollama_url,
+            ollama_url: cfg.ollama_url.clone(),
             model_name: cfg.model,
             save_path: cfg.save_path.clone(),
             response_rx: None,
@@ -236,13 +264,14 @@ impl App {
             file_dialog_scroll: 0,
             file_dialog_mode: FileDialogMode::AttachFile,
             agentic_mode: cfg.agentic,
-            max_tool_rounds: 10,
+            max_tool_rounds: cfg.max_tool_rounds,
             tool_round_count: 0,
+            tool_call_count: 0,
             pending_tool_calls: Vec::new(),
             tool_call_log: Vec::new(),
-            temperature: 1.0,
-            top_p: 0.9,
-            top_k: 40,
+            temperature: cfg.temperature,
+            top_p: cfg.top_p,
+            top_k: cfg.top_k,
             show_save_dialog: false,
             save_dialog_path: cfg.save_path,
             save_dialog_cursor: 0,
@@ -252,6 +281,16 @@ impl App {
             show_load_dialog: false,
             load_dialog_path: dirs_home().to_string_lossy().to_string(),
             load_dialog_cursor: 0,
+            show_settings_dialog: false,
+            settings_focus: SettingsFocus::Proxy,
+            settings_proxy: cfg.proxy.clone().unwrap_or_default(),
+            settings_ollama_url: cfg.ollama_url.clone(),
+            settings_temperature: "1.0".to_string(),
+            settings_top_p: "0.9".to_string(),
+            settings_top_k: "40".to_string(),
+            settings_max_tool_rounds: cfg.max_tool_rounds.to_string(),
+            settings_cursor: 0,
+            proxy: cfg.proxy.clone(),
             is_logging: cfg.logging,
             log_file: cfg.logfile,
             token_stats: TokenStats::default(),
@@ -265,6 +304,7 @@ impl App {
             cached_streaming_len: 0,
             cached_streaming_thinking_len: 0,
             cached_width: 0,
+            terminal_height: 24,
             session_id: format!("{:016x}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos() & 0xffff_ffff_ffff_ffff),
             session_name: String::new(),
         };
@@ -314,6 +354,10 @@ impl App {
             self.handle_model_dialog_key(key);
             return;
         }
+        if self.show_settings_dialog {
+            self.handle_settings_dialog_key(key);
+            return;
+        }
         match self.input_mode {
             InputMode::Normal => self.handle_normal_key(key),
             InputMode::Input => self.handle_input_key(key),
@@ -327,8 +371,12 @@ impl App {
             KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.open_export_dialog();
             }
-            KeyCode::Up | KeyCode::Char('k') => self.scroll_up(),
-            KeyCode::Down | KeyCode::Char('j') => self.scroll_down(),
+            KeyCode::Up => self.scroll_up(),
+            KeyCode::Down => self.scroll_down(),
+            KeyCode::PageUp => self.page_up(),
+            KeyCode::PageDown => self.page_down(),
+            KeyCode::Home => self.home(),
+            KeyCode::End => self.end(),
             KeyCode::Char(c) => {
                 self.input_mode = InputMode::Input;
                 self.focus = Focus::Input;
@@ -510,7 +558,7 @@ impl App {
     fn max_menu_items(&self) -> usize {
         match self.active_menu {
             ActiveMenu::File => 4,
-            ActiveMenu::Options => 2,
+            ActiveMenu::Options => 3,
             ActiveMenu::Help => 1,
             ActiveMenu::None => 0,
         }
@@ -532,6 +580,7 @@ impl App {
                     "Agentic mode: OFF".to_string()
                 };
             }
+            (ActiveMenu::Options, 2) => self.open_settings_dialog(),
             _ => {}
         }
         self.active_menu = ActiveMenu::None;
@@ -545,6 +594,26 @@ impl App {
 
     pub fn scroll_down(&mut self) {
         self.scroll_offset = self.scroll_offset.saturating_add(1);
+    }
+
+    pub fn page_up(&mut self) {
+        self.auto_scroll = false;
+        let page = self.terminal_height.saturating_sub(4);
+        self.scroll_offset = self.scroll_offset.saturating_sub(page);
+    }
+
+    pub fn page_down(&mut self) {
+        let page = self.terminal_height.saturating_sub(4);
+        self.scroll_offset = self.scroll_offset.saturating_add(page);
+    }
+
+    pub fn home(&mut self) {
+        self.auto_scroll = false;
+        self.scroll_offset = 0;
+    }
+
+    pub fn end(&mut self) {
+        self.auto_scroll = true;
     }
 
     pub fn set_auto_scroll(&mut self) {
@@ -574,6 +643,7 @@ impl App {
                             self.log_event("ASSISTANT", &self.streaming_text);
                             self.streaming_text.clear();
                         }
+                        let mut consecutive_unknown = 0;
                         for tc in &tool_calls {
                             let name = tc["function"]["name"]
                                 .as_str()
@@ -585,7 +655,17 @@ impl App {
                                 tc["function"]["arguments"].to_string()
                             };
 
-                            let tool_call_id = tc["id"].as_str().map(|s| s.to_string());
+                            if name == "unknown" || name == "call_unknown" {
+                                consecutive_unknown += 1;
+                                if consecutive_unknown >= 3 {
+                                    break;
+                                }
+                            } else {
+                                consecutive_unknown = 0;
+                            }
+
+                            let tool_call_id = Some(tc["id"].as_str().map(|s| s.to_string())
+                                .unwrap_or_else(|| format!("call_{}", &name)));
 
                             self.messages.push(ChatMessage::ToolCall {
                                 name: name.clone(),
@@ -593,7 +673,8 @@ impl App {
                                 tool_call_id: tool_call_id.clone(),
                             });
 
-                            let result = execute_tool_call(&name, &args);
+                            let result = execute_tool_call(&name, &args, &self.proxy);
+                            self.tool_call_count += 1;
                             self.tool_call_log
                                 .push((name.clone(), args.clone(), result.clone()));
                             self.log_event("TOOL_CALL", &format!("{}({}) -> {}", name, args, truncate(&result, 500)));
@@ -611,7 +692,7 @@ impl App {
                         self.tool_round_count += 1;
                         if self.tool_round_count >= self.max_tool_rounds {
                             self.messages.push(ChatMessage::App(
-                                format!("Reached max tool rounds ({}). Stopping.", self.max_tool_rounds),
+                                format!("Reached max tool rounds ({}/{} rounds, {} tool calls). Stopping.", self.tool_round_count, self.max_tool_rounds, self.tool_call_count),
                             ));
                             self.set_auto_scroll();
                             break;
@@ -633,18 +714,20 @@ impl App {
                                 for tc in &parsed_tool_calls {
                                     let name = tc["name"].as_str().unwrap_or("unknown").to_string();
                                     let args = tc["parameters"].to_string();
+                                    let tc_id = format!("call_{}", &name);
                                     self.messages.push(ChatMessage::ToolCall {
                                         name: name.clone(),
                                         arguments: args.clone(),
-                                        tool_call_id: None,
+                                        tool_call_id: Some(tc_id.clone()),
                                     });
-                                    let result = execute_tool_call(&name, &args);
+                            let result = execute_tool_call(&name, &args, &self.proxy);
+                            self.tool_call_count += 1;
                                     self.tool_call_log.push((name.clone(), args.clone(), result.clone()));
                                     self.log_event("TOOL_CALL", &format!("{}({}) -> {}", name, args, truncate(&result, 500)));
                                     self.messages.push(ChatMessage::ToolResult {
                                         name,
                                         content: result,
-                                        tool_call_id: None,
+                                        tool_call_id: Some(tc_id),
                                     });
                                 }
                                 self.streaming_thinking.clear();
@@ -655,7 +738,7 @@ impl App {
                                 self.tool_round_count += 1;
                                 if self.tool_round_count >= self.max_tool_rounds {
                                     self.messages.push(ChatMessage::App(
-                                        format!("Reached max tool rounds ({}). Stopping.", self.max_tool_rounds),
+                                        format!("Reached max tool rounds ({}/{} rounds, {} tool calls). Stopping.", self.tool_round_count, self.max_tool_rounds, self.tool_call_count),
                                     ));
                                     self.set_auto_scroll();
                                     break;
@@ -668,6 +751,9 @@ impl App {
                                 .push(ChatMessage::Assistant(text));
                             self.streaming_thinking.clear();
                             self.streaming_text.clear();
+                        } else {
+                            self.messages
+                                .push(ChatMessage::App("Error: Empty response from model".to_string()));
                         }
                         self.is_loading = false;
                         self.status_message.clear();
@@ -755,7 +841,7 @@ impl App {
                     let mut tc = serde_json::json!({
                         "function": {
                             "name": name,
-                            "arguments": serde_json::from_str::<serde_json::Value>(arguments).unwrap_or(serde_json::json!({}))
+                            "arguments": arguments
                         }
                     });
                     if is_cloud {
@@ -776,11 +862,8 @@ impl App {
                         "content": content,
                     });
                     if is_cloud {
-                        if let Some(id) = tool_call_id {
-                            msg["tool_call_id"] = serde_json::json!(id);
-                        } else {
-                            msg["name"] = serde_json::json!(name);
-                        }
+                        let id = tool_call_id.clone().unwrap_or_else(|| name.to_string());
+                        msg["tool_call_id"] = serde_json::json!(id);
                     } else {
                         msg["name"] = serde_json::json!(name);
                     }
@@ -798,6 +881,7 @@ impl App {
         let temperature = self.temperature;
         let top_p = self.top_p;
         let top_k = self.top_k;
+        let proxy = if cloud_model.is_some() { self.proxy.clone() } else { None };
 
         self.log_event("PROMPT", &serde_json::to_string_pretty(&api_messages).unwrap_or_default());
 
@@ -811,7 +895,7 @@ impl App {
                 .unwrap();
 
             rt.block_on(async {
-                let client = reqwest::Client::new();
+                let client = build_reqwest_client(&proxy);
 
                 let (api_url, headers, body) = if let Some(ref cloud) = cloud_model {
                     let mut body = serde_json::json!({
@@ -822,9 +906,6 @@ impl App {
                     body["tools"] = serde_json::json!(get_tool_definitions());
                     body["temperature"] = serde_json::json!(temperature);
                     body["top_p"] = serde_json::json!(top_p);
-                    if top_k > 0 {
-                        body["top_k"] = serde_json::json!(top_k);
-                    }
                     let mut headers = reqwest::header::HeaderMap::new();
                     headers.insert(
                         "Authorization",
@@ -852,19 +933,168 @@ impl App {
                     (format!("{}/api/chat", url), None, body)
                 };
 
-                let mut req = client
-                    .post(&api_url)
-                    .json(&body)
-                    .timeout(std::time::Duration::from_secs(300));
-
-                if let Some(h) = headers {
-                    req = req.headers(h);
-                }
-
                 log_to_file(is_logging, &log_file, &session_id, "REQUEST", &format!("{} {}", api_url, serde_json::to_string(&body).unwrap_or_default()));
 
+                let result = send_with_retry(&client, reqwest::Method::POST, &api_url, headers, &body, 3, &tx, is_logging, &log_file, &session_id).await;
+
                 let is_cloud = cloud_model.is_some();
-                stream_with_retry(req, tx, is_cloud, is_logging, &log_file, &session_id, &api_url).await;
+                match result {
+                    Ok(mut resp) => {
+                        if !resp.status().is_success() {
+                            let status = resp.status();
+                            let body = resp.text().await.unwrap_or_default();
+                            let msg = format!("HTTP {}: {}", status, truncate(&body, 200));
+                            log_to_file(is_logging, &log_file, &session_id, "HTTP_ERROR", &msg);
+                            let _ = tx.send(StreamChunk::Error(msg));
+                            return;
+                        }
+                        let mut buffer = String::new();
+                        let mut tool_call_map: std::collections::HashMap<u32, serde_json::Value> = std::collections::HashMap::new();
+                        loop {
+                            match resp.chunk().await {
+                                Ok(Some(chunk)) => {
+                                    buffer.push_str(&String::from_utf8_lossy(&chunk));
+                                    while let Some(pos) = buffer.find('\n') {
+                                        let raw = buffer[..pos].trim().to_string();
+                                        buffer = buffer[pos + 1..].to_string();
+                                        if raw.is_empty() {
+                                            continue;
+                                        }
+                                        let line = if is_cloud {
+                                            raw.strip_prefix("data: ").unwrap_or(&raw).trim().to_string()
+                                        } else {
+                                            raw
+                                        };
+                                        log_to_file(is_logging, &log_file, &session_id, "RESPONSE", &line);
+                                        if line == "[DONE]" {
+                                            log_to_file(is_logging, &log_file, &session_id, "STREAM_END", "DONE sentinel");
+                                            let _ = tx.send(StreamChunk::Done(TokenStats::default()));
+                                            return;
+                                        }
+                                        if line.is_empty() {
+                                            continue;
+                                        }
+                                        match serde_json::from_str::<serde_json::Value>(&line) {
+                                            Ok(json) => {
+                                                if is_cloud {
+                                                    if let Some(reasoning) = json["choices"][0]["delta"]["reasoning_content"].as_str() {
+                                                        if !reasoning.is_empty() {
+                                                            let _ = tx.send(StreamChunk::Thinking(reasoning.to_string()));
+                                                        }
+                                                    }
+                                                    if let Some(delta) = json["choices"][0]["delta"]["content"].as_str() {
+                                                        if !delta.is_empty() {
+                                                            let _ = tx.send(StreamChunk::Text(delta.to_string()));
+                                                        }
+                                                    }
+                                                    if let Some(tc_array) = json["choices"][0]["delta"]["tool_calls"].as_array() {
+                                                        for tc in tc_array {
+                                                            let idx = tc["index"].as_u64().unwrap_or(0) as u32;
+                                                            let entry = tool_call_map.entry(idx).or_insert_with(|| {
+                                                                let mut base = serde_json::json!({
+                                                                    "index": idx,
+                                                                    "type": "function",
+                                                                    "function": {"name": "", "arguments": ""}
+                                                                });
+                                                                if let Some(id) = tc["id"].as_str() {
+                                                                    base["id"] = serde_json::json!(id);
+                                                                }
+                                                                base
+                                                            });
+                                                            if let Some(id) = tc["id"].as_str() {
+                                                                entry["id"] = serde_json::json!(id);
+                                                            }
+                                                            if let Some(name) = tc["function"]["name"].as_str() {
+                                                                if !name.is_empty() {
+                                                                    entry["function"]["name"] = serde_json::json!(name);
+                                                                }
+                                                            }
+                                                            if let Some(args) = tc["function"]["arguments"].as_str() {
+                                                                let existing = entry["function"]["arguments"].as_str().unwrap_or("").to_string();
+                                                                entry["function"]["arguments"] = serde_json::json!(format!("{}{}", existing, args));
+                                                            }
+                                                        }
+                                                    }
+                                                    let finish = json["choices"][0]["finish_reason"].as_str();
+                                                    if finish == Some("stop") || finish == Some("tool_calls") {
+                                                         let stats = parse_usage_stats(&json);
+                                                        log_to_file(is_logging, &log_file, &session_id, "STREAM_END", &format!("{} finish_reason={}", api_url, finish.unwrap_or("?")));
+                                                        if !tool_call_map.is_empty() {
+                                                            let mut calls: Vec<serde_json::Value> = tool_call_map.into_values().collect();
+                                                            calls.sort_by_key(|tc| tc["index"].as_u64().unwrap_or(0));
+                                                            let _ = tx.send(StreamChunk::ToolCalls(calls));
+                                                        } else {
+                                                            let _ = tx.send(StreamChunk::Done(stats));
+                                                        }
+                                                        return;
+                                                    }
+                                                } else {
+                                                    if let Some(thinking) = json["message"]["thinking"].as_str() {
+                                                        if !thinking.is_empty() {
+                                                            let _ = tx.send(StreamChunk::Thinking(thinking.to_string()));
+                                                        }
+                                                    }
+                                                    if let Some(content) = json["message"]["content"].as_str() {
+                                                        if !content.is_empty() {
+                                                            let _ = tx.send(StreamChunk::Text(content.to_string()));
+                                                        }
+                                                    }
+                                                    if let Some(tool_calls) = json["message"]["tool_calls"].as_array() {
+                                                        for tc in tool_calls {
+                                                            let idx = tc["index"].as_u64().unwrap_or(0) as u32;
+                                                            let entry = tool_call_map.entry(idx).or_insert_with(|| {
+                                                                serde_json::json!({
+                                                                    "index": idx,
+                                                                    "type": "function",
+                                                                    "function": {"name": "", "arguments": ""}
+                                                                })
+                                                            });
+                                                            if let Some(name) = tc["function"]["name"].as_str() {
+                                                                entry["function"]["name"] = serde_json::json!(name);
+                                                            }
+                                                            if let Some(id) = tc["id"].as_str() {
+                                                                entry["id"] = serde_json::json!(id);
+                                                            }
+                                                            if let Some(args) = tc["function"]["arguments"].as_str() {
+                                                                entry["function"]["arguments"] = serde_json::json!(args);
+                                                            }
+                                                        }
+                                                    }
+                                                    if json["done"].as_bool() == Some(true) {
+                                                        log_to_file(is_logging, &log_file, &session_id, "STREAM_END", &format!("{} done=true tokens={}", api_url, json["eval_count"].as_u64().unwrap_or(0)));
+                                                        if !tool_call_map.is_empty() {
+                                                            let calls: Vec<serde_json::Value> = tool_call_map.into_values().collect();
+                                                            let _ = tx.send(StreamChunk::ToolCalls(calls));
+                                                        } else {
+                                                            let stats = parse_token_stats(&json);
+                                                            let _ = tx.send(StreamChunk::Done(stats));
+                                                        }
+                                                        return;
+                                                    }
+                                                }
+                                            }
+                                            Err(_) => {}
+                                        }
+                                    }
+                                }
+                                Ok(None) => {
+                                    log_to_file(is_logging, &log_file, &session_id, "STREAM_END", "stream closed");
+                                    let _ = tx.send(StreamChunk::Done(TokenStats::default()));
+                                    return;
+                                }
+                                Err(e) => {
+                                    log_to_file(is_logging, &log_file, &session_id, "STREAM_ERROR", &e.to_string());
+                                    let _ = tx.send(StreamChunk::Error(format!("Stream error: {}", e)));
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        log_to_file(is_logging, &log_file, &session_id, "CONNECT_ERROR", &e.to_string());
+                        let _ = tx.send(StreamChunk::Error(format!("Failed to connect: {}", e)));
+                    }
+                }
             });
         });
     }
@@ -882,10 +1112,12 @@ impl App {
 
         self.messages.push(ChatMessage::User(prompt));
         self.tool_round_count = 0;
+        self.tool_call_count = 0;
         self.is_loading = true;
         self.streaming_text.clear();
         self.streaming_thinking.clear();
         self.status_message = "Streaming response...".to_string();
+        self.set_auto_scroll();
 
         let model = self.model_name.clone();
         let is_cloud = self.cloud_models.iter().any(|m| m.name == model);
@@ -928,7 +1160,7 @@ impl App {
                     let mut tc = serde_json::json!({
                         "function": {
                             "name": name,
-                            "arguments": serde_json::from_str::<serde_json::Value>(arguments).unwrap_or(serde_json::json!({}))
+                            "arguments": arguments
                         }
                     });
                     if is_cloud {
@@ -949,11 +1181,8 @@ impl App {
                         "content": content,
                     });
                     if is_cloud {
-                        if let Some(id) = tool_call_id {
-                            msg["tool_call_id"] = serde_json::json!(id);
-                        } else {
-                            msg["name"] = serde_json::json!(name);
-                        }
+                        let id = tool_call_id.clone().unwrap_or_else(|| name.to_string());
+                        msg["tool_call_id"] = serde_json::json!(id);
                     } else {
                         msg["name"] = serde_json::json!(name);
                     }
@@ -972,6 +1201,7 @@ impl App {
         let temperature = self.temperature;
         let top_p = self.top_p;
         let top_k = self.top_k;
+        let proxy = if cloud_model.is_some() { self.proxy.clone() } else { None };
 
         self.log_event("PROMPT", &serde_json::to_string_pretty(&api_messages).unwrap_or_default());
 
@@ -985,7 +1215,7 @@ impl App {
                 .unwrap();
 
             rt.block_on(async {
-                let client = reqwest::Client::new();
+                let client = build_reqwest_client(&proxy);
 
                 let (api_url, headers, body) = if let Some(ref cloud) = cloud_model {
                     let mut body = serde_json::json!({
@@ -996,9 +1226,6 @@ impl App {
                     body["tools"] = serde_json::json!(get_tool_definitions());
                     body["temperature"] = serde_json::json!(temperature);
                     body["top_p"] = serde_json::json!(top_p);
-                    if top_k > 0 {
-                        body["top_k"] = serde_json::json!(top_k);
-                    }
                     let mut headers = reqwest::header::HeaderMap::new();
                     headers.insert(
                         "Authorization",
@@ -1018,37 +1245,178 @@ impl App {
                     if agentic {
                         body["tools"] = serde_json::json!(get_tool_definitions());
                     }
-                    if is_cloud {
-                        body["temperature"] = serde_json::json!(temperature);
-                        body["top_p"] = serde_json::json!(top_p);
-                        if top_k > 0 {
-                            body["top_k"] = serde_json::json!(top_k);
-                        }
-                    } else {
-                        let mut options = serde_json::json!({});
-                        options["temperature"] = serde_json::json!(temperature);
-                        options["top_p"] = serde_json::json!(top_p);
-                        if top_k > 0 {
-                            options["top_k"] = serde_json::json!(top_k);
-                        }
-                        body["options"] = options;
+                    let mut options = serde_json::json!({});
+                    options["temperature"] = serde_json::json!(temperature);
+                    options["top_p"] = serde_json::json!(top_p);
+                    if top_k > 0 {
+                        options["top_k"] = serde_json::json!(top_k);
                     }
+                    body["options"] = options;
                     (format!("{}/api/chat", url), None, body)
                 };
 
-                let mut req = client
-                    .post(&api_url)
-                    .json(&body)
-                    .timeout(std::time::Duration::from_secs(300));
-
-                if let Some(h) = headers {
-                    req = req.headers(h);
-                }
-
                 log_to_file(is_logging, &log_file, &session_id, "REQUEST", &format!("{} {}", api_url, serde_json::to_string(&body).unwrap_or_default()));
 
+                let result = send_with_retry(&client, reqwest::Method::POST, &api_url, headers, &body, 3, &tx, is_logging, &log_file, &session_id).await;
+
                 let is_cloud = cloud_model.is_some();
-                stream_with_retry(req, tx, is_cloud, is_logging, &log_file, &session_id, &api_url).await;
+                match result {
+                    Ok(mut resp) => {
+                        if !resp.status().is_success() {
+                            let status = resp.status();
+                            let body = resp.text().await.unwrap_or_default();
+                            let msg = format!("HTTP {}: {}", status, truncate(&body, 200));
+                            log_to_file(is_logging, &log_file, &session_id, "HTTP_ERROR", &msg);
+                            let _ = tx.send(StreamChunk::Error(msg));
+                            return;
+                        }
+                        let mut buffer = String::new();
+                        let mut tool_call_map: std::collections::HashMap<u32, serde_json::Value> = std::collections::HashMap::new();
+                        loop {
+                            match resp.chunk().await {
+                                Ok(Some(chunk)) => {
+                                    buffer.push_str(&String::from_utf8_lossy(&chunk));
+                                    while let Some(pos) = buffer.find('\n') {
+                                        let raw = buffer[..pos].trim().to_string();
+                                        buffer = buffer[pos + 1..].to_string();
+                                        if raw.is_empty() {
+                                            continue;
+                                        }
+                                        let line = if is_cloud {
+                                            raw.strip_prefix("data: ").unwrap_or(&raw).trim().to_string()
+                                        } else {
+                                            raw
+                                        };
+                                        log_to_file(is_logging, &log_file, &session_id, "RESPONSE", &line);
+                                        if line == "[DONE]" {
+                                            log_to_file(is_logging, &log_file, &session_id, "STREAM_END", "DONE sentinel");
+                                            let _ = tx.send(StreamChunk::Done(TokenStats::default()));
+                                            return;
+                                        }
+                                        if line.is_empty() {
+                                            continue;
+                                        }
+                                        match serde_json::from_str::<serde_json::Value>(&line) {
+                                            Ok(json) => {
+                                                if is_cloud {
+                                                    if let Some(reasoning) = json["choices"][0]["delta"]["reasoning_content"].as_str() {
+                                                        if !reasoning.is_empty() {
+                                                            let _ = tx.send(StreamChunk::Thinking(reasoning.to_string()));
+                                                        }
+                                                    }
+                                                    if let Some(delta) = json["choices"][0]["delta"]["content"].as_str() {
+                                                        if !delta.is_empty() {
+                                                            let _ = tx.send(StreamChunk::Text(delta.to_string()));
+                                                        }
+                                                    }
+                                                    if let Some(tc_array) = json["choices"][0]["delta"]["tool_calls"].as_array() {
+                                                        for tc in tc_array {
+                                                            let idx = tc["index"].as_u64().unwrap_or(0) as u32;
+                                                            let entry = tool_call_map.entry(idx).or_insert_with(|| {
+                                                                let mut base = serde_json::json!({
+                                                                    "index": idx,
+                                                                    "type": "function",
+                                                                    "function": {"name": "", "arguments": ""}
+                                                                });
+                                                                if let Some(id) = tc["id"].as_str() {
+                                                                    base["id"] = serde_json::json!(id);
+                                                                }
+                                                                base
+                                                            });
+                                                            if let Some(id) = tc["id"].as_str() {
+                                                                entry["id"] = serde_json::json!(id);
+                                                            }
+                                                            if let Some(name) = tc["function"]["name"].as_str() {
+                                                                if !name.is_empty() {
+                                                                    entry["function"]["name"] = serde_json::json!(name);
+                                                                }
+                                                            }
+                                                            if let Some(args) = tc["function"]["arguments"].as_str() {
+                                                                let existing = entry["function"]["arguments"].as_str().unwrap_or("").to_string();
+                                                                entry["function"]["arguments"] = serde_json::json!(format!("{}{}", existing, args));
+                                                            }
+                                                        }
+                                                    }
+                                                    let finish = json["choices"][0]["finish_reason"].as_str();
+                                                    if finish == Some("stop") || finish == Some("tool_calls") {
+                                                         let stats = parse_usage_stats(&json);
+                                                        log_to_file(is_logging, &log_file, &session_id, "STREAM_END", &format!("{} finish_reason={}", api_url, finish.unwrap_or("?")));
+                                                        if !tool_call_map.is_empty() {
+                                                            let mut calls: Vec<serde_json::Value> = tool_call_map.into_values().collect();
+                                                            calls.sort_by_key(|tc| tc["index"].as_u64().unwrap_or(0));
+                                                            let _ = tx.send(StreamChunk::ToolCalls(calls));
+                                                        } else {
+                                                            let _ = tx.send(StreamChunk::Done(stats));
+                                                        }
+                                                        return;
+                                                    }
+                                                } else {
+                                                    if let Some(thinking) = json["message"]["thinking"].as_str() {
+                                                        if !thinking.is_empty() {
+                                                            let _ = tx.send(StreamChunk::Thinking(thinking.to_string()));
+                                                        }
+                                                    }
+                                                    if let Some(content) = json["message"]["content"].as_str() {
+                                                        if !content.is_empty() {
+                                                            let _ = tx.send(StreamChunk::Text(content.to_string()));
+                                                        }
+                                                    }
+                                                    if let Some(tool_calls) = json["message"]["tool_calls"].as_array() {
+                                                        for tc in tool_calls {
+                                                            let idx = tc["index"].as_u64().unwrap_or(0) as u32;
+                                                            let entry = tool_call_map.entry(idx).or_insert_with(|| {
+                                                                serde_json::json!({
+                                                                    "index": idx,
+                                                                    "type": "function",
+                                                                    "function": {"name": "", "arguments": ""}
+                                                                })
+                                                            });
+                                                            if let Some(name) = tc["function"]["name"].as_str() {
+                                                                entry["function"]["name"] = serde_json::json!(name);
+                                                            }
+                                                            if let Some(id) = tc["id"].as_str() {
+                                                                entry["id"] = serde_json::json!(id);
+                                                            }
+                                                            if let Some(args) = tc["function"]["arguments"].as_str() {
+                                                                entry["function"]["arguments"] = serde_json::json!(args);
+                                                            }
+                                                        }
+                                                    }
+                                                    if json["done"].as_bool() == Some(true) {
+                                                        log_to_file(is_logging, &log_file, &session_id, "STREAM_END", &format!("{} done=true tokens={}", api_url, json["eval_count"].as_u64().unwrap_or(0)));
+                                                        if !tool_call_map.is_empty() {
+                                                            let calls: Vec<serde_json::Value> = tool_call_map.into_values().collect();
+                                                            let _ = tx.send(StreamChunk::ToolCalls(calls));
+                                                        } else {
+                                                            let stats = parse_token_stats(&json);
+                                                            let _ = tx.send(StreamChunk::Done(stats));
+                                                        }
+                                                        return;
+                                                    }
+                                                }
+                                            }
+                                            Err(_) => {}
+                                        }
+                                    }
+                                }
+                                Ok(None) => {
+                                    log_to_file(is_logging, &log_file, &session_id, "STREAM_END", "stream closed");
+                                    let _ = tx.send(StreamChunk::Done(TokenStats::default()));
+                                    return;
+                                }
+                                Err(e) => {
+                                    log_to_file(is_logging, &log_file, &session_id, "STREAM_ERROR", &e.to_string());
+                                    let _ = tx.send(StreamChunk::Error(format!("Stream error: {}", e)));
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        log_to_file(is_logging, &log_file, &session_id, "CONNECT_ERROR", &e.to_string());
+                        let _ = tx.send(StreamChunk::Error(format!("Failed to connect: {}", e)));
+                    }
+                }
             });
         });
     }
@@ -1134,6 +1502,7 @@ impl App {
             SaveDialogMode::SaveSession => {
                 let data = serde_json::json!({
                     "session_id": self.session_id,
+                    "model": self.model_name,
                     "messages": self.messages,
                 });
                 match serde_json::to_string_pretty(&data) {
@@ -1148,12 +1517,30 @@ impl App {
         self.show_save_dialog = false;
     }
 
+    pub fn save_proxy_to_config(&self) -> Result<(), String> {
+        let mut cfg = Config::default();
+        cfg.ollama_url = self.ollama_url.clone();
+        cfg.model = self.model_name.clone();
+        cfg.save_path = self.save_path.clone();
+        cfg.agentic = self.agentic_mode;
+        cfg.logging = self.is_logging;
+        cfg.logfile = self.log_file.clone();
+        cfg.system_prompt = self.system_prompt.clone();
+        cfg.proxy = self.proxy.clone();
+        cfg.max_tool_rounds = self.max_tool_rounds;
+        cfg.temperature = self.temperature;
+        cfg.top_p = self.top_p;
+        cfg.top_k = self.top_k;
+        cfg.save()
+    }
+
     pub fn save_session(&self) -> Result<(), String> {
         let sessions_dir = dirs_home().join(".config/rustama");
         std::fs::create_dir_all(&sessions_dir).map_err(|e| e.to_string())?;
         let path = sessions_dir.join(format!("{}.session.rustama", self.session_name));
         let data = serde_json::json!({
             "session_id": self.session_id,
+            "model": self.model_name,
             "messages": self.messages,
         });
         let json = serde_json::to_string_pretty(&data).map_err(|e| e.to_string())?;
@@ -1166,11 +1553,15 @@ impl App {
         let path = sessions_dir.join(format!("{}.session.rustama", sess_id));
         let json = std::fs::read_to_string(&path).map_err(|e| format!("Session not found: {}", e))?;
         let data: serde_json::Value = serde_json::from_str(&json).map_err(|e| e.to_string())?;
-        let msgs: Vec<ChatMessage> = serde_json::from_value(data["messages"].clone())
+        let mut msgs: Vec<ChatMessage> = serde_json::from_value(data["messages"].clone())
             .map_err(|e| format!("Invalid session data: {}", e))?;
+        patch_tool_call_ids(&mut msgs);
         self.messages = msgs;
         self.streaming_text.clear();
         self.session_name = sess_id.to_string();
+        if let Some(model) = data["model"].as_str() {
+            self.model_name = model.to_string();
+        }
         self.status_message = format!("Loaded session {}", sess_id);
         Ok(())
     }
@@ -1206,15 +1597,19 @@ impl App {
                 return;
             }
         };
-        let msgs: Vec<ChatMessage> = match serde_json::from_value(data["messages"].clone()) {
+        let mut msgs: Vec<ChatMessage> = match serde_json::from_value(data["messages"].clone()) {
             Ok(m) => m,
             Err(e) => {
                 self.status_message = format!("Invalid session data: {}", e);
                 return;
             }
         };
+        patch_tool_call_ids(&mut msgs);
         self.messages = msgs;
         self.streaming_text.clear();
+        if let Some(model) = data["model"].as_str() {
+            self.model_name = model.to_string();
+        }
         if let Some(sid) = data["session_id"].as_str() {
             self.status_message = format!("Loaded session {}", sid);
         } else {
@@ -1489,7 +1884,7 @@ impl App {
     pub fn menu_item_names(&self) -> Vec<&'static str> {
         match self.active_menu {
             ActiveMenu::File => vec!["Load", "Save", "Export...", "Exit"],
-            ActiveMenu::Options => vec!["Set Model", "Agentic Mode"],
+            ActiveMenu::Options => vec!["Set Model", "Agentic Mode", "Settings..."],
             ActiveMenu::Help => vec!["About"],
             ActiveMenu::None => vec![],
         }
@@ -1498,6 +1893,10 @@ impl App {
     pub fn handle_click(&mut self, col: u16, row: u16, width: u16, height: u16) {
         if self.show_save_dialog {
             self.handle_save_dialog_click(col, row, width, height);
+            return;
+        }
+        if self.show_settings_dialog {
+            self.handle_settings_dialog_click(col, row, width, height);
             return;
         }
         if self.show_file_dialog {
@@ -1564,9 +1963,39 @@ impl App {
             self.input_mode = InputMode::Input;
             self.focus = Focus::Input;
         } else if row > 0 && row < input_start {
-            self.focus = Focus::Output;
-            self.input_mode = InputMode::Normal;
+            if col == width.saturating_sub(1) {
+                self.scrollbar_dragging = true;
+                self.scrollbar_click_to(row, input_start);
+            } else {
+                self.focus = Focus::Output;
+                self.input_mode = InputMode::Normal;
+            }
         }
+    }
+
+    fn scrollbar_click_to(&mut self, row: u16, input_start: u16) {
+        self.auto_scroll = false;
+        let output_height = input_start.saturating_sub(1) as f64;
+        let total_lines = self.cached_wrapped.len() as f64;
+        let visible_height = self.terminal_height.saturating_sub(4) as f64;
+        let max_scroll = (total_lines - visible_height).max(0.0);
+        if output_height <= 0.0 || max_scroll <= 0.0 {
+            return;
+        }
+        let ratio = (row as f64 - 1.0) / output_height;
+        self.scroll_offset = (ratio * max_scroll).round() as u16;
+    }
+
+    pub fn scrollbar_drag_to(&mut self, row: u16, input_start: u16) {
+        if !self.scrollbar_dragging {
+            return;
+        }
+        self.scrollbar_click_to(row, input_start);
+    }
+
+    pub fn scrollbar_drag_end(&mut self) {
+        self.scrollbar_dragging = false;
+        self.scrollbar_drag_start = None;
     }
 
     fn open_model_dialog(&mut self) {
@@ -1589,7 +2018,7 @@ impl App {
                 .unwrap();
 
             rt.block_on(async {
-                let client = reqwest::Client::new();
+                let client = build_reqwest_client(&None);
                 let result = match client
                     .get(format!("{}/api/tags", url))
                     .timeout(std::time::Duration::from_secs(10))
@@ -1754,6 +2183,271 @@ impl App {
         if cancel_btn.is_clicked(col, row) {
             self.show_model_dialog = false;
             return;
+        }
+    }
+
+    fn open_settings_dialog(&mut self) {
+        self.show_settings_dialog = true;
+        self.settings_focus = SettingsFocus::Proxy;
+        self.settings_cursor = 0;
+        self.settings_proxy = self.proxy.clone().unwrap_or_default();
+        self.settings_ollama_url = self.ollama_url.clone();
+        self.settings_temperature = format!("{}", self.temperature);
+        self.settings_top_p = format!("{}", self.top_p);
+        self.settings_top_k = format!("{}", self.top_k);
+        self.settings_max_tool_rounds = self.max_tool_rounds.to_string();
+    }
+
+    fn handle_settings_dialog_key(&mut self, key: KeyEvent) {
+        let is_text_field = matches!(
+            self.settings_focus,
+            SettingsFocus::Proxy | SettingsFocus::OllamaUrl | SettingsFocus::Temperature | SettingsFocus::TopP | SettingsFocus::TopK | SettingsFocus::MaxToolRounds
+        );
+
+        match key.code {
+            KeyCode::Esc => {
+                self.show_settings_dialog = false;
+            }
+            KeyCode::Tab => {
+                self.settings_cursor = 0;
+                self.settings_focus = match self.settings_focus {
+                    SettingsFocus::Proxy => SettingsFocus::OllamaUrl,
+                    SettingsFocus::OllamaUrl => SettingsFocus::Temperature,
+                    SettingsFocus::Temperature => SettingsFocus::TopP,
+                    SettingsFocus::TopP => SettingsFocus::TopK,
+                    SettingsFocus::TopK => SettingsFocus::MaxToolRounds,
+                    SettingsFocus::MaxToolRounds => SettingsFocus::Save,
+                    SettingsFocus::Save => SettingsFocus::Cancel,
+                    SettingsFocus::Cancel => SettingsFocus::Proxy,
+                };
+            }
+            KeyCode::BackTab => {
+                self.settings_cursor = 0;
+                self.settings_focus = match self.settings_focus {
+                    SettingsFocus::Proxy => SettingsFocus::Cancel,
+                    SettingsFocus::OllamaUrl => SettingsFocus::Proxy,
+                    SettingsFocus::Temperature => SettingsFocus::OllamaUrl,
+                    SettingsFocus::TopP => SettingsFocus::Temperature,
+                    SettingsFocus::TopK => SettingsFocus::TopP,
+                    SettingsFocus::MaxToolRounds => SettingsFocus::TopK,
+                    SettingsFocus::Save => SettingsFocus::MaxToolRounds,
+                    SettingsFocus::Cancel => SettingsFocus::Save,
+                };
+            }
+            KeyCode::Up => {
+                self.settings_cursor = 0;
+                self.settings_focus = match self.settings_focus {
+                    SettingsFocus::Proxy => SettingsFocus::Cancel,
+                    SettingsFocus::OllamaUrl => SettingsFocus::Proxy,
+                    SettingsFocus::Temperature => SettingsFocus::OllamaUrl,
+                    SettingsFocus::TopP => SettingsFocus::Temperature,
+                    SettingsFocus::TopK => SettingsFocus::TopP,
+                    SettingsFocus::MaxToolRounds => SettingsFocus::TopK,
+                    SettingsFocus::Save => SettingsFocus::MaxToolRounds,
+                    SettingsFocus::Cancel => SettingsFocus::Save,
+                };
+            }
+            KeyCode::Down => {
+                self.settings_cursor = 0;
+                self.settings_focus = match self.settings_focus {
+                    SettingsFocus::Proxy => SettingsFocus::OllamaUrl,
+                    SettingsFocus::OllamaUrl => SettingsFocus::Temperature,
+                    SettingsFocus::Temperature => SettingsFocus::TopP,
+                    SettingsFocus::TopP => SettingsFocus::TopK,
+                    SettingsFocus::TopK => SettingsFocus::MaxToolRounds,
+                    SettingsFocus::MaxToolRounds => SettingsFocus::Save,
+                    SettingsFocus::Save => SettingsFocus::Cancel,
+                    SettingsFocus::Cancel => SettingsFocus::Proxy,
+                };
+            }
+            KeyCode::Left => {
+                if is_text_field {
+                    self.settings_cursor = self.settings_cursor.saturating_sub(1);
+                } else if self.settings_focus == SettingsFocus::Save {
+                    self.settings_focus = SettingsFocus::Cancel;
+                } else if self.settings_focus == SettingsFocus::Cancel {
+                    self.settings_focus = SettingsFocus::Save;
+                }
+            }
+            KeyCode::Right => {
+                if is_text_field {
+                    let field = self.settings_field_text();
+                    if self.settings_cursor < field.chars().count() {
+                        self.settings_cursor += 1;
+                    }
+                } else if self.settings_focus == SettingsFocus::Save {
+                    self.settings_focus = SettingsFocus::Cancel;
+                } else if self.settings_focus == SettingsFocus::Cancel {
+                    self.settings_focus = SettingsFocus::Save;
+                }
+            }
+            KeyCode::Home => {
+                if is_text_field {
+                    self.settings_cursor = 0;
+                }
+            }
+            KeyCode::End => {
+                if is_text_field {
+                    let field = self.settings_field_text();
+                    self.settings_cursor = field.chars().count();
+                }
+            }
+            KeyCode::Enter => match self.settings_focus {
+                SettingsFocus::Save => self.confirm_settings(),
+                SettingsFocus::Cancel => self.show_settings_dialog = false,
+                _ => {}
+            },
+            KeyCode::Char(c) if is_text_field => {
+                let cursor = self.settings_cursor;
+                let field = self.settings_field_mut();
+                let byte_idx = field
+                    .char_indices()
+                    .nth(cursor)
+                    .map_or(field.len(), |(i, _)| i);
+                field.insert(byte_idx, c);
+                self.settings_cursor = cursor + 1;
+            }
+            KeyCode::Backspace if is_text_field => {
+                if self.settings_cursor > 0 {
+                    self.settings_cursor -= 1;
+                    let cursor = self.settings_cursor;
+                    let field = self.settings_field_mut();
+                    let byte_idx = field
+                        .char_indices()
+                        .nth(cursor)
+                        .map_or(field.len(), |(i, _)| i);
+                    field.remove(byte_idx);
+                }
+            }
+            KeyCode::Delete if is_text_field => {
+                let cursor = self.settings_cursor;
+                let field_text = self.settings_field_text();
+                if cursor < field_text.chars().count() {
+                    let field = self.settings_field_mut();
+                    let byte_idx = field
+                        .char_indices()
+                        .nth(cursor)
+                        .map_or(field.len(), |(i, _)| i);
+                    field.remove(byte_idx);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn settings_field_text(&self) -> &str {
+        match self.settings_focus {
+            SettingsFocus::Proxy => &self.settings_proxy,
+            SettingsFocus::OllamaUrl => &self.settings_ollama_url,
+            SettingsFocus::Temperature => &self.settings_temperature,
+            SettingsFocus::TopP => &self.settings_top_p,
+            SettingsFocus::TopK => &self.settings_top_k,
+            SettingsFocus::MaxToolRounds => &self.settings_max_tool_rounds,
+            _ => "",
+        }
+    }
+
+    fn settings_field_mut(&mut self) -> &mut String {
+        match self.settings_focus {
+            SettingsFocus::Proxy => &mut self.settings_proxy,
+            SettingsFocus::OllamaUrl => &mut self.settings_ollama_url,
+            SettingsFocus::Temperature => &mut self.settings_temperature,
+            SettingsFocus::TopP => &mut self.settings_top_p,
+            SettingsFocus::TopK => &mut self.settings_top_k,
+            SettingsFocus::MaxToolRounds => &mut self.settings_max_tool_rounds,
+            _ => unreachable!(),
+        }
+    }
+
+    fn confirm_settings(&mut self) {
+        let proxy_val = self.settings_proxy.trim().to_string();
+        self.proxy = if proxy_val.is_empty() || proxy_val.eq_ignore_ascii_case("off") {
+            None
+        } else {
+            Some(proxy_val)
+        };
+        self.ollama_url = self.settings_ollama_url.trim().to_string();
+        if let Ok(v) = self.settings_temperature.trim().parse::<f64>() {
+            if v >= 0.0 && v <= 2.0 {
+                self.temperature = v;
+            }
+        }
+        if let Ok(v) = self.settings_top_p.trim().parse::<f64>() {
+            if v >= 0.0 && v <= 1.0 {
+                self.top_p = v;
+            }
+        }
+        if let Ok(v) = self.settings_top_k.trim().parse::<u32>() {
+            if v >= 1 && v <= 100 {
+                self.top_k = v;
+            }
+        }
+        if let Ok(v) = self.settings_max_tool_rounds.trim().parse::<usize>() {
+            if v >= 1 && v <= 100 {
+                self.max_tool_rounds = v;
+            }
+        }
+        let _ = self.save_proxy_to_config();
+        self.show_settings_dialog = false;
+        self.status_message = "Settings saved".to_string();
+    }
+
+    fn handle_settings_dialog_click(&mut self, col: u16, row: u16, width: u16, height: u16) {
+        let dialog_w: u16 = 60;
+        let dialog_h: u16 = 20;
+        let dialog_x = (width.saturating_sub(dialog_w)) / 2;
+        let dialog_y = (height.saturating_sub(dialog_h)) / 2;
+        let inner_x = dialog_x + 2;
+        let inner_y = dialog_y + 1;
+        let inner_w = dialog_w.saturating_sub(4);
+
+        if col < dialog_x
+            || col >= dialog_x + dialog_w
+            || row < dialog_y
+            || row >= dialog_y + dialog_h
+        {
+            self.show_settings_dialog = false;
+            return;
+        }
+
+        let fields = [
+            (SettingsFocus::Proxy, "Proxy URL:"),
+            (SettingsFocus::OllamaUrl, "Ollama URL:"),
+            (SettingsFocus::Temperature, "Temperature:"),
+            (SettingsFocus::TopP, "Top-P:"),
+            (SettingsFocus::TopK, "Top-K:"),
+            (SettingsFocus::MaxToolRounds, "Max Rounds:"),
+        ];
+
+        for (i, (focus, _label)) in fields.iter().enumerate() {
+            let field_y = inner_y + i as u16 * 2;
+            let max_w = inner_w.saturating_sub(16);
+            if row == field_y && col >= inner_x + 14 && col < inner_x + 14 + max_w + 2 {
+                self.settings_focus = focus.clone();
+                return;
+            }
+        }
+
+        let num_fields = 6u16;
+        let btn_y = inner_y + num_fields * 2 + 1;
+        let save_label = "Save";
+        let cancel_label = "Cancel";
+        let save_w = save_label.len() as u16 + 4;
+        let cancel_w = cancel_label.len() as u16 + 4;
+        let gap: u16 = 4;
+        let total_btn_w = save_w + gap + cancel_w;
+        let btn_start_x = inner_x + (inner_w.saturating_sub(total_btn_w)) / 2;
+
+        if row == btn_y {
+            if col >= btn_start_x && col < btn_start_x + save_w {
+                self.settings_focus = SettingsFocus::Save;
+                self.confirm_settings();
+                return;
+            }
+            if col >= btn_start_x + save_w + gap && col < btn_start_x + total_btn_w {
+                self.show_settings_dialog = false;
+                return;
+            }
         }
     }
 
@@ -1925,15 +2619,19 @@ impl App {
                         return;
                     }
                 };
-                let msgs: Vec<ChatMessage> = match serde_json::from_value(data["messages"].clone()) {
+                let mut msgs: Vec<ChatMessage> = match serde_json::from_value(data["messages"].clone()) {
                     Ok(m) => m,
                     Err(e) => {
                         self.status_message = format!("Invalid session data: {}", e);
                         return;
                     }
                 };
+                patch_tool_call_ids(&mut msgs);
                 self.messages = msgs;
                 self.streaming_text.clear();
+                if let Some(model) = data["model"].as_str() {
+                    self.model_name = model.to_string();
+                }
                 let display_name = name.strip_suffix(".session.rustama").unwrap_or(&name);
                 self.session_name = display_name.to_string();
                 if let Some(sid) = data["session_id"].as_str() {
@@ -2155,6 +2853,22 @@ impl App {
                 },
                 None => format!("Current top_k: {} (usage: /topk <number>)", self.top_k),
             }),
+            "proxy" => Some(match arg {
+                Some("off") | Some("none") | Some("") => {
+                    self.proxy = None;
+                    let _ = self.save_proxy_to_config();
+                    "Proxy disabled".to_string()
+                }
+                Some(url) => {
+                    self.proxy = Some(url.to_string());
+                    let _ = self.save_proxy_to_config();
+                    format!("Proxy set to {}", url)
+                }
+                None => match &self.proxy {
+                    Some(url) => format!("Current proxy: {} (usage: /proxy <url> or /proxy off)", url),
+                    None => "No proxy set (usage: /proxy <url> or /proxy off)".to_string(),
+                },
+            }),
             "status" => Some(self.slash_status()),
             "system" => Some(self.slash_system()),
             "setsystem" => Some(self.slash_setsystem(arg)),
@@ -2205,6 +2919,8 @@ impl App {
             ("/temp <n>", "Temperature 0.0-2.0 (default: 1.0)"),
             ("/topp <n>", "Top_p 0.0-1.0 (default: 0.9)"),
             ("/topk <n>", "Top_k 1-100 (default: 40)"),
+            ("/proxy <url>", "Set HTTP proxy (e.g. http://proxy:8080)"),
+            ("/proxy off", "Disable proxy"),
             ("/session save", "Save current session"),
             ("/session rename <name>", "Rename current session"),
             ("/session load <name>", "Load a session by name"),
@@ -2399,155 +3115,6 @@ impl App {
     }
 }
 
-async fn stream_with_retry(
-    req: reqwest::RequestBuilder,
-    tx: mpsc::Sender<StreamChunk>,
-    is_cloud: bool,
-    is_logging: bool,
-    log_file: &str,
-    session_id: &str,
-    api_url: &str,
-) {
-    let max_retries = 3u32;
-    let mut resp: Option<reqwest::Response> = None;
-    for attempt in 1..=max_retries {
-        let result: Result<reqwest::Response, reqwest::Error> = req.try_clone().unwrap().send().await;
-        match result {
-            Ok(r) if r.status().as_u16() == 429 => {
-                let retry_after: u64 = r.headers()
-                    .get("retry-after")
-                    .and_then(|v: &reqwest::header::HeaderValue| v.to_str().ok())
-                    .and_then(|s: &str| s.parse::<u64>().ok())
-                    .unwrap_or(2);
-                let msg = format!("⚠ Rate limited (429), retrying in {}s (attempt {}/{})", retry_after, attempt, max_retries);
-                log_to_file(is_logging, log_file, session_id, "RATE_LIMIT", &msg);
-                let _ = tx.send(StreamChunk::Text(format!("\n{}\n", msg)));
-                tokio::time::sleep(std::time::Duration::from_secs(retry_after)).await;
-                continue;
-            }
-            Ok(r) => {
-                resp = Some(r);
-                break;
-            }
-            Err(e) => {
-                log_to_file(is_logging, log_file, session_id, "CONNECT_ERROR", &e.to_string());
-                let _ = tx.send(StreamChunk::Error(format!("Failed to connect: {}", e)));
-                return;
-            }
-        }
-    }
-    let Some(mut resp) = resp else {
-        let msg = format!("Rate limited (429) after {} retries, giving up", max_retries);
-        log_to_file(is_logging, log_file, session_id, "RATE_LIMIT", &msg);
-        let _ = tx.send(StreamChunk::Error(msg));
-        return;
-    };
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        let msg = format!("API error {}: {}", status, body);
-        log_to_file(is_logging, log_file, session_id, "API_ERROR", &msg);
-        let _ = tx.send(StreamChunk::Error(msg));
-        return;
-    }
-
-    let mut buffer = String::new();
-    let mut collected_tool_calls: Vec<serde_json::Value> = Vec::new();
-    loop {
-        match resp.chunk().await {
-            Ok(Some(chunk)) => {
-                buffer.push_str(&String::from_utf8_lossy(&chunk));
-                while let Some(pos) = buffer.find('\n') {
-                    let raw = buffer[..pos].trim().to_string();
-                    buffer = buffer[pos + 1..].to_string();
-                    if raw.is_empty() {
-                        continue;
-                    }
-                    let line = if is_cloud {
-                        raw.strip_prefix("data: ").unwrap_or(&raw).trim().to_string()
-                    } else {
-                        raw
-                    };
-                    log_to_file(is_logging, log_file, session_id, "RESPONSE", &line);
-                    if line == "[DONE]" {
-                        log_to_file(is_logging, log_file, session_id, "STREAM_END", "DONE sentinel");
-                        let _ = tx.send(StreamChunk::Done(TokenStats::default()));
-                        return;
-                    }
-                    if line.is_empty() {
-                        continue;
-                    }
-                    match serde_json::from_str::<serde_json::Value>(&line) {
-                        Ok(json) => {
-                            if is_cloud {
-                                if let Some(delta) = json["choices"][0]["delta"]["content"].as_str() {
-                                    if !delta.is_empty() {
-                                        let _ = tx.send(StreamChunk::Text(delta.to_string()));
-                                    }
-                                }
-                                if let Some(tc_array) = json["choices"][0]["delta"]["tool_calls"].as_array() {
-                                    for tc in tc_array {
-                                        collected_tool_calls.push(tc.clone());
-                                    }
-                                }
-                                let finish = json["choices"][0]["finish_reason"].as_str();
-                                if finish == Some("stop") || finish == Some("tool_calls") {
-                                    let stats = parse_usage_stats(&json);
-                                    log_to_file(is_logging, log_file, session_id, "STREAM_END", &format!("{} finish_reason={}", api_url, finish.unwrap_or("?")));
-                                    if !collected_tool_calls.is_empty() {
-                                        let _ = tx.send(StreamChunk::ToolCalls(collected_tool_calls));
-                                    } else {
-                                        let _ = tx.send(StreamChunk::Done(stats));
-                                    }
-                                    return;
-                                }
-                            } else {
-                                if let Some(thinking) = json["message"]["thinking"].as_str() {
-                                    if !thinking.is_empty() {
-                                        let _ = tx.send(StreamChunk::Thinking(thinking.to_string()));
-                                    }
-                                }
-                                if let Some(content) = json["message"]["content"].as_str() {
-                                    if !content.is_empty() {
-                                        let _ = tx.send(StreamChunk::Text(content.to_string()));
-                                    }
-                                }
-                                if let Some(tool_calls) = json["message"]["tool_calls"].as_array() {
-                                    for tc in tool_calls {
-                                        collected_tool_calls.push(tc.clone());
-                                    }
-                                }
-                                if json["done"].as_bool() == Some(true) {
-                                    log_to_file(is_logging, log_file, session_id, "STREAM_END", &format!("{} done=true tokens={}", api_url, json["eval_count"].as_u64().unwrap_or(0)));
-                                    if !collected_tool_calls.is_empty() {
-                                        let _ = tx.send(StreamChunk::ToolCalls(collected_tool_calls));
-                                    } else {
-                                        let stats = parse_token_stats(&json);
-                                        let _ = tx.send(StreamChunk::Done(stats));
-                                    }
-                                    return;
-                                }
-                            }
-                        }
-                        Err(_) => {}
-                    }
-                }
-            }
-            Ok(None) => {
-                log_to_file(is_logging, log_file, session_id, "STREAM_END", "stream closed");
-                let _ = tx.send(StreamChunk::Done(TokenStats::default()));
-                return;
-            }
-            Err(e) => {
-                log_to_file(is_logging, log_file, session_id, "STREAM_ERROR", &e.to_string());
-                let _ = tx.send(StreamChunk::Error(format!("Stream error: {}", e)));
-                return;
-            }
-        }
-    }
-}
-
 fn log_to_file(is_logging: bool, log_file: &str, session_id: &str, kind: &str, content: &str) {
     if !is_logging {
         return;
@@ -2600,6 +3167,37 @@ fn truncate(s: &str, max: usize) -> String {
         s.to_string()
     } else {
         format!("{}... ({} bytes)", &s[..max], s.len())
+    }
+}
+
+fn patch_tool_call_ids(msgs: &mut Vec<ChatMessage>) {
+    for i in 0..msgs.len() {
+        if let ChatMessage::ToolCall { name, tool_call_id, .. } = &msgs[i] {
+            if tool_call_id.is_none() {
+                let id = format!("call_{}", name);
+                msgs[i] = match msgs[i].clone() {
+                    ChatMessage::ToolCall { name, arguments, .. } => ChatMessage::ToolCall {
+                        name,
+                        arguments,
+                        tool_call_id: Some(id),
+                    },
+                    other => other,
+                };
+            }
+        }
+        if let ChatMessage::ToolResult { name, tool_call_id, .. } = &msgs[i] {
+            if tool_call_id.is_none() {
+                let id = format!("call_{}", name);
+                msgs[i] = match msgs[i].clone() {
+                    ChatMessage::ToolResult { name, content, .. } => ChatMessage::ToolResult {
+                        name,
+                        content,
+                        tool_call_id: Some(id),
+                    },
+                    other => other,
+                };
+            }
+        }
     }
 }
 
@@ -2772,10 +3370,126 @@ fn get_tool_definitions() -> Vec<serde_json::Value> {
                 }
             }
         }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "fetch_url",
+                "description": "Fetch content from a URL via HTTP/HTTPS GET request",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "url": {
+                            "type": "string",
+                            "description": "The URL to fetch (http:// or https://)"
+                        }
+                    },
+                    "required": ["url"]
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "web_search",
+                "description": "Search the web using DuckDuckGo and return results",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "The search query"
+                        }
+                    },
+                    "required": ["query"]
+                }
+            }
+        }),
     ]
 }
 
-fn execute_tool_call(name: &str, args_json: &str) -> String {
+fn build_reqwest_client(proxy: &Option<String>) -> reqwest::Client {
+    let mut builder = reqwest::Client::builder();
+    if let Some(proxy_url) = proxy {
+        if let Ok(proxy) = reqwest::Proxy::all(proxy_url) {
+            builder = builder.proxy(proxy);
+        }
+    }
+    builder.build().unwrap_or_else(|_| reqwest::Client::new())
+}
+
+fn build_blocking_client(proxy: &Option<String>) -> reqwest::blocking::Client {
+    let mut builder = reqwest::blocking::Client::builder();
+    if let Some(proxy_url) = proxy {
+        if let Ok(proxy) = reqwest::Proxy::all(proxy_url) {
+            builder = builder.proxy(proxy);
+        }
+    }
+    builder.build().unwrap_or_else(|_| reqwest::blocking::Client::new())
+}
+
+async fn send_with_retry(
+    client: &reqwest::Client,
+    method: reqwest::Method,
+    url: &str,
+    headers: Option<reqwest::header::HeaderMap>,
+    body: &serde_json::Value,
+    max_retries: u32,
+    tx: &mpsc::Sender<StreamChunk>,
+    is_logging: bool,
+    log_file: &str,
+    session_id: &str,
+) -> Result<reqwest::Response, reqwest::Error> {
+    let mut last_err = None;
+    for attempt in 0..=max_retries {
+        let mut req = client
+            .request(method.clone(), url)
+            .json(body)
+            .timeout(std::time::Duration::from_secs(300));
+        if let Some(ref h) = headers {
+            req = req.headers(h.clone());
+        }
+        match req.send().await {
+            Ok(resp) if resp.status().as_u16() == 429 && attempt < max_retries => {
+                let delay_secs = resp.headers()
+                    .get("retry-after")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or_else(|| 2u64.pow(attempt) + 1);
+                let msg = format!("Rate limited (429), retrying in {}s (attempt {}/{})", delay_secs, attempt + 1, max_retries);
+                let _ = tx.send(StreamChunk::Error(format!("⚠ {}", msg)));
+                log_to_file(is_logging, log_file, session_id, "RETRY", &msg);
+                let _ = resp.text().await;
+                tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
+                continue;
+            }
+            Ok(resp) if resp.status().is_server_error() && attempt < max_retries => {
+                let status = resp.status();
+                let delay_secs = 2u64.pow(attempt) + 1;
+                let msg = format!("Server error ({}), retrying in {}s (attempt {}/{})", status, delay_secs, attempt + 1, max_retries);
+                let _ = tx.send(StreamChunk::Error(format!("⚠ {}", msg)));
+                log_to_file(is_logging, log_file, session_id, "RETRY", &msg);
+                let _ = resp.text().await;
+                tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
+                continue;
+            }
+            Ok(resp) => return Ok(resp),
+            Err(e) => {
+                last_err = Some(e);
+                if attempt < max_retries {
+                    let delay_secs = 2u64.pow(attempt) + 1;
+                    let msg = format!("Request error, retrying in {}s (attempt {}/{})", delay_secs, attempt + 1, max_retries);
+                    let _ = tx.send(StreamChunk::Error(format!("⚠ {}", msg)));
+                    log_to_file(is_logging, log_file, session_id, "RETRY", &msg);
+                    tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
+                    continue;
+                }
+            }
+        }
+    }
+    Err(last_err.unwrap())
+}
+
+fn execute_tool_call(name: &str, args_json: &str, proxy: &Option<String>) -> String {
     let args: serde_json::Value = serde_json::from_str(args_json).unwrap_or(serde_json::json!({}));
 
     match name {
@@ -2816,6 +3530,10 @@ fn execute_tool_call(name: &str, args_json: &str) -> String {
         }
         "bash" => {
             let command = args["command"].as_str().unwrap_or("");
+            let trimmed = command.trim_start();
+            if trimmed.starts_with("sudo ") || trimmed == "sudo" {
+                return "Error: sudo is not permitted. You do not have elevated privileges and cannot run commands as root.".to_string();
+            }
             use std::io::Read;
             use std::process::Stdio;
             match std::process::Command::new("sh")
@@ -2919,7 +3637,83 @@ fn execute_tool_call(name: &str, args_json: &str) -> String {
                 Err(e) => format!("Error searching: {}", e),
             }
         }
-        _ => format!("Unknown tool: {}", name),
+        "fetch_url" => {
+            let url = args["url"].as_str().unwrap_or("");
+            if url.is_empty() {
+                "Error: no URL provided".to_string()
+            } else {
+                let client = build_blocking_client(proxy);
+                match client.get(url).send() {
+                    Ok(resp) => {
+                        let status = resp.status();
+                        if !status.is_success() {
+                            format!("HTTP error: {}", status)
+                        } else {
+                            match resp.text() {
+                                Ok(text) => {
+                                    if text.len() > 50000 {
+                                        format!("{}...[truncated, total {} bytes]", &text[..50000], text.len())
+                                    } else {
+                                        text
+                                    }
+                                }
+                                Err(e) => format!("Error reading response: {}", e),
+                            }
+                        }
+                    }
+                    Err(e) => format!("Error fetching URL: {}", e),
+                }
+            }
+        }
+        "web_search" => {
+            let query = args["query"].as_str().unwrap_or("");
+            if query.is_empty() {
+                "Error: no search query provided".to_string()
+            } else {
+                let search_url = format!(
+                    "https://html.duckduckgo.com/html/?q={}",
+                    urlencoding::encode(query)
+                );
+                let client = build_blocking_client(proxy);
+                match client.get(&*search_url).send() {
+                    Ok(resp) => {
+                        match resp.text() {
+                            Ok(html) => {
+                                let mut results = Vec::new();
+                                for line in html.lines() {
+                                    if line.contains("result__snippet") || line.contains("result__a") {
+                                        let cleaned = line
+                                            .replace("<a rel=\"nofollow\" class=\"result__a\" href=\"", "")
+                                            .replace("<a class=\"result__snippet\" href=\"", "")
+                                            .replace("</a>", "")
+                                            .replace("<span class=\"result__snippet\">", "")
+                                            .replace("</span>", "")
+                                            .replace("<b>", "")
+                                            .replace("</b>", "")
+                                            .trim()
+                                            .to_string();
+                                        if !cleaned.is_empty() && cleaned.len() > 5 {
+                                            results.push(cleaned);
+                                        }
+                                    }
+                                }
+                                if results.is_empty() {
+                                    "No results found".to_string()
+                                } else {
+                                    results.join("\n")
+                                }
+                            }
+                            Err(e) => format!("Error reading search results: {}", e),
+                        }
+                    }
+                    Err(e) => format!("Error performing search: {}", e),
+                }
+            }
+        }
+        _ => {
+            let tools: Vec<&str> = vec!["read_file", "write_file", "edit_file", "bash", "list_files", "search_files", "search_content", "fetch_url", "web_search"];
+            format!("Unknown tool: '{}'. Available tools: {}", name, tools.join(", "))
+        }
     }
 }
 

@@ -17,7 +17,7 @@ use ratatui::widgets::*;
 mod app;
 mod config;
 mod ui;
-use app::{ActiveMenu, App, ChatMessage, FileDialogFocus, FileDialogMode, Focus, InputMode, ModelDialogFocus, SaveDialogFocus};
+use app::{ActiveMenu, App, ChatMessage, FileDialogFocus, FileDialogMode, Focus, InputMode, ModelDialogFocus, SaveDialogFocus, SettingsFocus};
 use ui::{dialog_block, Button, FileActionDialog, Theme};
 use config::Config;
 
@@ -62,6 +62,9 @@ where
         terminal.draw(|f| ui(f, app))?;
 
         if event::poll(Duration::from_millis(50))? {
+            let size = terminal.size()?;
+            app.terminal_height = size.height;
+
             match event::read()? {
                 Event::Key(key) => {
                     app.handle_key(key);
@@ -72,6 +75,14 @@ where
                     MouseEventKind::Down(MouseButton::Left) => {
                         let size = terminal.size()?;
                         app.handle_click(mouse.column, mouse.row, size.width, size.height);
+                    }
+                    MouseEventKind::Up(MouseButton::Left) => {
+                        app.scrollbar_drag_end();
+                    }
+                    MouseEventKind::Drag(MouseButton::Left) => {
+                        let size = terminal.size()?;
+                        let input_start = size.height.saturating_sub(6);
+                        app.scrollbar_drag_to(mouse.row, input_start);
                     }
                     _ => {}
                 },
@@ -88,6 +99,14 @@ where
                         MouseEventKind::Down(MouseButton::Left) => {
                             let size = terminal.size()?;
                             app.handle_click(mouse.column, mouse.row, size.width, size.height);
+                        }
+                        MouseEventKind::Up(MouseButton::Left) => {
+                            app.scrollbar_drag_end();
+                        }
+                        MouseEventKind::Drag(MouseButton::Left) => {
+                            let size = terminal.size()?;
+                            let input_start = size.height.saturating_sub(6);
+                            app.scrollbar_drag_to(mouse.row, input_start);
                         }
                         _ => {}
                     },
@@ -150,6 +169,10 @@ fn ui(f: &mut Frame, app: &mut App) {
 
     if app.show_save_dialog {
         render_save_dialog(f, app, area);
+    }
+
+    if app.show_settings_dialog {
+        render_settings_dialog(f, app, area);
     }
 }
 
@@ -217,6 +240,7 @@ fn render_output(f: &mut Frame, app: &mut App, area: Rect) {
 
     if history_changed {
         let mut hist: Vec<Line<'static>> = Vec::new();
+        let mut tool_call_num: usize = 0;
 
         for msg in &app.messages {
             match msg {
@@ -288,6 +312,7 @@ fn render_output(f: &mut Frame, app: &mut App, area: Rect) {
                     hist.push(Line::from(""));
                 }
                 ChatMessage::ToolCall { name, arguments, .. } => {
+                    tool_call_num += 1;
                     hist.push(Line::from(vec![
                         Span::styled(
                             " \u{2699} ",
@@ -296,7 +321,7 @@ fn render_output(f: &mut Frame, app: &mut App, area: Rect) {
                                 .add_modifier(Modifier::BOLD),
                         ),
                         Span::styled(
-                            format!("TOOL CALL: {}", name),
+                            format!("#{} TOOL CALL: {}", tool_call_num, name),
                             Style::default()
                                 .fg(Color::Yellow)
                                 .add_modifier(Modifier::BOLD),
@@ -404,9 +429,65 @@ fn render_output(f: &mut Frame, app: &mut App, area: Rect) {
         Style::default().fg(Color::DarkGray)
     };
 
+    let streaming_part = if app.is_loading {
+        " [streaming] "
+    } else {
+        ""
+    };
+
+    let stats_part = if app.token_stats.prompt_tokens > 0 || app.token_stats.response_tokens > 0 {
+        format!(
+            " | in:{} out:{} {:.1}t/s {}ms",
+            app.token_stats.prompt_tokens,
+            app.token_stats.response_tokens,
+            app.token_stats.tokens_per_sec,
+            app.token_stats.total_duration_ms,
+        )
+    } else {
+        String::new()
+    };
+
+    let tool_count_part = if app.tool_call_count > 0 {
+        format!(" | tools:{} (max {} rounds)", app.tool_call_count, app.max_tool_rounds)
+    } else {
+        String::new()
+    };
+
+    let total_suffix_len = stats_part.chars().count() + streaming_part.chars().count() + tool_count_part.chars().count();
+    let available = area.width.saturating_sub(2) as usize;
+    let model_display = if app.model_name.chars().count() + total_suffix_len > available {
+        let model_budget = available.saturating_sub(total_suffix_len).saturating_sub(3);
+        if model_budget > 0 {
+            let truncated: String = app.model_name.chars().take(model_budget).collect();
+            format!("{}...", truncated)
+        } else {
+            String::new()
+        }
+    } else {
+        app.model_name.clone()
+    };
+
+    let mut bottom_spans = vec![Span::styled(
+        format!(" {}{}{}", model_display, stats_part, tool_count_part),
+        Style::default().fg(Color::DarkGray),
+    )];
+
+    if !streaming_part.is_empty() {
+        bottom_spans.push(Span::styled(
+            streaming_part,
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::SLOW_BLINK),
+        ));
+    }
+    bottom_spans.push(Span::raw(" "));
+
+    let bottom_title = Line::from(bottom_spans);
+
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" Output ")
+        .title_bottom(bottom_title)
         .border_style(focus_style);
 
     let paragraph = Paragraph::new(lines.as_slice()).block(block).scroll((scroll, 0));
@@ -442,29 +523,17 @@ fn render_output(f: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn render_input(f: &mut Frame, app: &App, area: Rect) {
-    let stats_str = if app.token_stats.prompt_tokens > 0 || app.token_stats.response_tokens > 0 {
-        format!(
-            " in:{} out:{} {:.1}t/s {}ms ",
-            app.token_stats.prompt_tokens,
-            app.token_stats.response_tokens,
-            app.token_stats.tokens_per_sec,
-            app.token_stats.total_duration_ms,
-        )
-    } else {
-        String::new()
-    };
-
     let (title, border_style) = match (&app.input_mode, &app.focus) {
         (InputMode::Input, Focus::Input) => (
-            format!(" Input (Alt+Enter: send){} ", stats_str),
+            " Input (Alt+Enter: send) ".to_string(),
             Style::default().fg(Color::Green),
         ),
         (_, Focus::Input) => (
-            format!(" Input (i or Enter to type){} ", stats_str),
+            " Input (i or Enter to type) ".to_string(),
             Style::default().fg(Color::Yellow),
         ),
         _ => (
-            format!(" Input (i or Enter to type){} ", stats_str),
+            " Input (i or Enter to type) ".to_string(),
             Style::default().fg(Color::DarkGray),
         ),
     };
@@ -1086,6 +1155,128 @@ fn render_load_dialog(f: &mut Frame, app: &App, area: Rect) {
         x: inner.x,
         y: btn_y,
         width: inner.width,
+        height: 1,
+    };
+    f.render_widget(Paragraph::new(buttons), btn_area);
+}
+
+fn render_settings_dialog(f: &mut Frame, app: &App, area: Rect) {
+    let dialog_w: u16 = 60;
+    let dialog_h: u16 = 20;
+
+    let popup_area = Rect {
+        x: (area.width.saturating_sub(dialog_w)) / 2,
+        y: (area.height.saturating_sub(dialog_h)) / 2,
+        width: dialog_w,
+        height: dialog_h,
+    };
+
+    f.render_widget(Clear, popup_area);
+    f.render_widget(dialog_block("Settings", &app.theme), popup_area);
+
+    let inner = popup_area.inner(Margin::new(2, 1));
+
+    let fields = [
+        ("Proxy URL:", &app.settings_proxy, SettingsFocus::Proxy),
+        ("Ollama URL:", &app.settings_ollama_url, SettingsFocus::OllamaUrl),
+        ("Temperature:", &app.settings_temperature, SettingsFocus::Temperature),
+        ("Top-P:", &app.settings_top_p, SettingsFocus::TopP),
+        ("Top-K:", &app.settings_top_k, SettingsFocus::TopK),
+        ("Max Rounds:", &app.settings_max_tool_rounds, SettingsFocus::MaxToolRounds),
+    ];
+
+    for (i, (label, value, focus)) in fields.iter().enumerate() {
+        let field_y = inner.y + i as u16 * 2;
+
+        let label_style = if *focus == app.settings_focus {
+            Style::default().fg(Color::Yellow)
+        } else {
+            Style::default().fg(Color::White)
+        };
+
+        let label_para = Paragraph::new(Line::from(Span::styled(
+            format!("  {:<13}", label),
+            label_style,
+        )));
+        let label_area = Rect {
+            x: inner.x,
+            y: field_y,
+            width: 15,
+            height: 1,
+        };
+        f.render_widget(label_para, label_area);
+
+        let value_style = if *focus == app.settings_focus {
+            Style::default().fg(Color::Black).bg(Color::White)
+        } else {
+            Style::default().fg(Color::White).bg(Color::Rgb(40, 40, 40))
+        };
+
+        let max_w = inner.width.saturating_sub(16);
+        let display_val = if value.len() > max_w as usize {
+            format!("{}...", &value[..(max_w as usize - 3)])
+        } else {
+            value.to_string()
+        };
+
+        let value_para = Paragraph::new(Line::from(Span::styled(
+            format!(" {:<width$} ", display_val, width = max_w.saturating_sub(1) as usize),
+            value_style,
+        )));
+        let value_area = Rect {
+            x: inner.x + 14,
+            y: field_y,
+            width: max_w + 2,
+            height: 1,
+        };
+        f.render_widget(value_para, value_area);
+
+        if *focus == app.settings_focus {
+            let cursor_x = value_area.x + 1 + app.settings_cursor as u16;
+            f.set_cursor_position(Position::new(cursor_x, field_y));
+        }
+    }
+
+    let num_fields = 6u16;
+    let btn_y = inner.y + num_fields * 2 + 1;
+    let save_label = "Save";
+    let cancel_label = "Cancel";
+    let save_w = save_label.len() as u16 + 4;
+    let cancel_w = cancel_label.len() as u16 + 4;
+    let gap: u16 = 4;
+    let total_btn_w = save_w + gap + cancel_w;
+    let btn_start_x = inner.x + (inner.width.saturating_sub(total_btn_w)) / 2;
+
+    let save_btn = Button::new(
+        save_label,
+        btn_start_x,
+        btn_y,
+        app.settings_focus == SettingsFocus::Save,
+        Color::Green,
+        Color::Green,
+    );
+    let cancel_btn = Button::new(
+        cancel_label,
+        btn_start_x + save_w + gap,
+        btn_y,
+        app.settings_focus == SettingsFocus::Cancel,
+        Color::Red,
+        Color::Red,
+    );
+
+    let (save_text, save_style) = save_btn.render();
+    let (cancel_text, cancel_style) = cancel_btn.render();
+
+    let buttons = Line::from(vec![
+        Span::styled(save_text, save_style),
+        Span::raw(" ".repeat(gap as usize)),
+        Span::styled(cancel_text, cancel_style),
+    ]);
+
+    let btn_area = Rect {
+        x: btn_start_x,
+        y: btn_y,
+        width: total_btn_w,
         height: 1,
     };
     f.render_widget(Paragraph::new(buttons), btn_area);
