@@ -2443,6 +2443,15 @@ async fn stream_with_retry(
         return;
     };
 
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        let msg = format!("API error {}: {}", status, body);
+        log_to_file(is_logging, log_file, session_id, "API_ERROR", &msg);
+        let _ = tx.send(StreamChunk::Error(msg));
+        return;
+    }
+
     let mut buffer = String::new();
     let mut collected_tool_calls: Vec<serde_json::Value> = Vec::new();
     loop {
