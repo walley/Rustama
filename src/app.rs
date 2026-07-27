@@ -627,9 +627,11 @@ impl App {
                 match rx.try_recv() {
                     Ok(StreamChunk::Text(text)) => {
                         self.streaming_text.push_str(&text);
+                        self.auto_scroll = true;
                     }
                     Ok(StreamChunk::Thinking(text)) => {
                         self.streaming_thinking.push_str(&text);
+                        self.auto_scroll = true;
                     }
                     Ok(StreamChunk::ToolCalls(tool_calls)) => {
                         if !self.streaming_thinking.is_empty() {
