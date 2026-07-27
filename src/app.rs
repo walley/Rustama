@@ -223,8 +223,7 @@ pub struct App {
 
 impl App {
     pub fn new(cfg: Config) -> Self {
-        let mut textarea = TextArea::default();
-        textarea.set_line_number_style(ratatui::style::Style::default());
+        let textarea = TextArea::default();
         let clipboard = Clipboard::new().ok();
         let mut app = App {
             messages: vec![ChatMessage::App(
@@ -491,7 +490,6 @@ impl App {
                 let completed = &matches[0];
                 let new_text = format!("{}{}", cmd_prefix, completed);
                 self.textarea = TextArea::default();
-                self.textarea.set_line_number_style(ratatui::style::Style::default());
                 for ch in new_text.chars() {
                     self.textarea.insert_char(ch);
                 }
@@ -501,7 +499,6 @@ impl App {
                 if common.len() > partial.len() {
                     let new_text = format!("{}{}", cmd_prefix, common);
                     self.textarea = TextArea::default();
-                    self.textarea.set_line_number_style(ratatui::style::Style::default());
                     for ch in new_text.chars() {
                         self.textarea.insert_char(ch);
                     }
@@ -1122,7 +1119,6 @@ impl App {
     fn send_to_ollama_async(&mut self) {
         let prompt = self.textarea.lines().join("\n").trim().to_string();
         self.textarea = TextArea::default();
-        self.textarea.set_line_number_style(ratatui::style::Style::default());
 
         if let Some(result) = self.handle_slash_command(&prompt) {
             self.messages.push(ChatMessage::App(result));
