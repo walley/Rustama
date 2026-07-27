@@ -847,7 +847,12 @@ impl App {
                 }
                 ChatMessage::System(_) => {}
                 ChatMessage::App(_) => {}
-                ChatMessage::Thinking(_) => {}
+                ChatMessage::Thinking(t) => {
+                    api_messages.push(serde_json::json!({
+                        "role": "system",
+                        "content": format!("Your previous reasoning (interrupted): {}", t),
+                    }));
+                }
                 ChatMessage::FileContent { name, content } => {
                     api_messages.push(serde_json::json!({
                         "role": "user",
@@ -1165,7 +1170,12 @@ impl App {
                 }
                 ChatMessage::System(_) => {}
                 ChatMessage::App(_) => {}
-                ChatMessage::Thinking(_) => {}
+                ChatMessage::Thinking(t) => {
+                    api_messages.push(serde_json::json!({
+                        "role": "system",
+                        "content": format!("Your previous reasoning (interrupted): {}", t),
+                    }));
+                }
                 ChatMessage::FileContent { name, content } => {
                     api_messages.push(serde_json::json!({
                         "role": "user",
