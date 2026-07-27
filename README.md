@@ -69,4 +69,5 @@ Contributions are welcome! Please feel free to open issues or submit pull reques
 
 ---
 
-Built with ❤️ in Rust
+Built with ❤️in Rust YAY!
+
