@@ -863,111 +863,8 @@ impl App {
 
                 log_to_file(is_logging, &log_file, &session_id, "REQUEST", &format!("{} {}", api_url, serde_json::to_string(&body).unwrap_or_default()));
 
-                let result = req.send().await;
-
                 let is_cloud = cloud_model.is_some();
-                match result {
-                    Ok(mut resp) => {
-                        let mut buffer = String::new();
-                        let mut collected_tool_calls: Vec<serde_json::Value> = Vec::new();
-                        loop {
-                            match resp.chunk().await {
-                                Ok(Some(chunk)) => {
-                                    buffer.push_str(&String::from_utf8_lossy(&chunk));
-                                    while let Some(pos) = buffer.find('\n') {
-                                        let raw = buffer[..pos].trim().to_string();
-                                        buffer = buffer[pos + 1..].to_string();
-                                        if raw.is_empty() {
-                                            continue;
-                                        }
-                                        let line = if is_cloud {
-                                            raw.strip_prefix("data: ").unwrap_or(&raw).trim().to_string()
-                                        } else {
-                                            raw
-                                        };
-                                        log_to_file(is_logging, &log_file, &session_id, "RESPONSE", &line);
-                                        if line == "[DONE]" {
-                                            log_to_file(is_logging, &log_file, &session_id, "STREAM_END", "DONE sentinel");
-                                            let _ = tx.send(StreamChunk::Done(TokenStats::default()));
-                                            return;
-                                        }
-                                        if line.is_empty() {
-                                            continue;
-                                        }
-                                        match serde_json::from_str::<serde_json::Value>(&line) {
-                                            Ok(json) => {
-                                                if is_cloud {
-                                                    if let Some(delta) = json["choices"][0]["delta"]["content"].as_str() {
-                                                        if !delta.is_empty() {
-                                                            let _ = tx.send(StreamChunk::Text(delta.to_string()));
-                                                        }
-                                                    }
-                                                    if let Some(tc_array) = json["choices"][0]["delta"]["tool_calls"].as_array() {
-                                                        for tc in tc_array {
-                                                            collected_tool_calls.push(tc.clone());
-                                                        }
-                                                    }
-                                                    let finish = json["choices"][0]["finish_reason"].as_str();
-                                                    if finish == Some("stop") || finish == Some("tool_calls") {
-                                                         let stats = parse_usage_stats(&json);
-                                                        log_to_file(is_logging, &log_file, &session_id, "STREAM_END", &format!("{} finish_reason={}", api_url, finish.unwrap_or("?")));
-                                                        if !collected_tool_calls.is_empty() {
-                                                            let _ = tx.send(StreamChunk::ToolCalls(collected_tool_calls));
-                                                        } else {
-                                                            let _ = tx.send(StreamChunk::Done(stats));
-                                                        }
-                                                        return;
-                                                    }
-                                                } else {
-                                                    if let Some(thinking) = json["message"]["thinking"].as_str() {
-                                                        if !thinking.is_empty() {
-                                                            let _ = tx.send(StreamChunk::Thinking(thinking.to_string()));
-                                                        }
-                                                    }
-                                                    if let Some(content) = json["message"]["content"].as_str() {
-                                                        if !content.is_empty() {
-                                                            let _ = tx.send(StreamChunk::Text(content.to_string()));
-                                                        }
-                                                    }
-                                                    if let Some(tool_calls) = json["message"]["tool_calls"].as_array() {
-                                                        for tc in tool_calls {
-                                                            collected_tool_calls.push(tc.clone());
-                                                        }
-                                                    }
-                                                    if json["done"].as_bool() == Some(true) {
-                                                        log_to_file(is_logging, &log_file, &session_id, "STREAM_END", &format!("{} done=true tokens={}", api_url, json["eval_count"].as_u64().unwrap_or(0)));
-                                                        if !collected_tool_calls.is_empty() {
-                                                            let _ = tx.send(StreamChunk::ToolCalls(collected_tool_calls));
-                                                        } else {
-                                                            let stats = parse_token_stats(&json);
-                                                            let _ = tx.send(StreamChunk::Done(stats));
-                                                        }
-                                                        return;
-                                                    }
-                                                }
-                                            }
-                                            Err(_) => {}
-                                        }
-                                    }
-                                }
-                                Ok(None) => {
-                                    log_to_file(is_logging, &log_file, &session_id, "STREAM_END", "stream closed");
-                                    let _ = tx.send(StreamChunk::Done(TokenStats::default()));
-                                    return;
-                                }
-                                Err(e) => {
-                                    log_to_file(is_logging, &log_file, &session_id, "STREAM_ERROR", &e.to_string());
-                                    let _ = tx.send(StreamChunk::Error(format!("Stream error: {}", e)));
-                                    return;
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        log_to_file(is_logging, &log_file, &session_id, "CONNECT_ERROR", &e.to_string());
-                        let _ = tx.send(StreamChunk::Error(format!("Failed to connect: {}", e)));
-                    }
-                }
+                stream_with_retry(req, tx, is_cloud, is_logging, &log_file, &session_id, &api_url).await;
             });
         });
     }
@@ -1150,111 +1047,8 @@ impl App {
 
                 log_to_file(is_logging, &log_file, &session_id, "REQUEST", &format!("{} {}", api_url, serde_json::to_string(&body).unwrap_or_default()));
 
-                let result = req.send().await;
-
                 let is_cloud = cloud_model.is_some();
-                match result {
-                    Ok(mut resp) => {
-                        let mut buffer = String::new();
-                        let mut collected_tool_calls: Vec<serde_json::Value> = Vec::new();
-                        loop {
-                            match resp.chunk().await {
-                                Ok(Some(chunk)) => {
-                                    buffer.push_str(&String::from_utf8_lossy(&chunk));
-                                    while let Some(pos) = buffer.find('\n') {
-                                        let raw = buffer[..pos].trim().to_string();
-                                        buffer = buffer[pos + 1..].to_string();
-                                        if raw.is_empty() {
-                                            continue;
-                                        }
-                                        let line = if is_cloud {
-                                            raw.strip_prefix("data: ").unwrap_or(&raw).trim().to_string()
-                                        } else {
-                                            raw
-                                        };
-                                        log_to_file(is_logging, &log_file, &session_id, "RESPONSE", &line);
-                                        if line == "[DONE]" {
-                                            log_to_file(is_logging, &log_file, &session_id, "STREAM_END", "DONE sentinel");
-                                            let _ = tx.send(StreamChunk::Done(TokenStats::default()));
-                                            return;
-                                        }
-                                        if line.is_empty() {
-                                            continue;
-                                        }
-                                        match serde_json::from_str::<serde_json::Value>(&line) {
-                                            Ok(json) => {
-                                                if is_cloud {
-                                                    if let Some(delta) = json["choices"][0]["delta"]["content"].as_str() {
-                                                        if !delta.is_empty() {
-                                                            let _ = tx.send(StreamChunk::Text(delta.to_string()));
-                                                        }
-                                                    }
-                                                    if let Some(tc_array) = json["choices"][0]["delta"]["tool_calls"].as_array() {
-                                                        for tc in tc_array {
-                                                            collected_tool_calls.push(tc.clone());
-                                                        }
-                                                    }
-                                                    let finish = json["choices"][0]["finish_reason"].as_str();
-                                                    if finish == Some("stop") || finish == Some("tool_calls") {
-                                                         let stats = parse_usage_stats(&json);
-                                                        log_to_file(is_logging, &log_file, &session_id, "STREAM_END", &format!("{} finish_reason={}", api_url, finish.unwrap_or("?")));
-                                                        if !collected_tool_calls.is_empty() {
-                                                            let _ = tx.send(StreamChunk::ToolCalls(collected_tool_calls));
-                                                        } else {
-                                                            let _ = tx.send(StreamChunk::Done(stats));
-                                                        }
-                                                        return;
-                                                    }
-                                                } else {
-                                                    if let Some(thinking) = json["message"]["thinking"].as_str() {
-                                                        if !thinking.is_empty() {
-                                                            let _ = tx.send(StreamChunk::Thinking(thinking.to_string()));
-                                                        }
-                                                    }
-                                                    if let Some(content) = json["message"]["content"].as_str() {
-                                                        if !content.is_empty() {
-                                                            let _ = tx.send(StreamChunk::Text(content.to_string()));
-                                                        }
-                                                    }
-                                                    if let Some(tool_calls) = json["message"]["tool_calls"].as_array() {
-                                                        for tc in tool_calls {
-                                                            collected_tool_calls.push(tc.clone());
-                                                        }
-                                                    }
-                                                    if json["done"].as_bool() == Some(true) {
-                                                        log_to_file(is_logging, &log_file, &session_id, "STREAM_END", &format!("{} done=true tokens={}", api_url, json["eval_count"].as_u64().unwrap_or(0)));
-                                                        if !collected_tool_calls.is_empty() {
-                                                            let _ = tx.send(StreamChunk::ToolCalls(collected_tool_calls));
-                                                        } else {
-                                                            let stats = parse_token_stats(&json);
-                                                            let _ = tx.send(StreamChunk::Done(stats));
-                                                        }
-                                                        return;
-                                                    }
-                                                }
-                                            }
-                                            Err(_) => {}
-                                        }
-                                    }
-                                }
-                                Ok(None) => {
-                                    log_to_file(is_logging, &log_file, &session_id, "STREAM_END", "stream closed");
-                                    let _ = tx.send(StreamChunk::Done(TokenStats::default()));
-                                    return;
-                                }
-                                Err(e) => {
-                                    log_to_file(is_logging, &log_file, &session_id, "STREAM_ERROR", &e.to_string());
-                                    let _ = tx.send(StreamChunk::Error(format!("Stream error: {}", e)));
-                                    return;
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        log_to_file(is_logging, &log_file, &session_id, "CONNECT_ERROR", &e.to_string());
-                        let _ = tx.send(StreamChunk::Error(format!("Failed to connect: {}", e)));
-                    }
-                }
+                stream_with_retry(req, tx, is_cloud, is_logging, &log_file, &session_id, &api_url).await;
             });
         });
     }
@@ -2602,6 +2396,146 @@ impl App {
 
     fn log_event(&self, kind: &str, content: &str) {
         log_to_file(self.is_logging, &self.log_file, &self.session_id, kind, content);
+    }
+}
+
+async fn stream_with_retry(
+    req: reqwest::RequestBuilder,
+    tx: mpsc::Sender<StreamChunk>,
+    is_cloud: bool,
+    is_logging: bool,
+    log_file: &str,
+    session_id: &str,
+    api_url: &str,
+) {
+    let max_retries = 3u32;
+    let mut resp: Option<reqwest::Response> = None;
+    for attempt in 1..=max_retries {
+        let result: Result<reqwest::Response, reqwest::Error> = req.try_clone().unwrap().send().await;
+        match result {
+            Ok(r) if r.status().as_u16() == 429 => {
+                let retry_after: u64 = r.headers()
+                    .get("retry-after")
+                    .and_then(|v: &reqwest::header::HeaderValue| v.to_str().ok())
+                    .and_then(|s: &str| s.parse::<u64>().ok())
+                    .unwrap_or(2);
+                let msg = format!("⚠ Rate limited (429), retrying in {}s (attempt {}/{})", retry_after, attempt, max_retries);
+                log_to_file(is_logging, log_file, session_id, "RATE_LIMIT", &msg);
+                let _ = tx.send(StreamChunk::Text(format!("\n{}\n", msg)));
+                tokio::time::sleep(std::time::Duration::from_secs(retry_after)).await;
+                continue;
+            }
+            Ok(r) => {
+                resp = Some(r);
+                break;
+            }
+            Err(e) => {
+                log_to_file(is_logging, log_file, session_id, "CONNECT_ERROR", &e.to_string());
+                let _ = tx.send(StreamChunk::Error(format!("Failed to connect: {}", e)));
+                return;
+            }
+        }
+    }
+    let Some(mut resp) = resp else {
+        let msg = format!("Rate limited (429) after {} retries, giving up", max_retries);
+        log_to_file(is_logging, log_file, session_id, "RATE_LIMIT", &msg);
+        let _ = tx.send(StreamChunk::Error(msg));
+        return;
+    };
+
+    let mut buffer = String::new();
+    let mut collected_tool_calls: Vec<serde_json::Value> = Vec::new();
+    loop {
+        match resp.chunk().await {
+            Ok(Some(chunk)) => {
+                buffer.push_str(&String::from_utf8_lossy(&chunk));
+                while let Some(pos) = buffer.find('\n') {
+                    let raw = buffer[..pos].trim().to_string();
+                    buffer = buffer[pos + 1..].to_string();
+                    if raw.is_empty() {
+                        continue;
+                    }
+                    let line = if is_cloud {
+                        raw.strip_prefix("data: ").unwrap_or(&raw).trim().to_string()
+                    } else {
+                        raw
+                    };
+                    log_to_file(is_logging, log_file, session_id, "RESPONSE", &line);
+                    if line == "[DONE]" {
+                        log_to_file(is_logging, log_file, session_id, "STREAM_END", "DONE sentinel");
+                        let _ = tx.send(StreamChunk::Done(TokenStats::default()));
+                        return;
+                    }
+                    if line.is_empty() {
+                        continue;
+                    }
+                    match serde_json::from_str::<serde_json::Value>(&line) {
+                        Ok(json) => {
+                            if is_cloud {
+                                if let Some(delta) = json["choices"][0]["delta"]["content"].as_str() {
+                                    if !delta.is_empty() {
+                                        let _ = tx.send(StreamChunk::Text(delta.to_string()));
+                                    }
+                                }
+                                if let Some(tc_array) = json["choices"][0]["delta"]["tool_calls"].as_array() {
+                                    for tc in tc_array {
+                                        collected_tool_calls.push(tc.clone());
+                                    }
+                                }
+                                let finish = json["choices"][0]["finish_reason"].as_str();
+                                if finish == Some("stop") || finish == Some("tool_calls") {
+                                    let stats = parse_usage_stats(&json);
+                                    log_to_file(is_logging, log_file, session_id, "STREAM_END", &format!("{} finish_reason={}", api_url, finish.unwrap_or("?")));
+                                    if !collected_tool_calls.is_empty() {
+                                        let _ = tx.send(StreamChunk::ToolCalls(collected_tool_calls));
+                                    } else {
+                                        let _ = tx.send(StreamChunk::Done(stats));
+                                    }
+                                    return;
+                                }
+                            } else {
+                                if let Some(thinking) = json["message"]["thinking"].as_str() {
+                                    if !thinking.is_empty() {
+                                        let _ = tx.send(StreamChunk::Thinking(thinking.to_string()));
+                                    }
+                                }
+                                if let Some(content) = json["message"]["content"].as_str() {
+                                    if !content.is_empty() {
+                                        let _ = tx.send(StreamChunk::Text(content.to_string()));
+                                    }
+                                }
+                                if let Some(tool_calls) = json["message"]["tool_calls"].as_array() {
+                                    for tc in tool_calls {
+                                        collected_tool_calls.push(tc.clone());
+                                    }
+                                }
+                                if json["done"].as_bool() == Some(true) {
+                                    log_to_file(is_logging, log_file, session_id, "STREAM_END", &format!("{} done=true tokens={}", api_url, json["eval_count"].as_u64().unwrap_or(0)));
+                                    if !collected_tool_calls.is_empty() {
+                                        let _ = tx.send(StreamChunk::ToolCalls(collected_tool_calls));
+                                    } else {
+                                        let stats = parse_token_stats(&json);
+                                        let _ = tx.send(StreamChunk::Done(stats));
+                                    }
+                                    return;
+                                }
+                            }
+                        }
+                        Err(_) => {}
+                    }
+                }
+            }
+            Ok(None) => {
+                log_to_file(is_logging, log_file, session_id, "STREAM_END", "stream closed");
+                let _ = tx.send(StreamChunk::Done(TokenStats::default()));
+                return;
+            }
+            Err(e) => {
+                log_to_file(is_logging, log_file, session_id, "STREAM_ERROR", &e.to_string());
+                let _ = tx.send(StreamChunk::Error(format!("Stream error: {}", e)));
+                return;
+            }
+        }
     }
 }
 
