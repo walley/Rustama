@@ -1,7 +1,8 @@
+use ratatui::crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::{Margin, Offset, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, ListItem, Paragraph, Shadow};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Shadow};
 use ratatui::widgets::dimmed;
 use ratatui::Frame;
 
@@ -616,5 +617,342 @@ impl FileActionDialog {
         }
 
         DialogHit::None
+    }
+}
+
+// ─── Main Menu ───────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ActiveMenu {
+    None,
+    File,
+    Edit,
+    Help,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum MenuAction {
+    None,
+    LoadSession,
+    SaveSession,
+    ExportChat,
+    Quit,
+    OpenModelDialog,
+    ToggleAgenticMode(bool),
+    OpenSettingsDialog,
+    ShowAbout,
+}
+
+pub struct MainMenu {
+    pub active: ActiveMenu,
+    pub selection: usize,
+}
+
+impl MainMenu {
+    pub fn new() -> Self {
+        MainMenu {
+            active: ActiveMenu::None,
+            selection: 0,
+        }
+    }
+
+    pub fn is_open(&self) -> bool {
+        self.active != ActiveMenu::None
+    }
+
+    pub fn open(&mut self, menu: ActiveMenu) {
+        self.active = menu;
+        self.selection = 0;
+    }
+
+    pub fn close(&mut self) {
+        self.active = ActiveMenu::None;
+    }
+
+    pub fn item_names(&self) -> Vec<&'static str> {
+        match self.active {
+            ActiveMenu::File => vec!["Load", "Save", "Export...", "\u{2500}", "Exit"],
+            ActiveMenu::Edit => vec!["Set Model", "Agentic Mode", "\u{2500}", "Settings..."],
+            ActiveMenu::Help => vec!["About"],
+            ActiveMenu::None => vec![],
+        }
+    }
+
+    pub fn max_items(&self) -> usize {
+        self.item_names().len()
+    }
+
+    pub fn is_separator(&self, index: usize) -> bool {
+        self.item_names()
+            .get(index)
+            .map_or(false, |name| *name == "\u{2500}")
+    }
+
+    fn x_offset_for(menu: ActiveMenu) -> u16 {
+        match menu {
+            ActiveMenu::File => 0,
+            ActiveMenu::Edit => 7,
+            ActiveMenu::Help => 14,
+            ActiveMenu::None => 0,
+        }
+    }
+
+    pub fn bar_col_to_menu(col: u16) -> ActiveMenu {
+        match col {
+            0..=6 => ActiveMenu::File,
+            7..=13 => ActiveMenu::Edit,
+            _ => ActiveMenu::Help,
+        }
+    }
+
+    fn next_menu(menu: ActiveMenu) -> ActiveMenu {
+        match menu {
+            ActiveMenu::File => ActiveMenu::Edit,
+            ActiveMenu::Edit => ActiveMenu::Help,
+            ActiveMenu::Help => ActiveMenu::File,
+            ActiveMenu::None => ActiveMenu::File,
+        }
+    }
+
+    fn prev_menu(menu: ActiveMenu) -> ActiveMenu {
+        match menu {
+            ActiveMenu::File => ActiveMenu::Help,
+            ActiveMenu::Edit => ActiveMenu::File,
+            ActiveMenu::Help => ActiveMenu::Edit,
+            ActiveMenu::None => ActiveMenu::File,
+        }
+    }
+
+    fn action_for(&self, menu: ActiveMenu, index: usize) -> MenuAction {
+        match (menu, index) {
+            (ActiveMenu::File, 0) => MenuAction::LoadSession,
+            (ActiveMenu::File, 1) => MenuAction::SaveSession,
+            (ActiveMenu::File, 2) => MenuAction::ExportChat,
+            (ActiveMenu::File, 4) => MenuAction::Quit,
+            (ActiveMenu::Edit, 0) => MenuAction::OpenModelDialog,
+            (ActiveMenu::Edit, 1) => MenuAction::ToggleAgenticMode(true),
+            (ActiveMenu::Edit, 3) => MenuAction::OpenSettingsDialog,
+            (ActiveMenu::Help, 0) => MenuAction::ShowAbout,
+            _ => MenuAction::None,
+        }
+    }
+
+    pub fn handle_key(&mut self, key: KeyEvent) -> MenuAction {
+        match key.code {
+            KeyCode::Esc => {
+                self.close();
+                MenuAction::None
+            }
+            KeyCode::Left => {
+                self.active = Self::prev_menu(self.active);
+                self.selection = self.first_selectable();
+                MenuAction::None
+            }
+            KeyCode::Right => {
+                self.active = Self::next_menu(self.active);
+                self.selection = self.first_selectable();
+                MenuAction::None
+            }
+            KeyCode::Up => {
+                self.selection = self.prev_selectable(self.selection);
+                MenuAction::None
+            }
+            KeyCode::Down => {
+                self.selection = self.next_selectable(self.selection);
+                MenuAction::None
+            }
+            KeyCode::Enter => {
+                let action = self.action_for(self.active, self.selection);
+                self.close();
+                action
+            }
+            _ => MenuAction::None,
+        }
+    }
+
+    fn first_selectable(&self) -> usize {
+        let count = self.max_items();
+        for i in 0..count {
+            if !self.is_separator(i) {
+                return i;
+            }
+        }
+        0
+    }
+
+    fn prev_selectable(&self, current: usize) -> usize {
+        let mut new = current;
+        while new > 0 {
+            new -= 1;
+            if !self.is_separator(new) {
+                return new;
+            }
+        }
+        current
+    }
+
+    fn next_selectable(&self, current: usize) -> usize {
+        let max = self.max_items();
+        let mut new = current;
+        while new < max - 1 {
+            new += 1;
+            if !self.is_separator(new) {
+                return new;
+            }
+        }
+        current
+    }
+
+    pub fn handle_click(&mut self, col: u16, row: u16) -> MenuAction {
+        if row == 0 {
+            let menu = Self::bar_col_to_menu(col);
+            if self.active == menu {
+                self.close();
+                return MenuAction::None;
+            } else {
+                self.open(menu);
+                return MenuAction::None;
+            }
+        }
+
+        if self.is_open() {
+            let x_offset = Self::x_offset_for(self.active);
+            let item_count = self.max_items() as u16;
+            if row >= 2 && row < 2 + item_count {
+                if col >= x_offset && col < x_offset + 20 {
+                    let idx = (row - 2) as usize;
+                    if !self.is_separator(idx) {
+                        self.selection = idx;
+                        let action = self.action_for(self.active, self.selection);
+                        self.close();
+                        return action;
+                    }
+                    return MenuAction::None;
+                }
+            }
+            self.close();
+            return MenuAction::None;
+        }
+
+        MenuAction::None
+    }
+
+    pub fn render_bar(
+        &self,
+        f: &mut Frame,
+        agentic_mode: bool,
+        theme: &Theme,
+        area: Rect,
+    ) {
+        let normal_style = Style::default().fg(Color::White).bg(Color::DarkGray);
+        let selected_style = Style::default().fg(Color::Black).bg(Color::White);
+
+        let file_style = if self.active == ActiveMenu::File {
+            selected_style
+        } else {
+            normal_style
+        };
+        let edit_style = if self.active == ActiveMenu::Edit {
+            selected_style
+        } else {
+            normal_style
+        };
+        let help_style = if self.active == ActiveMenu::Help {
+            selected_style
+        } else {
+            normal_style
+        };
+
+        let agentic_indicator = if agentic_mode {
+            Span::styled(
+                " [AGENTIC] ",
+                Style::default()
+                    .fg(theme.list_selected_fg)
+                    .bg(theme.list_selected_indicator_bg)
+                    .add_modifier(Modifier::BOLD),
+            )
+        } else {
+            Span::styled(" ", normal_style)
+        };
+
+        let now = chrono::Local::now();
+        let clock = format!("  {}  ", now.format("%H:%M"));
+        let clock_len = clock.len() as u16;
+        let used = 6 + 1 + 6 + 1 + 5 + 1 + agentic_indicator.width() as u16;
+        let pad = area.width.saturating_sub(used + clock_len);
+        let menu_bar = Line::from(vec![
+            Span::styled(" File ", file_style),
+            Span::styled(" ", normal_style),
+            Span::styled(" Edit ", edit_style),
+            Span::styled(" ", normal_style),
+            Span::styled(" Help ", help_style),
+            agentic_indicator,
+            Span::styled(" ".repeat(pad as usize), normal_style),
+            Span::styled(
+                clock,
+                Style::default().fg(Color::White).bg(Color::DarkGray),
+            ),
+        ]);
+
+        f.render_widget(Paragraph::new(menu_bar).style(normal_style), area);
+    }
+
+    pub fn render_submenu(&self, f: &mut Frame, menu_bar_area: Rect) {
+        let items = self.item_names();
+        if items.is_empty() {
+            return;
+        }
+
+        let menu_width = items
+            .iter()
+            .map(|s| s.len())
+            .max()
+            .unwrap_or(10) as u16
+            + 4;
+        let x_offset = Self::x_offset_for(self.active);
+
+        let popup_area = Rect {
+            x: menu_bar_area.x + x_offset,
+            y: menu_bar_area.y + 1,
+            width: menu_width,
+            height: (items.len() as u16) + 2,
+        };
+
+        let inner_width = menu_width.saturating_sub(2) as usize;
+        let list_items: Vec<ListItem> = items
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                if *name == "\u{2500}" {
+                    let line = "\u{2500}".repeat(inner_width);
+                    ListItem::new(Line::from(Span::styled(
+                        line,
+                        Style::default().fg(Color::DarkGray),
+                    )))
+                } else {
+                    let style = if i == self.selection {
+                        Style::default()
+                            .fg(Color::Black)
+                            .bg(Color::White)
+                    } else {
+                        Style::default()
+                    };
+                    ListItem::new(Line::from(Span::styled(
+                        format!(" {} ", name),
+                        style,
+                    )))
+                }
+            })
+            .collect();
+
+        let list = List::new(list_items).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::White))
+                .style(Style::default().bg(Color::Black)),
+        );
+
+        f.render_widget(Clear, popup_area);
+        f.render_widget(list, popup_area);
     }
 }

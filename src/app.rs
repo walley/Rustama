@@ -1,4 +1,4 @@
-use crate::ui::{Button, DialogDropdownState, DialogHit, FileActionDialog, Theme};
+use crate::ui::{ActiveMenu, Button, DialogDropdownState, DialogHit, FileActionDialog, MainMenu, MenuAction, Theme};
 use ratatui::layout::Rect;
 use serde::{Deserialize, Serialize};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -22,14 +22,6 @@ pub enum InputMode {
 pub enum Focus {
     Output,
     Input,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum ActiveMenu {
-    None,
-    File,
-    Options,
-    Help,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -152,8 +144,7 @@ pub struct App {
     pub should_quit: bool,
     pub input_mode: InputMode,
     pub focus: Focus,
-    pub active_menu: ActiveMenu,
-    pub menu_selection: usize,
+    pub main_menu: MainMenu,
     pub show_about: bool,
     pub show_quit_confirm: bool,
     pub is_loading: bool,
@@ -239,8 +230,7 @@ impl App {
             should_quit: false,
             input_mode: InputMode::Input,
             focus: Focus::Input,
-            active_menu: ActiveMenu::None,
-            menu_selection: 0,
+            main_menu: MainMenu::new(),
             show_about: false,
             show_quit_confirm: false,
             is_loading: false,
@@ -510,67 +500,24 @@ impl App {
     }
 
     fn handle_menu_key(&mut self, key: KeyEvent) {
-        match key.code {
-            KeyCode::Esc => {
-                self.active_menu = ActiveMenu::None;
-                self.input_mode = InputMode::Normal;
-            }
-            KeyCode::Left => {
-                self.active_menu = match self.active_menu {
-                    ActiveMenu::File => ActiveMenu::Help,
-                    ActiveMenu::Options => ActiveMenu::File,
-                    ActiveMenu::Help => ActiveMenu::Options,
-                    ActiveMenu::None => ActiveMenu::File,
-                };
-                self.menu_selection = 0;
-            }
-            KeyCode::Right => {
-                self.active_menu = match self.active_menu {
-                    ActiveMenu::File => ActiveMenu::Options,
-                    ActiveMenu::Options => ActiveMenu::Help,
-                    ActiveMenu::Help => ActiveMenu::File,
-                    ActiveMenu::None => ActiveMenu::File,
-                };
-                self.menu_selection = 0;
-            }
-            KeyCode::Up => {
-                self.menu_selection = self.menu_selection.saturating_sub(1);
-            }
-            KeyCode::Down => {
-                let max = self.max_menu_items();
-                if max > 0 && self.menu_selection < max - 1 {
-                    self.menu_selection += 1;
-                }
-            }
-            KeyCode::Enter => self.execute_menu_selection(),
-            _ => {}
-        }
+        let action = self.main_menu.handle_key(key);
+        self.handle_menu_action(action);
     }
 
     fn open_menu(&mut self) {
-        self.active_menu = ActiveMenu::File;
-        self.menu_selection = 0;
+        self.main_menu.open(ActiveMenu::File);
         self.input_mode = InputMode::Menu;
     }
 
-    fn max_menu_items(&self) -> usize {
-        match self.active_menu {
-            ActiveMenu::File => 4,
-            ActiveMenu::Options => 3,
-            ActiveMenu::Help => 1,
-            ActiveMenu::None => 0,
-        }
-    }
-
-    fn execute_menu_selection(&mut self) {
-        match (&self.active_menu, self.menu_selection) {
-            (ActiveMenu::File, 0) => self.open_load_session_dialog(),
-            (ActiveMenu::File, 1) => self.open_save_dialog(),
-            (ActiveMenu::File, 2) => self.open_export_dialog(),
-            (ActiveMenu::File, 3) => self.show_quit_confirm = true,
-            (ActiveMenu::Help, 0) => self.show_about = true,
-            (ActiveMenu::Options, 0) => self.open_model_dialog(),
-            (ActiveMenu::Options, 1) => {
+    fn handle_menu_action(&mut self, action: MenuAction) {
+        match action {
+            MenuAction::None => {}
+            MenuAction::LoadSession => self.open_load_session_dialog(),
+            MenuAction::SaveSession => self.open_save_dialog(),
+            MenuAction::ExportChat => self.open_export_dialog(),
+            MenuAction::Quit => self.show_quit_confirm = true,
+            MenuAction::OpenModelDialog => self.open_model_dialog(),
+            MenuAction::ToggleAgenticMode(_) => {
                 self.agentic_mode = !self.agentic_mode;
                 self.status_message = if self.agentic_mode {
                     "Agentic mode: ON".to_string()
@@ -578,10 +525,9 @@ impl App {
                     "Agentic mode: OFF".to_string()
                 };
             }
-            (ActiveMenu::Options, 2) => self.open_settings_dialog(),
-            _ => {}
+            MenuAction::OpenSettingsDialog => self.open_settings_dialog(),
+            MenuAction::ShowAbout => self.show_about = true,
         }
-        self.active_menu = ActiveMenu::None;
         self.input_mode = InputMode::Normal;
     }
 
@@ -632,7 +578,13 @@ impl App {
                         self.auto_scroll = true;
                     }
                     Ok(StreamChunk::Status(msg)) => {
-                        self.status_message = msg;
+                        self.status_message = msg.clone();
+                        if !self.streaming_text.is_empty() {
+                            self.streaming_text.push('\n');
+                        }
+                        self.streaming_text.push_str(&msg);
+                        self.streaming_text.push('\n');
+                        self.auto_scroll = true;
                     }
                     Ok(StreamChunk::ToolCalls(tool_calls)) => {
                         if !self.streaming_thinking.is_empty() {
@@ -1911,15 +1863,6 @@ impl App {
         }
     }
 
-    pub fn menu_item_names(&self) -> Vec<&'static str> {
-        match self.active_menu {
-            ActiveMenu::File => vec!["Load", "Save", "Export...", "Exit"],
-            ActiveMenu::Options => vec!["Set Model", "Agentic Mode", "Settings..."],
-            ActiveMenu::Help => vec!["About"],
-            ActiveMenu::None => vec![],
-        }
-    }
-
     pub fn handle_click(&mut self, col: u16, row: u16, width: u16, height: u16) {
         if self.show_save_dialog {
             self.handle_save_dialog_click(col, row, width, height);
@@ -1946,40 +1889,23 @@ impl App {
             return;
         }
 
-        if row == 0 {
-            let new_menu = match col {
-                0..=6 => ActiveMenu::File,
-                7..=16 => ActiveMenu::Options,
-                _ => ActiveMenu::Help,
-            };
-            if self.active_menu == new_menu {
-                self.active_menu = ActiveMenu::None;
-                self.input_mode = InputMode::Normal;
-            } else {
-                self.active_menu = new_menu;
-                self.menu_selection = 0;
-                self.input_mode = InputMode::Menu;
-            }
-            return;
-        }
-
-        if self.active_menu != ActiveMenu::None {
-            let x_offset = match self.active_menu {
-                ActiveMenu::File => 0,
-                ActiveMenu::Options => 7,
-                ActiveMenu::Help => 17,
-                _ => 0,
-            };
-            let item_count = self.max_menu_items() as u16;
-            if row >= 2 && row < 2 + item_count {
-                if col >= x_offset && col < x_offset + 20 {
-                    self.menu_selection = (row - 2) as usize;
-                    self.execute_menu_selection();
-                    return;
+        if row == 0 || self.main_menu.is_open() {
+            let action = self.main_menu.handle_click(col, row);
+            match action {
+                MenuAction::None => {
+                    if row == 0 || self.main_menu.is_open() == false {
+                        // Menu opened or closed, update input mode
+                        if self.main_menu.is_open() {
+                            self.input_mode = InputMode::Menu;
+                        } else {
+                            self.input_mode = InputMode::Normal;
+                        }
+                    }
+                }
+                _ => {
+                    self.handle_menu_action(action);
                 }
             }
-            self.active_menu = ActiveMenu::None;
-            self.input_mode = InputMode::Normal;
             return;
         }
 

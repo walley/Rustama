@@ -17,7 +17,7 @@ use ratatui::widgets::*;
 mod app;
 mod config;
 mod ui;
-use app::{ActiveMenu, App, ChatMessage, FileDialogFocus, FileDialogMode, Focus, InputMode, ModelDialogFocus, SaveDialogFocus, SettingsFocus};
+use app::{App, ChatMessage, FileDialogFocus, FileDialogMode, Focus, InputMode, ModelDialogFocus, SaveDialogFocus, SettingsFocus};
 use ui::{dialog_block, Button, FileActionDialog, Theme};
 use config::Config;
 
@@ -134,7 +134,7 @@ fn ui(f: &mut Frame, app: &mut App) {
     ])
     .split(area);
 
-    render_menu_bar(f, app, main_chunks[0]);
+    app.main_menu.render_bar(f, app.agentic_mode, &app.theme, main_chunks[0]);
     render_keybar(f, app, main_chunks[2]);
 
     let content_chunks =
@@ -143,8 +143,8 @@ fn ui(f: &mut Frame, app: &mut App) {
     render_output(f, app, content_chunks[0]);
     render_input(f, app, content_chunks[1]);
 
-    if app.active_menu != ActiveMenu::None {
-        render_submenu(f, app, main_chunks[0]);
+    if app.main_menu.is_open() {
+        app.main_menu.render_submenu(f, main_chunks[0]);
     }
 
     if app.show_about {
@@ -174,57 +174,6 @@ fn ui(f: &mut Frame, app: &mut App) {
     if app.show_settings_dialog {
         render_settings_dialog(f, app, area);
     }
-}
-
-fn render_menu_bar(f: &mut Frame, app: &App, area: Rect) {
-    let normal_style = Style::default().fg(Color::White).bg(Color::DarkGray);
-    let selected_style = Style::default().fg(Color::Black).bg(Color::White);
-
-    let file_style = if app.active_menu == ActiveMenu::File {
-        selected_style
-    } else {
-        normal_style
-    };
-    let options_style = if app.active_menu == ActiveMenu::Options {
-        selected_style
-    } else {
-        normal_style
-    };
-    let help_style = if app.active_menu == ActiveMenu::Help {
-        selected_style
-    } else {
-        normal_style
-    };
-
-    let agentic_indicator = if app.agentic_mode {
-        Span::styled(
-            " [AGENTIC] ",
-                    Style::default()
-                        .fg(app.theme.list_selected_fg)
-                        .bg(app.theme.list_selected_indicator_bg)
-                        .add_modifier(Modifier::BOLD),
-        )
-    } else {
-        Span::styled(" ", normal_style)
-    };
-
-    let now = chrono::Local::now();
-    let clock = format!("  {}  ", now.format("%H:%M"));
-    let clock_len = clock.len() as u16;
-    let used = 6 + 1 + 8 + 1 + 5 + 1 + agentic_indicator.width() as u16;
-    let pad = area.width.saturating_sub(used + clock_len);
-    let menu_bar = Line::from(vec![
-        Span::styled(" File ", file_style),
-        Span::styled(" ", normal_style),
-        Span::styled(" Options ", options_style),
-        Span::styled(" ", normal_style),
-        Span::styled(" Help ", help_style),
-        agentic_indicator,
-        Span::styled(" ".repeat(pad as usize), normal_style),
-        Span::styled(clock, Style::default().fg(Color::White).bg(Color::DarkGray)),
-    ]);
-
-    f.render_widget(Paragraph::new(menu_bar).style(normal_style), area);
 }
 
 fn render_output(f: &mut Frame, app: &mut App, area: Rect) {
@@ -635,51 +584,6 @@ fn render_keybar(f: &mut Frame, app: &App, area: Rect) {
     .style(Style::default().bg(Color::DarkGray));
 
     f.render_widget(keybar, area);
-}
-
-fn render_submenu(f: &mut Frame, app: &App, menu_bar_area: Rect) {
-    let items = app.menu_item_names();
-    if items.is_empty() {
-        return;
-    }
-
-    let menu_width = items.iter().map(|s| s.len()).max().unwrap_or(10) as u16 + 4;
-    let x_offset = match app.active_menu {
-        ActiveMenu::File => 0,
-        ActiveMenu::Options => 7,
-        ActiveMenu::Help => 17,
-        _ => 0,
-    };
-
-    let popup_area = Rect {
-        x: menu_bar_area.x + x_offset,
-        y: menu_bar_area.y + 1,
-        width: menu_width,
-        height: (items.len() as u16) + 2,
-    };
-
-    let list_items: Vec<ListItem> = items
-        .iter()
-        .enumerate()
-        .map(|(i, name)| {
-            let style = if i == app.menu_selection {
-                Style::default().fg(Color::Black).bg(Color::White)
-            } else {
-                Style::default()
-            };
-            ListItem::new(Line::from(Span::styled(format!(" {} ", name), style)))
-        })
-        .collect();
-
-    let list = List::new(list_items).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::White))
-            .style(Style::default().bg(Color::Black)),
-    );
-
-    f.render_widget(Clear, popup_area);
-    f.render_widget(list, popup_area);
 }
 
 fn render_about_popup(f: &mut Frame, area: Rect, theme: &Theme) {
