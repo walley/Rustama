@@ -764,10 +764,21 @@ impl App {
                         break;
                     }
                     Ok(StreamChunk::Error(msg)) => {
+                        if !self.streaming_thinking.is_empty() {
+                            self.messages
+                                .push(ChatMessage::Thinking(self.streaming_thinking.clone()));
+                            self.streaming_thinking.clear();
+                        }
+                        if !self.streaming_text.is_empty() {
+                            self.messages
+                                .push(ChatMessage::Assistant(self.streaming_text.clone()));
+                            self.streaming_text.clear();
+                        }
                         self.messages.push(ChatMessage::App(msg));
                         self.is_loading = false;
                         self.status_message.clear();
                         self.response_rx = None;
+                        self.set_auto_scroll();
                         break;
                     }
                     Err(mpsc::TryRecvError::Empty) => break,
