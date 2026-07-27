@@ -1636,7 +1636,31 @@ fn distribute_spaces(
     target_w: usize,
 ) -> Vec<Span<'static>> {
     let extra = target_w - current_w;
-    let gaps: Vec<usize> = spans
+
+    let normalized: Vec<Span<'static>> = if spans.len() == 1 && extra > 0 {
+        let text = spans[0].content.as_ref();
+        let style = spans[0].style;
+        let mut parts: Vec<Span<'static>> = Vec::new();
+        let mut current = String::new();
+        for ch in text.chars() {
+            if ch == ' ' {
+                if !current.is_empty() {
+                    parts.push(Span::styled(std::mem::take(&mut current), style));
+                }
+                parts.push(Span::styled(" ", style));
+            } else {
+                current.push(ch);
+            }
+        }
+        if !current.is_empty() {
+            parts.push(Span::styled(current, style));
+        }
+        parts
+    } else {
+        spans.to_vec()
+    };
+
+    let gaps: Vec<usize> = normalized
         .iter()
         .enumerate()
         .filter(|(_, s)| s.content.chars().all(|c| c == ' '))
@@ -1644,15 +1668,15 @@ fn distribute_spaces(
         .collect();
 
     if gaps.is_empty() {
-        return spans.to_vec();
+        return normalized;
     }
 
     let per_gap = extra / gaps.len();
     let remainder = extra % gaps.len();
-    let mut result = Vec::with_capacity(spans.len());
+    let mut result = Vec::with_capacity(normalized.len());
     let mut gap_idx = 0;
 
-    for (i, span) in spans.iter().enumerate() {
+    for (i, span) in normalized.iter().enumerate() {
         if gaps.contains(&i) {
             let add = if gap_idx < remainder { 1 } else { 0 };
             let total = 1 + per_gap + add;
