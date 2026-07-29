@@ -17,6 +17,7 @@ pub struct Config {
     pub temperature: f64,
     pub top_p: f64,
     pub top_k: u32,
+    pub terminal_width_pct: u16,
 }
 
 #[derive(Debug, Clone)]
@@ -43,6 +44,7 @@ impl Default for Config {
             temperature: 1.0,
             top_p: 0.9,
             top_k: 40,
+            terminal_width_pct: 40,
         }
     }
 }
@@ -189,6 +191,13 @@ impl Config {
                 }
             }
         }
+        if let Some(v) = values.get("terminal_width_pct") {
+            if let Ok(n) = v.parse::<u16>() {
+                if n >= 20 && n <= 80 {
+                    cfg.terminal_width_pct = n;
+                }
+            }
+        }
 
         cfg
     }
@@ -249,6 +258,7 @@ impl Config {
         lines.push(format!("temperature = {}", self.temperature));
         lines.push(format!("top_p = {}", self.top_p));
         lines.push(format!("top_k = {}", self.top_k));
+        lines.push(format!("terminal_width_pct = {}", self.terminal_width_pct));
         fs::write(&conf_path, lines.join("\n")).map_err(|e| e.to_string())?;
         Ok(())
     }

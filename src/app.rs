@@ -7,7 +7,10 @@ use ratatui::text::Line;
 use ratatui_textarea::TextArea;
 use arboard::Clipboard;
 use std::path::PathBuf;
-use std::sync::mpsc;
+use std::process::{Child, Stdio};
+use std::io::Read;
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread::JoinHandle;
 
 use crate::config::{Config, CloudModel, load_cloud_models};
 
@@ -133,6 +136,183 @@ pub enum StreamChunk {
     ToolCalls(Vec<serde_json::Value>),
 }
 
+const TERMINAL_BUFFER_MAX: usize = 102400;
+
+pub struct TerminalState {
+    pub buffer: Arc<Mutex<String>>,
+    pub stdin_tx: Option<std::sync::mpsc::Sender<String>>,
+    pub child: Option<Child>,
+    pub reader_handle: Option<JoinHandle<()>>,
+    pub stdin_writer: Option<JoinHandle<()>>,
+    pub visible: bool,
+    pub width_pct: u16,
+    pub command: String,
+}
+
+impl TerminalState {
+    pub fn new() -> Self {
+        TerminalState {
+            buffer: Arc::new(Mutex::new(String::new())),
+            stdin_tx: None,
+            child: None,
+            reader_handle: None,
+            stdin_writer: None,
+            visible: false,
+            width_pct: 40,
+            command: String::new(),
+        }
+    }
+
+    pub fn is_running(&self) -> bool {
+        self.stdin_tx.is_some()
+    }
+
+    pub fn open(&mut self, command: &str) -> String {
+        if self.is_running() {
+            return "Terminal is already running. Close it first with terminal_close.".to_string();
+        }
+
+        let trimmed = command.trim_start();
+        if trimmed.starts_with("sudo ") || trimmed == "sudo" {
+            return "Error: sudo is not permitted.".to_string();
+        }
+
+        let (stdin_tx, stdin_rx) = std::sync::mpsc::channel::<String>();
+        let buffer = Arc::new(Mutex::new(String::new()));
+        let buffer_clone = buffer.clone();
+
+        match std::process::Command::new("sh")
+            .arg("-c")
+            .arg(command)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .stdin(Stdio::piped())
+            .spawn()
+        {
+            Ok(mut child) => {
+                let mut stdin = child.stdin.take().expect("stdin was piped");
+                let stdout = child.stdout.take().expect("stdout was piped");
+                let stderr = child.stderr.take().expect("stderr was piped");
+
+                let stdin_writer = std::thread::spawn(move || {
+                    use std::io::Write;
+                    while let Ok(msg) = stdin_rx.recv() {
+                        if stdin.write_all(msg.as_bytes()).is_err() {
+                            break;
+                        }
+                        let _ = stdin.flush();
+                    }
+                });
+
+                let reader_handle = std::thread::spawn(move || {
+                    let mut buf = [0u8; 4096];
+                    let mut stdout = Some(stdout);
+                    let mut stderr = Some(stderr);
+
+                    loop {
+                        let mut had_data = false;
+
+                        if let Some(ref mut out) = stdout {
+                            match out.read(&mut buf) {
+                                Ok(0) => { stdout = None; }
+                                Ok(n) => {
+                                    had_data = true;
+                                    if let Ok(text) = String::from_utf8(buf[..n].to_vec()) {
+                                        let mut buffer = buffer_clone.lock().unwrap();
+                                        buffer.push_str(&text);
+                                        let len = buffer.len();
+                                        if len > TERMINAL_BUFFER_MAX {
+                                            let drain_to = len - TERMINAL_BUFFER_MAX / 2;
+                                            *buffer = buffer.split_off(drain_to);
+                                        }
+                                    }
+                                }
+                                Err(_) => { stdout = None; }
+                            }
+                        }
+
+                        if let Some(ref mut err) = stderr {
+                            match err.read(&mut buf) {
+                                Ok(0) => { stderr = None; }
+                                Ok(n) => {
+                                    had_data = true;
+                                    if let Ok(text) = String::from_utf8(buf[..n].to_vec()) {
+                                        let mut buffer = buffer_clone.lock().unwrap();
+                                        buffer.push_str(&text);
+                                        let len = buffer.len();
+                                        if len > TERMINAL_BUFFER_MAX {
+                                            let drain_to = len - TERMINAL_BUFFER_MAX / 2;
+                                            *buffer = buffer.split_off(drain_to);
+                                        }
+                                    }
+                                }
+                                Err(_) => { stderr = None; }
+                            }
+                        }
+
+                        if stdout.is_none() && stderr.is_none() {
+                            break;
+                        }
+
+                        if !had_data {
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                        }
+                    }
+                });
+
+                self.buffer = buffer;
+                self.stdin_tx = Some(stdin_tx);
+                self.child = Some(child);
+                self.reader_handle = Some(reader_handle);
+                self.stdin_writer = Some(stdin_writer);
+                self.visible = true;
+                self.command = command.to_string();
+
+                format!("Terminal opened running: {}", command)
+            }
+            Err(e) => format!("Error opening terminal: {}", e),
+        }
+    }
+
+    pub fn send_input(&mut self, input: &str) -> String {
+        if let Some(ref tx) = self.stdin_tx {
+            match tx.send(format!("{}\n", input)) {
+                Ok(()) => format!("Sent: {}", input),
+                Err(_) => "Error: terminal process has exited".to_string(),
+            }
+        } else {
+            "Error: no terminal running".to_string()
+        }
+    }
+
+    pub fn read_buffer(&self) -> String {
+        let buffer = self.buffer.lock().unwrap();
+        if buffer.len() > 4000 {
+            buffer[buffer.len() - 4000..].to_string()
+        } else {
+            buffer.clone()
+        }
+    }
+
+    pub fn close(&mut self) -> String {
+        self.stdin_tx.take();
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        if let Some(handle) = self.stdin_writer.take() {
+            let _ = handle.join();
+        }
+        if let Some(handle) = self.reader_handle.take() {
+            let _ = handle.join();
+        }
+        self.visible = false;
+        self.command.clear();
+        *self.buffer.lock().unwrap() = String::new();
+        "Terminal closed".to_string()
+    }
+}
+
 pub struct App {
     pub messages: Vec<ChatMessage>,
     pub textarea: TextArea<'static>,
@@ -211,6 +391,7 @@ pub struct App {
     pub terminal_height: u16,
     pub session_id: String,
     pub session_name: String,
+    pub terminal_state: TerminalState,
 }
 
 impl App {
@@ -297,6 +478,10 @@ impl App {
             terminal_height: 24,
             session_id: format!("{:016x}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos() & 0xffff_ffff_ffff_ffff),
             session_name: String::new(),
+            terminal_state: TerminalState {
+                width_pct: cfg.terminal_width_pct,
+                ..TerminalState::new()
+            },
         };
         app.session_name = app.session_id.clone();
         app.fetch_models_async();
@@ -315,6 +500,35 @@ impl App {
             }
             KeyCode::F(10) => {
                 self.show_quit_confirm = true;
+                return;
+            }
+            KeyCode::Char('t')
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::SHIFT) =>
+            {
+                if self.terminal_state.is_running() {
+                    self.terminal_state.visible = !self.terminal_state.visible;
+                }
+                return;
+            }
+            KeyCode::Left
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && key.modifiers.contains(KeyModifiers::SHIFT) =>
+            {
+                if self.terminal_state.width_pct > 20 {
+                    self.terminal_state.width_pct -= 5;
+                    self.status_message = format!("Terminal width: {}%", self.terminal_state.width_pct);
+                }
+                return;
+            }
+            KeyCode::Right
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && key.modifiers.contains(KeyModifiers::SHIFT) =>
+            {
+                if self.terminal_state.width_pct < 80 {
+                    self.terminal_state.width_pct += 5;
+                    self.status_message = format!("Terminal width: {}%", self.terminal_state.width_pct);
+                }
                 return;
             }
             _ => {}
@@ -531,6 +745,24 @@ impl App {
         self.input_mode = InputMode::Normal;
     }
 
+    fn execute_terminal_tool(&mut self, name: &str, args_json: &str) -> Option<String> {
+        match name {
+            "terminal_open" => {
+                let args: serde_json::Value = serde_json::from_str(args_json).unwrap_or(serde_json::json!({}));
+                let command = args["command"].as_str().unwrap_or("");
+                Some(self.terminal_state.open(command))
+            }
+            "terminal_send" => {
+                let args: serde_json::Value = serde_json::from_str(args_json).unwrap_or(serde_json::json!({}));
+                let input = args["input"].as_str().unwrap_or("");
+                Some(self.terminal_state.send_input(input))
+            }
+            "terminal_read" => Some(self.terminal_state.read_buffer()),
+            "terminal_close" => Some(self.terminal_state.close()),
+            _ => None,
+        }
+    }
+
     pub fn scroll_up(&mut self) {
         self.auto_scroll = false;
         self.scroll_offset = self.scroll_offset.saturating_sub(1);
@@ -628,7 +860,8 @@ impl App {
                                 tool_call_id: tool_call_id.clone(),
                             });
 
-                            let result = execute_tool_call(&name, &args, &self.proxy);
+                            let result = self.execute_terminal_tool(&name, &args)
+                                .unwrap_or_else(|| execute_tool_call(&name, &args, &self.proxy));
                             self.tool_call_count += 1;
                             self.tool_call_log
                                 .push((name.clone(), args.clone(), result.clone()));
@@ -675,7 +908,8 @@ impl App {
                                         arguments: args.clone(),
                                         tool_call_id: Some(tc_id.clone()),
                                     });
-                            let result = execute_tool_call(&name, &args, &self.proxy);
+                             let result = self.execute_terminal_tool(&name, &args)
+                                .unwrap_or_else(|| execute_tool_call(&name, &args, &self.proxy));
                             self.tool_call_count += 1;
                                     self.tool_call_log.push((name.clone(), args.clone(), result.clone()));
                                     self.log_event("TOOL_CALL", &format!("{}({}) -> {}", name, args, truncate(&result, 500)));
@@ -1513,6 +1747,7 @@ impl App {
         cfg.temperature = self.temperature;
         cfg.top_p = self.top_p;
         cfg.top_k = self.top_k;
+        cfg.terminal_width_pct = self.terminal_state.width_pct;
         cfg.save()
     }
 
@@ -2447,6 +2682,7 @@ impl App {
                 self.show_quit_confirm = false;
             }
             KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
+                self.terminal_state.close();
                 self.should_quit = true;
             }
             _ => {}
@@ -2485,6 +2721,7 @@ impl App {
         let no_btn = Button::new("No", inner_x + 16, btn_y, true, Color::Cyan, Color::Cyan);
 
         if yes_btn.is_clicked(col, row) {
+            self.terminal_state.close();
             self.should_quit = true;
             return;
         }
@@ -3360,6 +3597,62 @@ fn get_tool_definitions() -> Vec<serde_json::Value> {
                 }
             }
         }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "terminal_open",
+                "description": "Open a terminal session to run a command. The terminal panel becomes visible so you can observe the output. Use terminal_send to interact and terminal_read to check output. Use terminal_close when done.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": {
+                            "type": "string",
+                            "description": "The shell command to run (e.g. 'npm run dev', 'cargo build')"
+                        }
+                    },
+                    "required": ["command"]
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "terminal_send",
+                "description": "Send input (keystrokes) to the running terminal session. Use this to interact with programs, answer prompts, press Enter, etc.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "input": {
+                            "type": "string",
+                            "description": "The text to send to the terminal (a newline is appended automatically)"
+                        }
+                    },
+                    "required": ["input"]
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "terminal_read",
+                "description": "Read the current output buffer from the terminal. Returns the most recent output (up to 4000 chars).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {}
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "terminal_close",
+                "description": "Close the terminal session and hide the terminal panel. Kills the running process.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {}
+                }
+            }
+        }),
     ]
 }
 
@@ -3667,7 +3960,7 @@ fn execute_tool_call(name: &str, args_json: &str, proxy: &Option<String>) -> Str
             }
         }
         _ => {
-            let tools: Vec<&str> = vec!["read_file", "write_file", "edit_file", "bash", "list_files", "search_files", "search_content", "fetch_url", "web_search"];
+            let tools: Vec<&str> = vec!["read_file", "write_file", "edit_file", "bash", "list_files", "search_files", "search_content", "fetch_url", "web_search", "terminal_open", "terminal_send", "terminal_read", "terminal_close"];
             format!("Unknown tool: '{}'. Available tools: {}", name, tools.join(", "))
         }
     }
@@ -3699,7 +3992,7 @@ fn grep_regex(pattern: &str, path: &str, include: &str) -> Result<Vec<String>, S
     Ok(results)
 }
 
-const TOOL_NAMES: &[&str] = &["read_file", "write_file", "edit_file", "bash", "list_files", "search_files", "search_content"];
+const TOOL_NAMES: &[&str] = &["read_file", "write_file", "edit_file", "bash", "list_files", "search_files", "search_content", "fetch_url", "web_search", "terminal_open", "terminal_send", "terminal_read", "terminal_close"];
 
 fn parse_text_tool_calls(text: &str) -> Vec<serde_json::Value> {
     let mut tool_calls = Vec::new();

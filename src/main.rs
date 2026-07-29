@@ -137,11 +137,28 @@ fn ui(f: &mut Frame, app: &mut App) {
     app.main_menu.render_bar(f, app.agentic_mode, &app.theme, main_chunks[0]);
     render_keybar(f, app, main_chunks[2]);
 
-    let content_chunks =
-        Layout::vertical([Constraint::Min(3), Constraint::Length(5)]).split(main_chunks[1]);
+    let show_terminal = app.terminal_state.visible && app.terminal_state.is_running();
 
-    render_output(f, app, content_chunks[0]);
-    render_input(f, app, content_chunks[1]);
+    if show_terminal {
+        let content_chunks = Layout::horizontal([
+            Constraint::Percentage(100 - app.terminal_state.width_pct),
+            Constraint::Percentage(app.terminal_state.width_pct),
+        ])
+        .split(main_chunks[1]);
+
+        let left_chunks =
+            Layout::vertical([Constraint::Min(3), Constraint::Length(5)]).split(content_chunks[0]);
+
+        render_output(f, app, left_chunks[0]);
+        render_input(f, app, left_chunks[1]);
+        render_terminal_panel(f, app, content_chunks[1]);
+    } else {
+        let content_chunks =
+            Layout::vertical([Constraint::Min(3), Constraint::Length(5)]).split(main_chunks[1]);
+
+        render_output(f, app, content_chunks[0]);
+        render_input(f, app, content_chunks[1]);
+    }
 
     if app.main_menu.is_open() {
         app.main_menu.render_submenu(f, main_chunks[0]);
@@ -522,6 +539,40 @@ fn render_input(f: &mut Frame, app: &App, area: Rect) {
     render_send_button(f, app, area);
 }
 
+fn render_terminal_panel(f: &mut Frame, app: &App, area: Rect) {
+    let buffer = app.terminal_state.buffer.lock().unwrap();
+    let lines: Vec<Line> = buffer
+        .lines()
+        .map(|l| {
+            Line::from(Span::styled(
+                l.to_string(),
+                Style::default().fg(Color::Green).bg(Color::Black),
+            ))
+        })
+        .collect();
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::DarkGray))
+        .style(Style::default().bg(Color::Black))
+        .title(format!(" {} ", app.terminal_state.command));
+
+    let total_lines = lines.len() as u16;
+    let visible_lines = area.height.saturating_sub(2);
+    let scroll_y = if total_lines > visible_lines {
+        total_lines - visible_lines
+    } else {
+        0
+    };
+
+    let paragraph = Paragraph::new(lines)
+        .block(block)
+        .style(Style::default().bg(Color::Black))
+        .scroll((scroll_y, 0));
+
+    f.render_widget(paragraph, area);
+}
+
 fn render_send_button(f: &mut Frame, app: &App, area: Rect) {
     let has_text = !app.textarea.lines().join("").trim().is_empty();
     let btn_x = area.x + area.width.saturating_sub(13);
@@ -553,24 +604,40 @@ fn render_keybar(f: &mut Frame, app: &App, area: Rect) {
         Focus::Input => " [INPUT] ",
     };
 
+    let terminal_hint = if app.terminal_state.is_running() {
+        if app.terminal_state.visible {
+            " Ctrl+T:HideTerm "
+        } else {
+            " Ctrl+T:ShowTerm "
+        }
+    } else {
+        ""
+    };
+
+    let resize_hint = if app.terminal_state.is_running() && app.terminal_state.visible {
+        " \u{2190}\u{2192}:Resize "
+    } else {
+        ""
+    };
+
     let text = match app.input_mode {
         InputMode::Normal => {
             if !app.status_message.is_empty() {
                 format!(
-                    " {} | F9:Menu F10:Quit Ctrl+S:Save{}{}",
-                    app.status_message, agentic_label, focus_label
+                    " {} | F9:Menu F10:Quit Ctrl+S:Save{}{}{}{}",
+                    app.status_message, agentic_label, focus_label, terminal_hint, resize_hint
                 )
             } else {
                 format!(
-                    " F9:Menu  F10:Quit  Ctrl+S:Save  Mouse:Click/Scroll{}{}",
-                    agentic_label, focus_label
+                    " F9:Menu  F10:Quit  Ctrl+S:Save  Mouse:Click/Scroll{}{}{}{}",
+                    agentic_label, focus_label, terminal_hint, resize_hint
                 )
             }
         }
         InputMode::Input => {
             format!(
-                " Enter:Send  Alt+Enter:Newline  \u{2190}\u{2191}\u{2193}\u{2192}:Cursor{}",
-                agentic_label
+                " Enter:Send  Alt+Enter:Newline  \u{2190}\u{2191}\u{2193}\u{2192}:Cursor{}{}",
+                agentic_label, terminal_hint
             )
         }
         InputMode::Menu => " \u{2190}\u{2192}:Navigate  \u{2191}\u{2193}:Select  Enter:Open  Esc:Close"
