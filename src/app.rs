@@ -69,6 +69,7 @@ pub enum SettingsFocus {
     TopP,
     TopK,
     MaxToolRounds,
+    Justify,
     Save,
     Cancel,
 }
@@ -133,6 +134,7 @@ pub enum StreamChunk {
     Done(TokenStats),
     Error(String),
     Status(String),
+    StatusTick(String),
     ToolCalls(Vec<serde_json::Value>),
 }
 
@@ -142,7 +144,8 @@ pub struct TerminalState {
     pub buffer: Arc<Mutex<String>>,
     pub stdin_tx: Option<std::sync::mpsc::Sender<String>>,
     pub child: Option<Child>,
-    pub reader_handle: Option<JoinHandle<()>>,
+    pub reader_stdout: Option<JoinHandle<()>>,
+    pub reader_stderr: Option<JoinHandle<()>>,
     pub stdin_writer: Option<JoinHandle<()>>,
     pub visible: bool,
     pub width_pct: u16,
@@ -155,7 +158,8 @@ impl TerminalState {
             buffer: Arc::new(Mutex::new(String::new())),
             stdin_tx: None,
             child: None,
-            reader_handle: None,
+            reader_stdout: None,
+            reader_stderr: None,
             stdin_writer: None,
             visible: false,
             width_pct: 40,
@@ -169,7 +173,7 @@ impl TerminalState {
 
     pub fn open(&mut self, command: &str) -> String {
         if self.is_running() {
-            return "Terminal is already running. Close it first with terminal_close.".to_string();
+            return format!("Terminal already running: {}", self.command);
         }
 
         let trimmed = command.trim_start();
@@ -179,7 +183,6 @@ impl TerminalState {
 
         let (stdin_tx, stdin_rx) = std::sync::mpsc::channel::<String>();
         let buffer = Arc::new(Mutex::new(String::new()));
-        let buffer_clone = buffer.clone();
 
         match std::process::Command::new("sh")
             .arg("-c")
@@ -204,21 +207,17 @@ impl TerminalState {
                     }
                 });
 
-                let reader_handle = std::thread::spawn(move || {
-                    let mut buf = [0u8; 4096];
-                    let mut stdout = Some(stdout);
-                    let mut stderr = Some(stderr);
-
-                    loop {
-                        let mut had_data = false;
-
-                        if let Some(ref mut out) = stdout {
+                let reader_stdout = {
+                    let buffer = buffer.clone();
+                    std::thread::spawn(move || {
+                        let mut buf = [0u8; 4096];
+                        let mut out = stdout;
+                        loop {
                             match out.read(&mut buf) {
-                                Ok(0) => { stdout = None; }
+                                Ok(0) => break,
                                 Ok(n) => {
-                                    had_data = true;
                                     if let Ok(text) = String::from_utf8(buf[..n].to_vec()) {
-                                        let mut buffer = buffer_clone.lock().unwrap();
+                                        let mut buffer = buffer.lock().unwrap();
                                         buffer.push_str(&text);
                                         let len = buffer.len();
                                         if len > TERMINAL_BUFFER_MAX {
@@ -227,17 +226,23 @@ impl TerminalState {
                                         }
                                     }
                                 }
-                                Err(_) => { stdout = None; }
+                                Err(_) => break,
                             }
                         }
+                    })
+                };
 
-                        if let Some(ref mut err) = stderr {
+                let reader_stderr = {
+                    let buffer = buffer.clone();
+                    std::thread::spawn(move || {
+                        let mut buf = [0u8; 4096];
+                        let mut err = stderr;
+                        loop {
                             match err.read(&mut buf) {
-                                Ok(0) => { stderr = None; }
+                                Ok(0) => break,
                                 Ok(n) => {
-                                    had_data = true;
                                     if let Ok(text) = String::from_utf8(buf[..n].to_vec()) {
-                                        let mut buffer = buffer_clone.lock().unwrap();
+                                        let mut buffer = buffer.lock().unwrap();
                                         buffer.push_str(&text);
                                         let len = buffer.len();
                                         if len > TERMINAL_BUFFER_MAX {
@@ -246,24 +251,17 @@ impl TerminalState {
                                         }
                                     }
                                 }
-                                Err(_) => { stderr = None; }
+                                Err(_) => break,
                             }
                         }
-
-                        if stdout.is_none() && stderr.is_none() {
-                            break;
-                        }
-
-                        if !had_data {
-                            std::thread::sleep(std::time::Duration::from_millis(10));
-                        }
-                    }
-                });
+                    })
+                };
 
                 self.buffer = buffer;
                 self.stdin_tx = Some(stdin_tx);
                 self.child = Some(child);
-                self.reader_handle = Some(reader_handle);
+                self.reader_stdout = Some(reader_stdout);
+                self.reader_stderr = Some(reader_stderr);
                 self.stdin_writer = Some(stdin_writer);
                 self.visible = true;
                 self.command = command.to_string();
@@ -303,7 +301,10 @@ impl TerminalState {
         if let Some(handle) = self.stdin_writer.take() {
             let _ = handle.join();
         }
-        if let Some(handle) = self.reader_handle.take() {
+        if let Some(handle) = self.reader_stdout.take() {
+            let _ = handle.join();
+        }
+        if let Some(handle) = self.reader_stderr.take() {
             let _ = handle.join();
         }
         self.visible = false;
@@ -389,15 +390,23 @@ pub struct App {
     pub cached_streaming_thinking_len: usize,
     pub cached_width: u16,
     pub terminal_height: u16,
+    pub output_width: u16,
     pub session_id: String,
     pub session_name: String,
     pub terminal_state: TerminalState,
+    pub justify: bool,
+    pub settings_justify: bool,
+    pub selection_start: Option<usize>,
+    pub selection_end: Option<usize>,
+    pub selecting: bool,
+    pub primary_selection: crate::primary_selection::PrimarySelection,
 }
 
 impl App {
     pub fn new(cfg: Config) -> Self {
         let textarea = TextArea::default();
         let clipboard = Clipboard::new().ok();
+        rotate_log_file(&cfg.logfile);
         let mut app = App {
             messages: vec![ChatMessage::App(
                 "Welcome to Rustama. Start typing your message.".to_string(),
@@ -476,19 +485,27 @@ impl App {
             cached_streaming_thinking_len: 0,
             cached_width: 0,
             terminal_height: 24,
+            output_width: 0,
             session_id: format!("{:016x}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos() & 0xffff_ffff_ffff_ffff),
             session_name: String::new(),
             terminal_state: TerminalState {
                 width_pct: cfg.terminal_width_pct,
                 ..TerminalState::new()
             },
+            justify: cfg.justify,
+            settings_justify: cfg.justify,
+            selection_start: None,
+            selection_end: None,
+            selecting: false,
+            primary_selection: crate::primary_selection::PrimarySelection::new(),
         };
         app.session_name = app.session_id.clone();
+        log_to_file(app.is_logging, &app.log_file, &app.session_id, "START", "Program started");
         app.fetch_models_async();
         app
     }
 
-    pub fn handle_key(&mut self, key: KeyEvent) {
+    pub fn handle_global_key(&mut self, key: KeyEvent) {
         if key.kind != KeyEventKind::Press {
             return;
         }
@@ -502,12 +519,14 @@ impl App {
                 self.show_quit_confirm = true;
                 return;
             }
-            KeyCode::Char('t')
-                if key.modifiers.contains(KeyModifiers::CONTROL)
-                    && !key.modifiers.contains(KeyModifiers::SHIFT) =>
+            KeyCode::Char('t' | 'T')
+                if key.modifiers.contains(KeyModifiers::CONTROL) =>
             {
                 if self.terminal_state.is_running() {
                     self.terminal_state.visible = !self.terminal_state.visible;
+                } else {
+                    let result = self.terminal_state.open("bash");
+                    self.status_message = result;
                 }
                 return;
             }
@@ -515,6 +534,9 @@ impl App {
                 if key.modifiers.contains(KeyModifiers::CONTROL)
                     && key.modifiers.contains(KeyModifiers::SHIFT) =>
             {
+                if !self.terminal_state.is_running() {
+                    self.terminal_state.open("bash");
+                }
                 if self.terminal_state.width_pct > 20 {
                     self.terminal_state.width_pct -= 5;
                     self.status_message = format!("Terminal width: {}%", self.terminal_state.width_pct);
@@ -525,6 +547,9 @@ impl App {
                 if key.modifiers.contains(KeyModifiers::CONTROL)
                     && key.modifiers.contains(KeyModifiers::SHIFT) =>
             {
+                if !self.terminal_state.is_running() {
+                    self.terminal_state.open("bash");
+                }
                 if self.terminal_state.width_pct < 80 {
                     self.terminal_state.width_pct += 5;
                     self.status_message = format!("Terminal width: {}%", self.terminal_state.width_pct);
@@ -563,13 +588,13 @@ impl App {
             return;
         }
         match self.input_mode {
-            InputMode::Normal => self.handle_normal_key(key),
+            InputMode::Normal => self.handle_output_key(key),
             InputMode::Input => self.handle_input_key(key),
             InputMode::Menu => self.handle_menu_key(key),
         }
     }
 
-    fn handle_normal_key(&mut self, key: KeyEvent) {
+    fn handle_output_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Tab => self.open_menu(),
             KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -581,6 +606,20 @@ impl App {
             KeyCode::PageDown => self.page_down(),
             KeyCode::Home => self.home(),
             KeyCode::End => self.end(),
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(text) = self.selected_text() {
+                    if let Some(ref mut cb) = self.clipboard {
+                        match cb.set_text(text.trim_end().to_string()) {
+                            Ok(_) => self.status_message = "Copied selection to clipboard".to_string(),
+                            Err(e) => self.status_message = format!("Clipboard write: {}", e),
+                        }
+                    } else {
+                        self.status_message = "No clipboard available".to_string();
+                    }
+                } else {
+                    self.status_message = "Nothing selected".to_string();
+                }
+            }
             KeyCode::Char(c) => {
                 self.input_mode = InputMode::Input;
                 self.focus = Focus::Input;
@@ -739,10 +778,26 @@ impl App {
                     "Agentic mode: OFF".to_string()
                 };
             }
+            MenuAction::ToggleTerminal => {
+                if self.terminal_state.is_running() {
+                    if self.terminal_state.visible {
+                        self.terminal_state.visible = false;
+                        self.status_message = "Terminal hidden".to_string();
+                    } else {
+                        self.terminal_state.visible = true;
+                        self.status_message = "Terminal shown".to_string();
+                    }
+                } else {
+                    let result = self.terminal_state.open("bash");
+                    self.status_message = result;
+                }
+            }
             MenuAction::OpenSettingsDialog => self.open_settings_dialog(),
             MenuAction::ShowAbout => self.show_about = true,
         }
-        self.input_mode = InputMode::Normal;
+        if !matches!(action, MenuAction::None) {
+            self.input_mode = InputMode::Normal;
+        }
     }
 
     fn execute_terminal_tool(&mut self, name: &str, args_json: &str) -> Option<String> {
@@ -753,11 +808,19 @@ impl App {
                 Some(self.terminal_state.open(command))
             }
             "terminal_send" => {
+                if !self.terminal_state.is_running() {
+                    self.terminal_state.open("bash");
+                }
                 let args: serde_json::Value = serde_json::from_str(args_json).unwrap_or(serde_json::json!({}));
                 let input = args["input"].as_str().unwrap_or("");
                 Some(self.terminal_state.send_input(input))
             }
-            "terminal_read" => Some(self.terminal_state.read_buffer()),
+            "terminal_read" => {
+                if !self.terminal_state.is_running() {
+                    self.terminal_state.open("bash");
+                }
+                Some(self.terminal_state.read_buffer())
+            }
             "terminal_close" => Some(self.terminal_state.close()),
             _ => None,
         }
@@ -814,6 +877,23 @@ impl App {
                         if !self.streaming_text.is_empty() {
                             self.streaming_text.push('\n');
                         }
+                        self.streaming_text.push_str(&msg);
+                        self.streaming_text.push('\n');
+                        self.auto_scroll = true;
+                    }
+                    Ok(StreamChunk::StatusTick(msg)) => {
+                        self.status_message = msg.clone();
+                        let trim_len = self.streaming_text.trim_end_matches('\n').len();
+                        let prefix = if trim_len > 0 {
+                            if let Some(pos) = self.streaming_text[..trim_len].rfind('\n') {
+                                pos + 1
+                            } else {
+                                0
+                            }
+                        } else {
+                            0
+                        };
+                        self.streaming_text.truncate(prefix);
                         self.streaming_text.push_str(&msg);
                         self.streaming_text.push('\n');
                         self.auto_scroll = true;
@@ -1050,10 +1130,15 @@ impl App {
                     }));
                 }
                 ChatMessage::ToolCall { name, arguments, tool_call_id } => {
+                    let args_value: serde_json::Value = if is_cloud {
+                        serde_json::json!(arguments)
+                    } else {
+                        serde_json::from_str(arguments).unwrap_or(serde_json::json!({}))
+                    };
                     let mut tc = serde_json::json!({
                         "function": {
                             "name": name,
-                            "arguments": arguments
+                            "arguments": args_value
                         }
                     });
                     if is_cloud {
@@ -1269,6 +1354,8 @@ impl App {
                                                             }
                                                             if let Some(args) = tc["function"]["arguments"].as_str() {
                                                                 entry["function"]["arguments"] = serde_json::json!(args);
+                                                            } else {
+                                                                entry["function"]["arguments"] = serde_json::json!(tc["function"]["arguments"].to_string());
                                                             }
                                                         }
                                                     }
@@ -1316,7 +1403,9 @@ impl App {
         self.textarea = TextArea::default();
 
         if let Some(result) = self.handle_slash_command(&prompt) {
-            self.messages.push(ChatMessage::App(result));
+            if !result.is_empty() {
+                self.messages.push(ChatMessage::App(result));
+            }
             self.set_auto_scroll();
             return;
         }
@@ -1373,10 +1462,15 @@ impl App {
                     }));
                 }
                 ChatMessage::ToolCall { name, arguments, tool_call_id } => {
+                    let args_value: serde_json::Value = if is_cloud {
+                        serde_json::json!(arguments)
+                    } else {
+                        serde_json::from_str(arguments).unwrap_or(serde_json::json!({}))
+                    };
                     let mut tc = serde_json::json!({
                         "function": {
                             "name": name,
-                            "arguments": arguments
+                            "arguments": args_value
                         }
                     });
                     if is_cloud {
@@ -1595,6 +1689,8 @@ impl App {
                                                             }
                                                             if let Some(args) = tc["function"]["arguments"].as_str() {
                                                                 entry["function"]["arguments"] = serde_json::json!(args);
+                                                            } else {
+                                                                entry["function"]["arguments"] = serde_json::json!(tc["function"]["arguments"].to_string());
                                                             }
                                                         }
                                                     }
@@ -2144,6 +2240,7 @@ impl App {
             return;
         }
 
+        let scrollbar_col = self.output_width.saturating_sub(1);
         let input_start = height.saturating_sub(6);
         let input_bottom = height.saturating_sub(2);
         if row >= input_start && row <= input_bottom {
@@ -2154,14 +2251,73 @@ impl App {
             self.input_mode = InputMode::Input;
             self.focus = Focus::Input;
         } else if row > 0 && row < input_start {
-            if col == width.saturating_sub(1) {
+            if col == scrollbar_col {
                 self.scrollbar_dragging = true;
                 self.scrollbar_click_to(row, input_start);
             } else {
                 self.focus = Focus::Output;
                 self.input_mode = InputMode::Normal;
+                self.auto_scroll = false;
+                if let Some(idx) = self.output_line_at_row(row) {
+                    self.selection_start = Some(idx);
+                    self.selection_end = Some(idx);
+                    self.selecting = true;
+                }
             }
         }
+    }
+
+    fn output_line_at_row(&self, row: u16) -> Option<usize> {
+        if row < 2 {
+            return None;
+        }
+        let idx = self.scroll_offset as usize + (row - 2) as usize;
+        if idx < self.cached_wrapped.len() {
+            Some(idx)
+        } else {
+            None
+        }
+    }
+
+    pub fn handle_mouse_drag(&mut self, row: u16, input_start: u16) {
+        if self.selecting {
+            self.auto_scroll = false;
+            if let Some(idx) = self.output_line_at_row(row) {
+                self.selection_end = Some(idx);
+            }
+        } else {
+            self.scrollbar_drag_to(row, input_start);
+        }
+    }
+
+    pub fn handle_mouse_up(&mut self) {
+        if self.selecting {
+            self.selecting = false;
+            if let Some(text) = self.selected_text() {
+                if !text.trim().is_empty() {
+                    self.primary_selection.set_text(text.clone());
+                    let count = self.selection_end.unwrap_or(0).saturating_sub(self.selection_start.unwrap_or(0)) + 1;
+                    self.status_message = format!("Selected {} line(s) copied to X selection", count);
+                }
+            }
+        }
+        self.scrollbar_drag_end();
+    }
+
+    fn selected_text(&self) -> Option<String> {
+        let start = self.selection_start?;
+        let end = self.selection_end?;
+        if start > end || start >= self.cached_wrapped.len() {
+            return None;
+        }
+        let end = end.min(self.cached_wrapped.len() - 1);
+        let mut out = String::new();
+        for line in &self.cached_wrapped[start..=end] {
+            let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+            out.push_str(text.trim_end());
+            out.push('\n');
+        }
+        Some(out)
     }
 
     fn scrollbar_click_to(&mut self, row: u16, input_start: u16) {
@@ -2173,8 +2329,14 @@ impl App {
         if output_height <= 0.0 || max_scroll <= 0.0 {
             return;
         }
-        let ratio = (row as f64 - 1.0) / output_height;
-        self.scroll_offset = (ratio * max_scroll).round() as u16;
+        if row <= 1 {
+            self.scroll_offset = self.scroll_offset.saturating_sub(1);
+        } else if row as f64 >= output_height {
+            self.scroll_offset = (self.scroll_offset + 1).min(max_scroll as u16);
+        } else {
+            let ratio = (row as f64 - 1.0) / output_height;
+            self.scroll_offset = (ratio * max_scroll).round() as u16;
+        }
     }
 
     pub fn scrollbar_drag_to(&mut self, row: u16, input_start: u16) {
@@ -2387,6 +2549,7 @@ impl App {
         self.settings_top_p = format!("{}", self.top_p);
         self.settings_top_k = format!("{}", self.top_k);
         self.settings_max_tool_rounds = self.max_tool_rounds.to_string();
+        self.settings_justify = self.justify;
     }
 
     fn handle_settings_dialog_key(&mut self, key: KeyEvent) {
@@ -2394,6 +2557,7 @@ impl App {
             self.settings_focus,
             SettingsFocus::Proxy | SettingsFocus::OllamaUrl | SettingsFocus::Temperature | SettingsFocus::TopP | SettingsFocus::TopK | SettingsFocus::MaxToolRounds
         );
+        let is_toggle = self.settings_focus == SettingsFocus::Justify;
 
         match key.code {
             KeyCode::Esc => {
@@ -2407,7 +2571,8 @@ impl App {
                     SettingsFocus::Temperature => SettingsFocus::TopP,
                     SettingsFocus::TopP => SettingsFocus::TopK,
                     SettingsFocus::TopK => SettingsFocus::MaxToolRounds,
-                    SettingsFocus::MaxToolRounds => SettingsFocus::Save,
+                    SettingsFocus::MaxToolRounds => SettingsFocus::Justify,
+                    SettingsFocus::Justify => SettingsFocus::Save,
                     SettingsFocus::Save => SettingsFocus::Cancel,
                     SettingsFocus::Cancel => SettingsFocus::Proxy,
                 };
@@ -2421,7 +2586,8 @@ impl App {
                     SettingsFocus::TopP => SettingsFocus::Temperature,
                     SettingsFocus::TopK => SettingsFocus::TopP,
                     SettingsFocus::MaxToolRounds => SettingsFocus::TopK,
-                    SettingsFocus::Save => SettingsFocus::MaxToolRounds,
+                    SettingsFocus::Justify => SettingsFocus::MaxToolRounds,
+                    SettingsFocus::Save => SettingsFocus::Justify,
                     SettingsFocus::Cancel => SettingsFocus::Save,
                 };
             }
@@ -2434,7 +2600,8 @@ impl App {
                     SettingsFocus::TopP => SettingsFocus::Temperature,
                     SettingsFocus::TopK => SettingsFocus::TopP,
                     SettingsFocus::MaxToolRounds => SettingsFocus::TopK,
-                    SettingsFocus::Save => SettingsFocus::MaxToolRounds,
+                    SettingsFocus::Justify => SettingsFocus::MaxToolRounds,
+                    SettingsFocus::Save => SettingsFocus::Justify,
                     SettingsFocus::Cancel => SettingsFocus::Save,
                 };
             }
@@ -2446,7 +2613,8 @@ impl App {
                     SettingsFocus::Temperature => SettingsFocus::TopP,
                     SettingsFocus::TopP => SettingsFocus::TopK,
                     SettingsFocus::TopK => SettingsFocus::MaxToolRounds,
-                    SettingsFocus::MaxToolRounds => SettingsFocus::Save,
+                    SettingsFocus::MaxToolRounds => SettingsFocus::Justify,
+                    SettingsFocus::Justify => SettingsFocus::Save,
                     SettingsFocus::Save => SettingsFocus::Cancel,
                     SettingsFocus::Cancel => SettingsFocus::Proxy,
                 };
@@ -2454,6 +2622,8 @@ impl App {
             KeyCode::Left => {
                 if is_text_field {
                     self.settings_cursor = self.settings_cursor.saturating_sub(1);
+                } else if is_toggle {
+                    self.settings_justify = !self.settings_justify;
                 } else if self.settings_focus == SettingsFocus::Save {
                     self.settings_focus = SettingsFocus::Cancel;
                 } else if self.settings_focus == SettingsFocus::Cancel {
@@ -2466,6 +2636,8 @@ impl App {
                     if self.settings_cursor < field.chars().count() {
                         self.settings_cursor += 1;
                     }
+                } else if is_toggle {
+                    self.settings_justify = !self.settings_justify;
                 } else if self.settings_focus == SettingsFocus::Save {
                     self.settings_focus = SettingsFocus::Cancel;
                 } else if self.settings_focus == SettingsFocus::Cancel {
@@ -2483,11 +2655,6 @@ impl App {
                     self.settings_cursor = field.chars().count();
                 }
             }
-            KeyCode::Enter => match self.settings_focus {
-                SettingsFocus::Save => self.confirm_settings(),
-                SettingsFocus::Cancel => self.show_settings_dialog = false,
-                _ => {}
-            },
             KeyCode::Char(c) if is_text_field => {
                 let cursor = self.settings_cursor;
                 let field = self.settings_field_mut();
@@ -2520,6 +2687,17 @@ impl App {
                         .nth(cursor)
                         .map_or(field.len(), |(i, _)| i);
                     field.remove(byte_idx);
+                }
+            }
+            KeyCode::Enter | KeyCode::Char(' ') if !is_text_field => {
+                if is_toggle {
+                    self.settings_justify = !self.settings_justify;
+                } else {
+                    match self.settings_focus {
+                        SettingsFocus::Save => self.confirm_settings(),
+                        SettingsFocus::Cancel => self.show_settings_dialog = false,
+                        _ => {}
+                    }
                 }
             }
             _ => {}
@@ -2578,6 +2756,7 @@ impl App {
                 self.max_tool_rounds = v;
             }
         }
+        self.justify = self.settings_justify;
         let _ = self.save_proxy_to_config();
         self.show_settings_dialog = false;
         self.status_message = "Settings saved".to_string();
@@ -2608,18 +2787,25 @@ impl App {
             (SettingsFocus::TopP, "Top-P:"),
             (SettingsFocus::TopK, "Top-K:"),
             (SettingsFocus::MaxToolRounds, "Max Rounds:"),
+            (SettingsFocus::Justify, "Justify:"),
         ];
 
         for (i, (focus, _label)) in fields.iter().enumerate() {
             let field_y = inner_y + i as u16 * 2;
             let max_w = inner_w.saturating_sub(16);
-            if row == field_y && col >= inner_x + 14 && col < inner_x + 14 + max_w + 2 {
-                self.settings_focus = focus.clone();
-                return;
+            if row == field_y {
+                if *focus == SettingsFocus::Justify {
+                    self.settings_focus = SettingsFocus::Justify;
+                    self.settings_justify = !self.settings_justify;
+                    return;
+                } else if col >= inner_x + 14 && col < inner_x + 14 + max_w + 2 {
+                    self.settings_focus = focus.clone();
+                    return;
+                }
             }
         }
 
-        let num_fields = 6u16;
+        let num_fields = 7u16;
         let btn_y = inner_y + num_fields * 2 + 1;
         let save_label = "Save";
         let cancel_label = "Cancel";
@@ -3089,9 +3275,13 @@ impl App {
                 }
                 _ => "Usage: /session save | /session rename <name> | /session load <name>".to_string(),
             }),
+            "justify" => {
+                self.justify = !self.justify;
+                Some(if self.justify { "Justify: ON" } else { "Justify: OFF" }.to_string())
+            }
             "quit" | "q" | "exit" => {
                 self.show_quit_confirm = true;
-                None
+                Some(String::new())
             }
             _ => Some(format!("Unknown command: /{}. Type /help for available commands.", cmd)),
         }
@@ -3117,6 +3307,7 @@ impl App {
             ("/session save", "Save current session"),
             ("/session rename <name>", "Rename current session"),
             ("/session load <name>", "Load a session by name"),
+            ("/justify", "Toggle paragraph justification"),
             ("/status", "Show app status"),
             ("/quit", "Exit the app"),
             ("/q", "Exit the app"),
@@ -3229,7 +3420,7 @@ impl App {
                 .join("rustama.conf")
         };
         format!(
-            "Config file: {}\n\n  ollama_url     = {}\n  model          = {}\n  save_path      = {}\n  agentic        = {}\n  max_rounds     = {}\n  timeout_secs   = {}\n  logging        = {}\n  logfile        = {}\n  temperature    = {}\n  top_p          = {}\n  top_k          = {}",
+            "Config file: {}\n\n  ollama_url     = {}\n  model          = {}\n  save_path      = {}\n  agentic        = {}\n  max_rounds     = {}\n  timeout_secs   = {}\n  logging        = {}\n  logfile        = {}\n  temperature    = {}\n  top_p          = {}\n  top_k          = {}\n  justify        = {}",
             conf_path.display(),
             self.ollama_url,
             self.model_name,
@@ -3242,6 +3433,7 @@ impl App {
             self.temperature,
             self.top_p,
             self.top_k,
+            self.justify,
         )
     }
 
@@ -3259,7 +3451,7 @@ impl App {
         let msg_count = self.messages.len();
         let tool_calls = self.tool_call_log.len();
         format!(
-            "Status:\n  Session ID:    {}\n  Session Name:  {}\n  Model:         {}\n  Messages:      {}\n  Logging:       {}\n  Log file:      {}\n  Agentic mode:  {}\n  Available:     {} model(s)\n  Tool calls:    {}\n  System prompt: {}\n  Temperature:   {}\n  Top_p:         {}\n  Top_k:         {}",
+            "Status:\n  Session ID:    {}\n  Session Name:  {}\n  Model:         {}\n  Messages:      {}\n  Logging:       {}\n  Log file:      {}\n  Agentic mode:  {}\n  Available:     {} model(s)\n  Tool calls:    {}\n  System prompt: {}\n  Temperature:   {}\n  Top_p:         {}\n  Top_k:         {}\n  Justify:       {}",
             self.session_id,
             self.session_name,
             self.model_name,
@@ -3273,6 +3465,7 @@ impl App {
             self.temperature,
             self.top_p,
             self.top_k,
+            if self.justify { "ON" } else { "OFF" },
         )
     }
 
@@ -3305,6 +3498,22 @@ impl App {
 
     fn log_event(&self, kind: &str, content: &str) {
         log_to_file(self.is_logging, &self.log_file, &self.session_id, kind, content);
+    }
+}
+
+fn rotate_log_file(log_file: &str) {
+    use std::fs;
+    let mut highest = 0;
+    while std::path::Path::new(&format!("{}.{}", log_file, highest + 1)).exists() {
+        highest += 1;
+    }
+    for i in (1..=highest).rev() {
+        let from = format!("{}.{}", log_file, i);
+        let to = format!("{}.{}", log_file, i + 1);
+        let _ = fs::rename(&from, &to);
+    }
+    if std::path::Path::new(log_file).exists() {
+        let _ = fs::rename(log_file, format!("{}.1", log_file));
     }
 }
 
@@ -3676,6 +3885,26 @@ fn build_blocking_client(proxy: &Option<String>) -> reqwest::blocking::Client {
     builder.build().unwrap_or_else(|_| reqwest::blocking::Client::new())
 }
 
+fn retry_countdown(
+    label: &str,
+    delay_secs: u64,
+    attempt: u32,
+    max_retries: u32,
+    tx: &mpsc::Sender<StreamChunk>,
+    is_logging: bool,
+    log_file: &str,
+    session_id: &str,
+) {
+    let header = format!("⚠ {}, retrying", label);
+    let _ = tx.send(StreamChunk::Status(format!("{} in {}s (attempt {}/{})", header, delay_secs, attempt + 1, max_retries)));
+    log_to_file(is_logging, log_file, session_id, "RETRY", &format!("{} in {}s", label, delay_secs));
+    for remaining in (1..delay_secs).rev() {
+        let _ = tx.send(StreamChunk::StatusTick(format!("{} in {}s (attempt {}/{})", header, remaining, attempt + 1, max_retries)));
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+    let _ = tx.send(StreamChunk::StatusTick(format!("{} now... (attempt {}/{})", header, attempt + 1, max_retries)));
+}
+
 async fn send_with_retry(
     client: &reqwest::Client,
     method: reqwest::Method,
@@ -3703,33 +3932,25 @@ async fn send_with_retry(
                     .get("retry-after")
                     .and_then(|v| v.to_str().ok())
                     .and_then(|s| s.parse::<u64>().ok())
-                    .unwrap_or_else(|| 2u64.pow(attempt) + 1);
-                let msg = format!("⚠ Rate limited (429), retrying in {}s (attempt {}/{})", delay_secs, attempt + 1, max_retries);
-                let _ = tx.send(StreamChunk::Status(msg.clone()));
-                log_to_file(is_logging, log_file, session_id, "RETRY", &msg);
+                    .unwrap_or_else(|| if attempt == 0 { 30 } else { 2u64.pow(attempt) + 1 });
+                let delay_secs = if attempt == 0 { delay_secs.min(30) } else { delay_secs.min(60) };
                 let _ = resp.text().await;
-                tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
+                retry_countdown("Rate limited (429)", delay_secs, attempt, max_retries, tx, is_logging, log_file, session_id);
                 continue;
             }
             Ok(resp) if resp.status().is_server_error() && attempt < max_retries => {
                 let status = resp.status();
-                let delay_secs = 2u64.pow(attempt) + 1;
-                let msg = format!("⚠ Server error ({}), retrying in {}s (attempt {}/{})", status, delay_secs, attempt + 1, max_retries);
-                let _ = tx.send(StreamChunk::Status(msg.clone()));
-                log_to_file(is_logging, log_file, session_id, "RETRY", &msg);
+                let delay_secs = if attempt == 0 { 30 } else { 2u64.pow(attempt) + 1 };
                 let _ = resp.text().await;
-                tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
+                retry_countdown(&format!("Server error ({})", status), delay_secs, attempt, max_retries, tx, is_logging, log_file, session_id);
                 continue;
             }
             Ok(resp) => return Ok(resp),
             Err(e) => {
                 last_err = Some(e);
                 if attempt < max_retries {
-                    let delay_secs = 2u64.pow(attempt) + 1;
-                    let msg = format!("⚠ Request error, retrying in {}s (attempt {}/{})", delay_secs, attempt + 1, max_retries);
-                    let _ = tx.send(StreamChunk::Status(msg.clone()));
-                    log_to_file(is_logging, log_file, session_id, "RETRY", &msg);
-                    tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
+                    let delay_secs = if attempt == 0 { 30 } else { 2u64.pow(attempt) + 1 };
+                    retry_countdown("Request error", delay_secs, attempt, max_retries, tx, is_logging, log_file, session_id);
                     continue;
                 }
             }

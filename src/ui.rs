@@ -627,6 +627,7 @@ pub enum ActiveMenu {
     None,
     File,
     Edit,
+    View,
     Help,
 }
 
@@ -639,6 +640,7 @@ pub enum MenuAction {
     Quit,
     OpenModelDialog,
     ToggleAgenticMode(bool),
+    ToggleTerminal,
     OpenSettingsDialog,
     ShowAbout,
 }
@@ -673,6 +675,7 @@ impl MainMenu {
         match self.active {
             ActiveMenu::File => vec!["Load", "Save", "Export...", "\u{2500}", "Exit"],
             ActiveMenu::Edit => vec!["Set Model", "Agentic Mode", "\u{2500}", "Settings..."],
+            ActiveMenu::View => vec!["Terminal"],
             ActiveMenu::Help => vec!["About"],
             ActiveMenu::None => vec![],
         }
@@ -692,7 +695,8 @@ impl MainMenu {
         match menu {
             ActiveMenu::File => 0,
             ActiveMenu::Edit => 7,
-            ActiveMenu::Help => 14,
+            ActiveMenu::View => 14,
+            ActiveMenu::Help => 21,
             ActiveMenu::None => 0,
         }
     }
@@ -701,6 +705,7 @@ impl MainMenu {
         match col {
             0..=6 => ActiveMenu::File,
             7..=13 => ActiveMenu::Edit,
+            14..=20 => ActiveMenu::View,
             _ => ActiveMenu::Help,
         }
     }
@@ -708,7 +713,8 @@ impl MainMenu {
     fn next_menu(menu: ActiveMenu) -> ActiveMenu {
         match menu {
             ActiveMenu::File => ActiveMenu::Edit,
-            ActiveMenu::Edit => ActiveMenu::Help,
+            ActiveMenu::Edit => ActiveMenu::View,
+            ActiveMenu::View => ActiveMenu::Help,
             ActiveMenu::Help => ActiveMenu::File,
             ActiveMenu::None => ActiveMenu::File,
         }
@@ -718,7 +724,8 @@ impl MainMenu {
         match menu {
             ActiveMenu::File => ActiveMenu::Help,
             ActiveMenu::Edit => ActiveMenu::File,
-            ActiveMenu::Help => ActiveMenu::Edit,
+            ActiveMenu::View => ActiveMenu::Edit,
+            ActiveMenu::Help => ActiveMenu::View,
             ActiveMenu::None => ActiveMenu::File,
         }
     }
@@ -732,6 +739,7 @@ impl MainMenu {
             (ActiveMenu::Edit, 0) => MenuAction::OpenModelDialog,
             (ActiveMenu::Edit, 1) => MenuAction::ToggleAgenticMode(true),
             (ActiveMenu::Edit, 3) => MenuAction::OpenSettingsDialog,
+            (ActiveMenu::View, 0) => MenuAction::ToggleTerminal,
             (ActiveMenu::Help, 0) => MenuAction::ShowAbout,
             _ => MenuAction::None,
         }
@@ -781,26 +789,31 @@ impl MainMenu {
     }
 
     fn prev_selectable(&self, current: usize) -> usize {
+        let max = self.max_items();
         let mut new = current;
-        while new > 0 {
+        loop {
+            if new == 0 {
+                new = max;
+            }
             new -= 1;
             if !self.is_separator(new) {
                 return new;
             }
         }
-        current
     }
 
     fn next_selectable(&self, current: usize) -> usize {
         let max = self.max_items();
         let mut new = current;
-        while new < max - 1 {
+        loop {
             new += 1;
+            if new >= max {
+                new = 0;
+            }
             if !self.is_separator(new) {
                 return new;
             }
         }
-        current
     }
 
     pub fn handle_click(&mut self, col: u16, row: u16) -> MenuAction {
@@ -857,6 +870,11 @@ impl MainMenu {
         } else {
             normal_style
         };
+        let view_style = if self.active == ActiveMenu::View {
+            selected_style
+        } else {
+            normal_style
+        };
         let help_style = if self.active == ActiveMenu::Help {
             selected_style
         } else {
@@ -878,12 +896,14 @@ impl MainMenu {
         let now = chrono::Local::now();
         let clock = format!("  {}  ", now.format("%H:%M"));
         let clock_len = clock.len() as u16;
-        let used = 6 + 1 + 6 + 1 + 5 + 1 + agentic_indicator.width() as u16;
+        let used = 6 + 1 + 6 + 1 + 6 + 1 + 5 + 1 + agentic_indicator.width() as u16;
         let pad = area.width.saturating_sub(used + clock_len);
         let menu_bar = Line::from(vec![
             Span::styled(" File ", file_style),
             Span::styled(" ", normal_style),
             Span::styled(" Edit ", edit_style),
+            Span::styled(" ", normal_style),
+            Span::styled(" View ", view_style),
             Span::styled(" ", normal_style),
             Span::styled(" Help ", help_style),
             agentic_indicator,

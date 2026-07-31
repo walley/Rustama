@@ -2298,6 +2298,7 @@ dependencies = [
  "syntect",
  "tokio",
  "urlencoding",
+ "x11rb",
 ]
 
 [[package]]

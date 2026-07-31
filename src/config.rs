@@ -18,6 +18,7 @@ pub struct Config {
     pub top_p: f64,
     pub top_k: u32,
     pub terminal_width_pct: u16,
+    pub justify: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -45,6 +46,7 @@ impl Default for Config {
             top_p: 0.9,
             top_k: 40,
             terminal_width_pct: 40,
+            justify: false,
         }
     }
 }
@@ -64,6 +66,7 @@ impl Config {
                     ("logging", if dflt.logging { "true".to_string() } else { "false".to_string() }),
                     ("logfile", dflt.logfile.clone()),
                     ("system_prompt", dflt.system_prompt.clone()),
+                    ("justify", if dflt.justify { "true".to_string() } else { "false".to_string() }),
                 ];
 
                 let mut updated = content.clone();
@@ -117,11 +120,13 @@ impl Config {
              temperature = {}\n\n\
              # Top-p sampling (0.0-1.0, default: 0.9)\n\
              top_p = {}\n\n\
-             # Top-k sampling (1-100, default: 40)\n\
-             top_k = {}\n",
+              # Top-k sampling (1-100, default: 40)\n\
+              top_k = {}\n\n\
+              # Justify paragraphs in output (true/false, default: false)\n\
+              justify = {}\n",
             self.ollama_url, self.model, self.save_path, self.agentic, self.timeout_secs,
             self.logging, self.logfile, self.system_prompt, self.max_tool_rounds,
-            self.temperature, self.top_p, self.top_k,
+            self.temperature, self.top_p, self.top_k, self.justify,
         )
     }
 
@@ -198,6 +203,9 @@ impl Config {
                 }
             }
         }
+        if let Some(v) = values.get("justify") {
+            cfg.justify = parse_bool(v);
+        }
 
         cfg
     }
@@ -259,6 +267,7 @@ impl Config {
         lines.push(format!("top_p = {}", self.top_p));
         lines.push(format!("top_k = {}", self.top_k));
         lines.push(format!("terminal_width_pct = {}", self.terminal_width_pct));
+        lines.push(format!("justify = {}", self.justify));
         fs::write(&conf_path, lines.join("\n")).map_err(|e| e.to_string())?;
         Ok(())
     }

@@ -16,6 +16,7 @@ use ratatui::widgets::*;
 
 mod app;
 mod config;
+mod primary_selection;
 mod ui;
 use app::{App, ChatMessage, FileDialogFocus, FileDialogMode, Focus, InputMode, ModelDialogFocus, SaveDialogFocus, SettingsFocus};
 use ui::{dialog_block, Button, FileActionDialog, Theme};
@@ -67,7 +68,7 @@ where
 
             match event::read()? {
                 Event::Key(key) => {
-                    app.handle_key(key);
+                    app.handle_global_key(key);
                 }
                 Event::Mouse(mouse) => match mouse.kind {
                     MouseEventKind::ScrollUp => app.scroll_up(),
@@ -77,12 +78,12 @@ where
                         app.handle_click(mouse.column, mouse.row, size.width, size.height);
                     }
                     MouseEventKind::Up(MouseButton::Left) => {
-                        app.scrollbar_drag_end();
+                        app.handle_mouse_up();
                     }
                     MouseEventKind::Drag(MouseButton::Left) => {
                         let size = terminal.size()?;
                         let input_start = size.height.saturating_sub(6);
-                        app.scrollbar_drag_to(mouse.row, input_start);
+                        app.handle_mouse_drag(mouse.row, input_start);
                     }
                     _ => {}
                 },
@@ -91,7 +92,7 @@ where
             while event::poll(Duration::ZERO)? {
                 match event::read()? {
                     Event::Key(key) => {
-                        app.handle_key(key);
+                        app.handle_global_key(key);
                     }
                     Event::Mouse(mouse) => match mouse.kind {
                         MouseEventKind::ScrollUp => app.scroll_up(),
@@ -101,12 +102,12 @@ where
                             app.handle_click(mouse.column, mouse.row, size.width, size.height);
                         }
                         MouseEventKind::Up(MouseButton::Left) => {
-                            app.scrollbar_drag_end();
+                            app.handle_mouse_up();
                         }
                         MouseEventKind::Drag(MouseButton::Left) => {
                             let size = terminal.size()?;
                             let input_start = size.height.saturating_sub(6);
-                            app.scrollbar_drag_to(mouse.row, input_start);
+                            app.handle_mouse_drag(mouse.row, input_start);
                         }
                         _ => {}
                     },
@@ -146,16 +147,18 @@ fn ui(f: &mut Frame, app: &mut App) {
         ])
         .split(main_chunks[1]);
 
-        let left_chunks =
-            Layout::vertical([Constraint::Min(3), Constraint::Length(5)]).split(content_chunks[0]);
+            let left_chunks =
+                Layout::vertical([Constraint::Min(3), Constraint::Length(5)]).split(content_chunks[0]);
 
-        render_output(f, app, left_chunks[0]);
-        render_input(f, app, left_chunks[1]);
-        render_terminal_panel(f, app, content_chunks[1]);
+            app.output_width = left_chunks[0].width;
+            render_output(f, app, left_chunks[0]);
+            render_input(f, app, left_chunks[1]);
+            render_terminal_panel(f, app, content_chunks[1]);
     } else {
         let content_chunks =
             Layout::vertical([Constraint::Min(3), Constraint::Length(5)]).split(main_chunks[1]);
 
+        app.output_width = content_chunks[0].width;
         render_output(f, app, content_chunks[0]);
         render_input(f, app, content_chunks[1]);
     }
@@ -397,7 +400,7 @@ fn render_output(f: &mut Frame, app: &mut App, area: Rect) {
         }
         app.cached_streaming_len = streaming_len;
         app.cached_streaming_thinking_len = streaming_thinking_len;
-        app.cached_wrapped = wrap_and_justify_lines(&lines, output_width);
+        app.cached_wrapped = wrap_and_justify_lines(&lines, output_width, app.justify);
     }
 
     let lines = &app.cached_wrapped;
@@ -412,6 +415,39 @@ fn render_output(f: &mut Frame, app: &mut App, area: Rect) {
         app.scroll_offset = scroll;
     }
     let scroll = app.scroll_offset;
+
+    let selected_lines: Vec<Line<'static>>;
+    let render_lines: &[Line<'static>] = if let (Some(s), Some(e)) = (app.selection_start, app.selection_end) {
+        if !app.cached_wrapped.is_empty() {
+            let s = s.min(app.cached_wrapped.len() - 1);
+            let e = e.min(app.cached_wrapped.len() - 1);
+            if s <= e {
+                selected_lines = app
+                    .cached_wrapped
+                    .iter()
+                    .enumerate()
+                    .map(|(i, l)| {
+                        if i >= s && i <= e {
+                            let mut hl = l.clone();
+                            for span in &mut hl.spans {
+                                span.style = span.style.add_modifier(Modifier::REVERSED);
+                            }
+                            hl
+                        } else {
+                            l.clone()
+                        }
+                    })
+                    .collect();
+                &selected_lines
+            } else {
+                lines
+            }
+        } else {
+            lines
+        }
+    } else {
+        lines
+    };
 
     let focus_style = if app.focus == Focus::Output {
         Style::default().fg(Color::Cyan)
@@ -480,7 +516,7 @@ fn render_output(f: &mut Frame, app: &mut App, area: Rect) {
         .title_bottom(bottom_title)
         .border_style(focus_style);
 
-    let paragraph = Paragraph::new(lines.as_slice()).block(block).scroll((scroll, 0));
+    let paragraph = Paragraph::new(render_lines).block(block).scroll((scroll, 0));
 
     let content_area = Rect {
         x: area.x,
@@ -1171,16 +1207,17 @@ fn render_settings_dialog(f: &mut Frame, app: &App, area: Rect) {
 
     let inner = popup_area.inner(Margin::new(2, 1));
 
-    let fields = [
-        ("Proxy URL:", &app.settings_proxy, SettingsFocus::Proxy),
-        ("Ollama URL:", &app.settings_ollama_url, SettingsFocus::OllamaUrl),
-        ("Temperature:", &app.settings_temperature, SettingsFocus::Temperature),
-        ("Top-P:", &app.settings_top_p, SettingsFocus::TopP),
-        ("Top-K:", &app.settings_top_k, SettingsFocus::TopK),
-        ("Max Rounds:", &app.settings_max_tool_rounds, SettingsFocus::MaxToolRounds),
+    let field_labels = [
+        ("Proxy URL:", SettingsFocus::Proxy),
+        ("Ollama URL:", SettingsFocus::OllamaUrl),
+        ("Temperature:", SettingsFocus::Temperature),
+        ("Top-P:", SettingsFocus::TopP),
+        ("Top-K:", SettingsFocus::TopK),
+        ("Max Rounds:", SettingsFocus::MaxToolRounds),
+        ("Justify:", SettingsFocus::Justify),
     ];
 
-    for (i, (label, value, focus)) in fields.iter().enumerate() {
+    for (i, (label, focus)) in field_labels.iter().enumerate() {
         let field_y = inner.y + i as u16 * 2;
 
         let label_style = if *focus == app.settings_focus {
@@ -1201,38 +1238,69 @@ fn render_settings_dialog(f: &mut Frame, app: &App, area: Rect) {
         };
         f.render_widget(label_para, label_area);
 
-        let value_style = if *focus == app.settings_focus {
-            Style::default().fg(Color::Black).bg(Color::White)
+        if *focus == SettingsFocus::Justify {
+            let checked = app.settings_justify;
+            let toggle_text = if checked { "[X]" } else { "[ ]" };
+            let toggle_style = if *focus == app.settings_focus {
+                Style::default().fg(Color::Black).bg(Color::White)
+            } else {
+                Style::default().fg(Color::White).bg(Color::Rgb(40, 40, 40))
+            };
+            let toggle_para = Paragraph::new(Line::from(Span::styled(
+                format!(" {:<5} ", toggle_text),
+                toggle_style,
+            )));
+            let toggle_area = Rect {
+                x: inner.x + 14,
+                y: field_y,
+                width: 7,
+                height: 1,
+            };
+            f.render_widget(toggle_para, toggle_area);
         } else {
-            Style::default().fg(Color::White).bg(Color::Rgb(40, 40, 40))
-        };
+            let value = match *focus {
+                SettingsFocus::Proxy => &app.settings_proxy,
+                SettingsFocus::OllamaUrl => &app.settings_ollama_url,
+                SettingsFocus::Temperature => &app.settings_temperature,
+                SettingsFocus::TopP => &app.settings_top_p,
+                SettingsFocus::TopK => &app.settings_top_k,
+                SettingsFocus::MaxToolRounds => &app.settings_max_tool_rounds,
+                _ => "",
+            };
 
-        let max_w = inner.width.saturating_sub(16);
-        let display_val = if value.len() > max_w as usize {
-            format!("{}...", &value[..(max_w as usize - 3)])
-        } else {
-            value.to_string()
-        };
+            let value_style = if *focus == app.settings_focus {
+                Style::default().fg(Color::Black).bg(Color::White)
+            } else {
+                Style::default().fg(Color::White).bg(Color::Rgb(40, 40, 40))
+            };
 
-        let value_para = Paragraph::new(Line::from(Span::styled(
-            format!(" {:<width$} ", display_val, width = max_w.saturating_sub(1) as usize),
-            value_style,
-        )));
-        let value_area = Rect {
-            x: inner.x + 14,
-            y: field_y,
-            width: max_w + 2,
-            height: 1,
-        };
-        f.render_widget(value_para, value_area);
+            let max_w = inner.width.saturating_sub(16);
+            let display_val = if value.len() > max_w as usize {
+                format!("{}...", &value[..(max_w as usize - 3)])
+            } else {
+                value.to_string()
+            };
 
-        if *focus == app.settings_focus {
-            let cursor_x = value_area.x + 1 + app.settings_cursor as u16;
-            f.set_cursor_position(Position::new(cursor_x, field_y));
+            let value_para = Paragraph::new(Line::from(Span::styled(
+                format!(" {:<width$} ", display_val, width = max_w.saturating_sub(1) as usize),
+                value_style,
+            )));
+            let value_area = Rect {
+                x: inner.x + 14,
+                y: field_y,
+                width: max_w + 2,
+                height: 1,
+            };
+            f.render_widget(value_para, value_area);
+
+            if *focus == app.settings_focus {
+                let cursor_x = value_area.x + 1 + app.settings_cursor as u16;
+                f.set_cursor_position(Position::new(cursor_x, field_y));
+            }
         }
     }
 
-    let num_fields = 6u16;
+    let num_fields = 7u16;
     let btn_y = inner.y + num_fields * 2 + 1;
     let save_label = "Save";
     let cancel_label = "Cancel";
@@ -1582,7 +1650,7 @@ fn span_display_width(span: &Span) -> usize {
     span.content.chars().count()
 }
 
-fn wrap_and_justify_lines(lines: &[Line<'static>], width: usize) -> Vec<Line<'static>> {
+fn wrap_and_justify_lines(lines: &[Line<'static>], width: usize, justify: bool) -> Vec<Line<'static>> {
     let mut result = Vec::new();
     let mut para: Vec<Line<'static>> = Vec::new();
 
@@ -1592,7 +1660,11 @@ fn wrap_and_justify_lines(lines: &[Line<'static>], width: usize) -> Vec<Line<'st
         let is_table = line.spans.iter().any(|s| s.content.contains('│') || s.content.contains('┌') || s.content.contains('└') || s.content.contains('├') || s.content.contains('┬') || s.content.contains('┴') || s.content.contains('┼'));
         if w == 0 || is_code || is_table {
             if !para.is_empty() {
-                justify_paragraph_into(&mut result, &para, width);
+                if justify {
+                    justify_paragraph_into(&mut result, &para, width);
+                } else {
+                    result.extend(para.drain(..));
+                }
                 para.clear();
             }
             result.push(line.clone());
@@ -1603,7 +1675,11 @@ fn wrap_and_justify_lines(lines: &[Line<'static>], width: usize) -> Vec<Line<'st
         }
     }
     if !para.is_empty() {
-        justify_paragraph_into(&mut result, &para, width);
+        if justify {
+            justify_paragraph_into(&mut result, &para, width);
+        } else {
+            result.extend(para);
+        }
     }
     result
 }
