@@ -152,6 +152,41 @@ pub struct TerminalState {
     pub command: String,
 }
 
+/// Shell reserved words / builtins that must not be prefixed with `stdbuf`.
+const SHELL_KEYWORDS: &[&str] = &[
+    "if", "then", "elif", "else", "fi", "for", "while", "until", "do", "done", "case", "esac",
+    "in", "function", "select", "time", "coproc", "!", "{", "}", "(", ")", "[[", "]]",
+    "cd", "echo", "export", "pwd", "set", "unset", "shift", "read", "printf", "return",
+    "exit", "eval", "exec", "source", "alias", "unalias", "declare", "typeset", "local",
+    "readonly", "trap", "wait", "jobs", "bg", "fg", "kill", "history", "let", "pushd",
+    "popd", "dirs", "umask", "ulimit", "test", "true", "false", "break", "continue",
+];
+
+/// Line-buffers the spawned command's output so long-running scripts (builds,
+/// python/node -c, ...) show output promptly even without a pty.
+///
+/// Verified: `PYTHONUNBUFFERED=1` fixes python; `stdbuf -oL -eL` fixes any
+/// program (line buffering via LD_PRELOAD). Together they handle script and
+/// progress output.
+///
+/// FIXME: interactive REPLs (python3 -q, node, ...) cannot work through pipes
+/// at all — they buffer piped stdin until EOF regardless of stdbuf/-u. Full
+/// PTY support (e.g. the `portable-pty` crate) is required for that, and for
+/// readline programs, top, less, ssh, ... . Should eventually replace this
+/// pipe-based TerminalState implementation.
+fn terminal_command(command: &str) -> String {
+    let first = command.split_whitespace().next().unwrap_or("");
+    let simple = !first.is_empty()
+        && !SHELL_KEYWORDS.contains(&first)
+        && !command.contains([';', '&', '|', '<', '>', '$', '`', '\'', '"', '\n'])
+        && !command.starts_with(['{', '(', '!']);
+    if simple {
+        format!("stdbuf -oL -eL {}", command)
+    } else {
+        command.to_string()
+    }
+}
+
 impl TerminalState {
     pub fn new() -> Self {
         TerminalState {
@@ -184,9 +219,11 @@ impl TerminalState {
         let (stdin_tx, stdin_rx) = std::sync::mpsc::channel::<String>();
         let buffer = Arc::new(Mutex::new(String::new()));
 
+        let wrapped = terminal_command(command);
         match std::process::Command::new("sh")
             .arg("-c")
-            .arg(command)
+            .arg(&wrapped)
+            .env("PYTHONUNBUFFERED", "1")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .stdin(Stdio::piped())
@@ -4266,4 +4303,26 @@ fn parse_text_tool_calls(text: &str) -> Vec<serde_json::Value> {
     }
 
     tool_calls
+}
+#[cfg(test)]
+mod tests {
+    use super::terminal_command;
+
+    #[test]
+    fn wraps_simple_command() {
+        assert_eq!(terminal_command("python3 -q"), "stdbuf -oL -eL python3 -q");
+        assert_eq!(terminal_command("ls -la"), "stdbuf -oL -eL ls -la");
+        assert_eq!(terminal_command("cmake --build ."), "stdbuf -oL -eL cmake --build .");
+    }
+
+    #[test]
+    fn leaves_shell_composites_alone() {
+        assert_eq!(terminal_command("cd /tmp && make"), "cd /tmp && make");
+        assert_eq!(terminal_command("echo hi"), "echo hi");
+        assert_eq!(terminal_command("for i in 1 2; do echo $i; done"), "for i in 1 2; do echo $i; done");
+        assert_eq!(terminal_command("ls | grep foo"), "ls | grep foo");
+        assert_eq!(terminal_command("cat < file"), "cat < file");
+        assert_eq!(terminal_command("FOO=1 bar"), "stdbuf -oL -eL FOO=1 bar");
+        assert_eq!(terminal_command(""), "");
+    }
 }
