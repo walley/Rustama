@@ -856,6 +856,7 @@ impl MainMenu {
         agentic_mode: bool,
         theme: &Theme,
         area: Rect,
+        status_message: &str,
     ) {
         let normal_style = Style::default().fg(Color::White).bg(Color::DarkGray);
         let selected_style = Style::default().fg(Color::Black).bg(Color::White);
@@ -896,9 +897,10 @@ impl MainMenu {
         let now = chrono::Local::now();
         let clock = format!("  {}  ", now.format("%H:%M"));
         let clock_len = clock.len() as u16;
-        let used = 6 + 1 + 6 + 1 + 6 + 1 + 5 + 1 + agentic_indicator.width() as u16;
+        let status_len = if status_message.is_empty() { 0 } else { status_message.len() as u16 + 3 };
+        let used = 6 + 1 + 6 + 1 + 6 + 1 + 5 + 1 + agentic_indicator.width() as u16 + status_len;
         let pad = area.width.saturating_sub(used + clock_len);
-        let menu_bar = Line::from(vec![
+        let mut menu_bar_spans = vec![
             Span::styled(" File ", file_style),
             Span::styled(" ", normal_style),
             Span::styled(" Edit ", edit_style),
@@ -907,12 +909,19 @@ impl MainMenu {
             Span::styled(" ", normal_style),
             Span::styled(" Help ", help_style),
             agentic_indicator,
-            Span::styled(" ".repeat(pad as usize), normal_style),
-            Span::styled(
-                clock,
-                Style::default().fg(Color::White).bg(Color::DarkGray),
-            ),
-        ]);
+        ];
+        if !status_message.is_empty() {
+            menu_bar_spans.push(Span::styled(
+                format!(" {} ", status_message),
+                Style::default().fg(Color::Yellow).bg(Color::DarkGray).add_modifier(Modifier::BOLD),
+            ));
+        }
+        menu_bar_spans.push(Span::styled(" ".repeat(pad as usize), normal_style));
+        menu_bar_spans.push(Span::styled(
+            clock,
+            Style::default().fg(Color::White).bg(Color::DarkGray),
+        ));
+        let menu_bar = Line::from(menu_bar_spans);
 
         f.render_widget(Paragraph::new(menu_bar).style(normal_style), area);
     }
@@ -974,5 +983,85 @@ impl MainMenu {
 
         f.render_widget(Clear, popup_area);
         f.render_widget(list, popup_area);
+    }
+}
+
+pub struct MessageBox {
+    pub title: String,
+    pub message: String,
+}
+
+impl MessageBox {
+    pub fn new(title: &str, message: &str) -> Self {
+        MessageBox {
+            title: title.to_string(),
+            message: message.to_string(),
+        }
+    }
+
+    pub fn render(&self, f: &mut Frame, area: Rect, focused: bool) {
+        let lines: Vec<&str> = self.message.lines().collect();
+        let msg_height = lines.len() as u16;
+        let dialog_w = 50.min(area.width.saturating_sub(4));
+        let dialog_h = 4 + msg_height;
+        let popup_area = Rect {
+            x: (area.width.saturating_sub(dialog_w)) / 2,
+            y: (area.height.saturating_sub(dialog_h)) / 2,
+            width: dialog_w,
+            height: dialog_h,
+        };
+
+        f.render_widget(Clear, popup_area);
+        f.render_widget(dialog_block(&self.title, &Theme::default()), popup_area);
+
+        let inner = popup_area.inner(Margin::new(2, 1));
+        for (i, line) in lines.iter().enumerate() {
+            let para = Paragraph::new(Line::from(Span::styled(
+                format!("  {}", line),
+                Style::default().fg(Color::White),
+            )));
+            let line_area = Rect {
+                x: inner.x,
+                y: inner.y + i as u16,
+                width: inner.width,
+                height: 1,
+            };
+            f.render_widget(para, line_area);
+        }
+
+        let btn_y = inner.y + msg_height + 1;
+        let btn_label = "OK";
+        let btn_w = btn_label.len() as u16 + 4;
+        let btn_x = inner.x + (inner.width.saturating_sub(btn_w)) / 2;
+        let ok_btn = Button::new(btn_label, btn_x, btn_y, focused, Color::Green, Color::Green);
+        let (display, style) = ok_btn.render();
+        let btn_para = Paragraph::new(Line::from(Span::styled(display, style)));
+        let btn_area = Rect {
+            x: btn_x,
+            y: btn_y,
+            width: btn_w,
+            height: 1,
+        };
+        f.render_widget(btn_para, btn_area);
+    }
+
+    pub fn hit_test(&self, col: u16, row: u16, area: Rect) -> bool {
+        let lines: Vec<&str> = self.message.lines().collect();
+        let msg_height = lines.len() as u16;
+        let dialog_w = 50.min(area.width.saturating_sub(4));
+        let dialog_h = 4 + msg_height;
+        let popup_area = Rect {
+            x: (area.width.saturating_sub(dialog_w)) / 2,
+            y: (area.height.saturating_sub(dialog_h)) / 2,
+            width: dialog_w,
+            height: dialog_h,
+        };
+        let inner = popup_area.inner(Margin::new(2, 1));
+        let btn_y = inner.y + msg_height + 1;
+        let btn_label = "OK";
+        let btn_w = btn_label.len() as u16 + 4;
+        let btn_x = inner.x + (inner.width.saturating_sub(btn_w)) / 2;
+        let ok_btn = Button::new(btn_label, btn_x, btn_y, true, Color::Green, Color::Green);
+        ok_btn.is_clicked(col, row)
     }
 }

@@ -69,6 +69,7 @@ pub enum SettingsFocus {
     TopP,
     TopK,
     MaxToolRounds,
+    MaxRetries,
     Justify,
     Save,
     Cancel,
@@ -133,6 +134,7 @@ pub enum StreamChunk {
     Thinking(String),
     Done(TokenStats),
     Error(String),
+    RetryPaused(String),
     Status(String),
     StatusTick(String),
     ToolCalls(Vec<serde_json::Value>),
@@ -366,6 +368,7 @@ pub struct App {
     pub show_about: bool,
     pub show_quit_confirm: bool,
     pub is_loading: bool,
+    pub retrying: bool,
     pub status_message: String,
     pub ollama_url: String,
     pub model_name: String,
@@ -387,6 +390,7 @@ pub struct App {
     pub file_dialog_mode: FileDialogMode,
     pub agentic_mode: bool,
     pub max_tool_rounds: usize,
+    pub max_retries: u32,
     pub tool_round_count: usize,
     pub tool_call_count: usize,
     pub pending_tool_calls: Vec<serde_json::Value>,
@@ -411,6 +415,7 @@ pub struct App {
     pub settings_top_p: String,
     pub settings_top_k: String,
     pub settings_max_tool_rounds: String,
+    pub settings_max_retries: String,
     pub settings_cursor: usize,
     pub proxy: Option<String>,
     pub is_logging: bool,
@@ -437,6 +442,8 @@ pub struct App {
     pub selection_end: Option<usize>,
     pub selecting: bool,
     pub primary_selection: crate::primary_selection::PrimarySelection,
+    pub show_retry_paused: bool,
+    pub retry_paused_message: String,
 }
 
 impl App {
@@ -461,6 +468,7 @@ impl App {
             show_about: false,
             show_quit_confirm: false,
             is_loading: false,
+            retrying: false,
             status_message: String::new(),
             ollama_url: cfg.ollama_url.clone(),
             model_name: cfg.model,
@@ -482,6 +490,7 @@ impl App {
             file_dialog_mode: FileDialogMode::AttachFile,
             agentic_mode: cfg.agentic,
             max_tool_rounds: cfg.max_tool_rounds,
+            max_retries: cfg.max_retries,
             tool_round_count: 0,
             tool_call_count: 0,
             pending_tool_calls: Vec::new(),
@@ -506,6 +515,7 @@ impl App {
             settings_top_p: "0.9".to_string(),
             settings_top_k: "40".to_string(),
             settings_max_tool_rounds: cfg.max_tool_rounds.to_string(),
+            settings_max_retries: cfg.max_retries.to_string(),
             settings_cursor: 0,
             proxy: cfg.proxy.clone(),
             is_logging: cfg.logging,
@@ -535,6 +545,8 @@ impl App {
             selection_end: None,
             selecting: false,
             primary_selection: crate::primary_selection::PrimarySelection::new(),
+            show_retry_paused: false,
+            retry_paused_message: String::new(),
         };
         app.session_name = app.session_id.clone();
         log_to_file(app.is_logging, &app.log_file, &app.session_id, "START", "Program started");
@@ -544,6 +556,16 @@ impl App {
 
     pub fn handle_global_key(&mut self, key: KeyEvent) {
         if key.kind != KeyEventKind::Press {
+            return;
+        }
+
+        if self.show_retry_paused {
+            match key.code {
+                KeyCode::Enter | KeyCode::Esc | KeyCode::Char(' ') => {
+                    self.show_retry_paused = false;
+                }
+                _ => {}
+            }
             return;
         }
 
@@ -903,18 +925,22 @@ impl App {
                 match rx.try_recv() {
                     Ok(StreamChunk::Text(text)) => {
                         self.streaming_text.push_str(&text);
+                        self.retrying = false;
                         self.auto_scroll = true;
                     }
                     Ok(StreamChunk::Thinking(text)) => {
                         self.streaming_thinking.push_str(&text);
+                        self.retrying = false;
                         self.auto_scroll = true;
                     }
                     Ok(StreamChunk::Status(msg)) => {
                         self.status_message = msg;
+                        self.retrying = false;
                         self.auto_scroll = true;
                     }
                     Ok(StreamChunk::StatusTick(msg)) => {
                         self.status_message = msg;
+                        self.retrying = true;
                         self.auto_scroll = true;
                     }
                     Ok(StreamChunk::ToolCalls(tool_calls)) => {
@@ -988,6 +1014,7 @@ impl App {
                         break;
                     }
                     Ok(StreamChunk::Done(stats)) => {
+                        self.retrying = false;
                         self.token_stats = stats;
                         if !self.streaming_thinking.is_empty() {
                             self.messages
@@ -1050,6 +1077,7 @@ impl App {
                         break;
                     }
                     Ok(StreamChunk::Error(msg)) => {
+                        self.retrying = false;
                         let had_content = !self.streaming_thinking.is_empty() || !self.streaming_text.is_empty();
                         if !self.streaming_thinking.is_empty() {
                             self.messages
@@ -1071,6 +1099,32 @@ impl App {
                         self.is_loading = false;
                         self.status_message.clear();
                         self.response_rx = None;
+                        self.set_auto_scroll();
+                        break;
+                    }
+                    Ok(StreamChunk::RetryPaused(msg)) => {
+                        self.retrying = false;
+                        let had_content = !self.streaming_thinking.is_empty() || !self.streaming_text.is_empty();
+                        if !self.streaming_thinking.is_empty() {
+                            self.messages
+                                .push(ChatMessage::Thinking(self.streaming_thinking.clone()));
+                            self.streaming_thinking.clear();
+                        }
+                        if !self.streaming_text.is_empty() {
+                            self.messages
+                                .push(ChatMessage::Assistant(self.streaming_text.clone()));
+                            self.streaming_text.clear();
+                        }
+                        if had_content {
+                            self.messages.push(ChatMessage::App(
+                                "⚠ Stream ended unexpectedly (partial response shown)".to_string(),
+                            ));
+                        }
+                        self.is_loading = false;
+                        self.status_message.clear();
+                        self.response_rx = None;
+                        self.show_retry_paused = true;
+                        self.retry_paused_message = msg;
                         self.set_auto_scroll();
                         break;
                     }
@@ -1198,6 +1252,7 @@ impl App {
         let top_p = self.top_p;
         let top_k = self.top_k;
         let proxy = if cloud_model.is_some() { self.proxy.clone() } else { None };
+        let max_retries = self.max_retries;
 
         self.log_event("PROMPT", &serde_json::to_string_pretty(&api_messages).unwrap_or_default());
 
@@ -1251,7 +1306,7 @@ impl App {
 
                 log_to_file(is_logging, &log_file, &session_id, "REQUEST", &format!("{} {}", api_url, serde_json::to_string(&body).unwrap_or_default()));
 
-                let result = send_with_retry(&client, reqwest::Method::POST, &api_url, headers, &body, 3, &tx, is_logging, &log_file, &session_id).await;
+                let result = send_with_retry(&client, reqwest::Method::POST, &api_url, headers, &body, max_retries, &tx, is_logging, &log_file, &session_id).await;
 
                 let is_cloud = cloud_model.is_some();
                 match result {
@@ -1261,7 +1316,11 @@ impl App {
                             let body = resp.text().await.unwrap_or_default();
                             let msg = format!("HTTP {}: {}", status, truncate(&body, 200));
                             log_to_file(is_logging, &log_file, &session_id, "HTTP_ERROR", &msg);
-                            let _ = tx.send(StreamChunk::Error(msg));
+                            if status.as_u16() == 429 {
+                                let _ = tx.send(StreamChunk::RetryPaused(format!("Max retries ({}) reached. Request paused.", max_retries)));
+                            } else {
+                                let _ = tx.send(StreamChunk::Error(msg));
+                            }
                             return;
                         }
                         let mut buffer = String::new();
@@ -1433,6 +1492,7 @@ impl App {
         self.tool_round_count = 0;
         self.tool_call_count = 0;
         self.is_loading = true;
+        self.retrying = false;
         self.streaming_text.clear();
         self.streaming_thinking.clear();
         self.status_message = "Streaming response...".to_string();
@@ -1531,6 +1591,7 @@ impl App {
         let top_p = self.top_p;
         let top_k = self.top_k;
         let proxy = if cloud_model.is_some() { self.proxy.clone() } else { None };
+        let max_retries = self.max_retries;
 
         self.log_event("PROMPT", &serde_json::to_string_pretty(&api_messages).unwrap_or_default());
 
@@ -1586,7 +1647,7 @@ impl App {
 
                 log_to_file(is_logging, &log_file, &session_id, "REQUEST", &format!("{} {}", api_url, serde_json::to_string(&body).unwrap_or_default()));
 
-                let result = send_with_retry(&client, reqwest::Method::POST, &api_url, headers, &body, 3, &tx, is_logging, &log_file, &session_id).await;
+                let result = send_with_retry(&client, reqwest::Method::POST, &api_url, headers, &body, max_retries, &tx, is_logging, &log_file, &session_id).await;
 
                 let is_cloud = cloud_model.is_some();
                 match result {
@@ -1596,7 +1657,11 @@ impl App {
                             let body = resp.text().await.unwrap_or_default();
                             let msg = format!("HTTP {}: {}", status, truncate(&body, 200));
                             log_to_file(is_logging, &log_file, &session_id, "HTTP_ERROR", &msg);
-                            let _ = tx.send(StreamChunk::Error(msg));
+                            if status.as_u16() == 429 {
+                                let _ = tx.send(StreamChunk::RetryPaused(format!("Max retries ({}) reached. Request paused.", max_retries)));
+                            } else {
+                                let _ = tx.send(StreamChunk::Error(msg));
+                            }
                             return;
                         }
                         let mut buffer = String::new();
@@ -1859,6 +1924,7 @@ impl App {
         cfg.system_prompt = self.system_prompt.clone();
         cfg.proxy = self.proxy.clone();
         cfg.max_tool_rounds = self.max_tool_rounds;
+        cfg.max_retries = self.max_retries;
         cfg.temperature = self.temperature;
         cfg.top_p = self.top_p;
         cfg.top_k = self.top_k;
@@ -2214,6 +2280,14 @@ impl App {
     }
 
     pub fn handle_click(&mut self, col: u16, row: u16, width: u16, height: u16) {
+        if self.show_retry_paused {
+            let area = Rect::new(0, 0, width, height);
+            let mb = crate::ui::MessageBox::new("Retry Paused", &self.retry_paused_message);
+            if mb.hit_test(col, row, area) {
+                self.show_retry_paused = false;
+            }
+            return;
+        }
         if self.show_save_dialog {
             self.handle_save_dialog_click(col, row, width, height);
             return;
@@ -2574,7 +2648,7 @@ impl App {
     fn handle_settings_dialog_key(&mut self, key: KeyEvent) {
         let is_text_field = matches!(
             self.settings_focus,
-            SettingsFocus::Proxy | SettingsFocus::OllamaUrl | SettingsFocus::Temperature | SettingsFocus::TopP | SettingsFocus::TopK | SettingsFocus::MaxToolRounds
+                    SettingsFocus::Proxy | SettingsFocus::OllamaUrl | SettingsFocus::Temperature | SettingsFocus::TopP | SettingsFocus::TopK | SettingsFocus::MaxToolRounds | SettingsFocus::MaxRetries
         );
         let is_toggle = self.settings_focus == SettingsFocus::Justify;
 
@@ -2590,7 +2664,8 @@ impl App {
                     SettingsFocus::Temperature => SettingsFocus::TopP,
                     SettingsFocus::TopP => SettingsFocus::TopK,
                     SettingsFocus::TopK => SettingsFocus::MaxToolRounds,
-                    SettingsFocus::MaxToolRounds => SettingsFocus::Justify,
+                    SettingsFocus::MaxToolRounds => SettingsFocus::MaxRetries,
+                    SettingsFocus::MaxRetries => SettingsFocus::Justify,
                     SettingsFocus::Justify => SettingsFocus::Save,
                     SettingsFocus::Save => SettingsFocus::Cancel,
                     SettingsFocus::Cancel => SettingsFocus::Proxy,
@@ -2605,7 +2680,8 @@ impl App {
                     SettingsFocus::TopP => SettingsFocus::Temperature,
                     SettingsFocus::TopK => SettingsFocus::TopP,
                     SettingsFocus::MaxToolRounds => SettingsFocus::TopK,
-                    SettingsFocus::Justify => SettingsFocus::MaxToolRounds,
+                    SettingsFocus::MaxRetries => SettingsFocus::MaxToolRounds,
+                    SettingsFocus::Justify => SettingsFocus::MaxRetries,
                     SettingsFocus::Save => SettingsFocus::Justify,
                     SettingsFocus::Cancel => SettingsFocus::Save,
                 };
@@ -2619,7 +2695,8 @@ impl App {
                     SettingsFocus::TopP => SettingsFocus::Temperature,
                     SettingsFocus::TopK => SettingsFocus::TopP,
                     SettingsFocus::MaxToolRounds => SettingsFocus::TopK,
-                    SettingsFocus::Justify => SettingsFocus::MaxToolRounds,
+                    SettingsFocus::MaxRetries => SettingsFocus::MaxToolRounds,
+                    SettingsFocus::Justify => SettingsFocus::MaxRetries,
                     SettingsFocus::Save => SettingsFocus::Justify,
                     SettingsFocus::Cancel => SettingsFocus::Save,
                 };
@@ -2632,7 +2709,8 @@ impl App {
                     SettingsFocus::Temperature => SettingsFocus::TopP,
                     SettingsFocus::TopP => SettingsFocus::TopK,
                     SettingsFocus::TopK => SettingsFocus::MaxToolRounds,
-                    SettingsFocus::MaxToolRounds => SettingsFocus::Justify,
+                    SettingsFocus::MaxToolRounds => SettingsFocus::MaxRetries,
+                    SettingsFocus::MaxRetries => SettingsFocus::Justify,
                     SettingsFocus::Justify => SettingsFocus::Save,
                     SettingsFocus::Save => SettingsFocus::Cancel,
                     SettingsFocus::Cancel => SettingsFocus::Proxy,
@@ -2731,6 +2809,7 @@ impl App {
             SettingsFocus::TopP => &self.settings_top_p,
             SettingsFocus::TopK => &self.settings_top_k,
             SettingsFocus::MaxToolRounds => &self.settings_max_tool_rounds,
+            SettingsFocus::MaxRetries => &self.settings_max_retries,
             _ => "",
         }
     }
@@ -2743,6 +2822,7 @@ impl App {
             SettingsFocus::TopP => &mut self.settings_top_p,
             SettingsFocus::TopK => &mut self.settings_top_k,
             SettingsFocus::MaxToolRounds => &mut self.settings_max_tool_rounds,
+            SettingsFocus::MaxRetries => &mut self.settings_max_retries,
             _ => unreachable!(),
         }
     }
@@ -2775,6 +2855,11 @@ impl App {
                 self.max_tool_rounds = v;
             }
         }
+        if let Ok(v) = self.settings_max_retries.trim().parse::<u32>() {
+            if v >= 1 && v <= 50 {
+                self.max_retries = v;
+            }
+        }
         self.justify = self.settings_justify;
         let _ = self.save_proxy_to_config();
         self.show_settings_dialog = false;
@@ -2783,7 +2868,7 @@ impl App {
 
     fn handle_settings_dialog_click(&mut self, col: u16, row: u16, width: u16, height: u16) {
         let dialog_w: u16 = 60;
-        let dialog_h: u16 = 20;
+        let dialog_h: u16 = 22;
         let dialog_x = (width.saturating_sub(dialog_w)) / 2;
         let dialog_y = (height.saturating_sub(dialog_h)) / 2;
         let inner_x = dialog_x + 2;
@@ -2806,6 +2891,7 @@ impl App {
             (SettingsFocus::TopP, "Top-P:"),
             (SettingsFocus::TopK, "Top-K:"),
             (SettingsFocus::MaxToolRounds, "Max Rounds:"),
+            (SettingsFocus::MaxRetries, "Max Retries:"),
             (SettingsFocus::Justify, "Justify:"),
         ];
 
@@ -2824,7 +2910,7 @@ impl App {
             }
         }
 
-        let num_fields = 7u16;
+        let num_fields = 8u16;
         let btn_y = inner_y + num_fields * 2 + 1;
         let save_label = "Save";
         let cancel_label = "Cancel";
@@ -3536,7 +3622,7 @@ fn rotate_log_file(log_file: &str) {
     }
 }
 
-fn log_to_file(is_logging: bool, log_file: &str, session_id: &str, kind: &str, content: &str) {
+pub(crate) fn log_to_file(is_logging: bool, log_file: &str, session_id: &str, kind: &str, content: &str) {
     if !is_logging {
         return;
     }
@@ -3915,18 +4001,12 @@ fn retry_countdown(
     log_file: &str,
     session_id: &str,
 ) {
-    let retry_info = match retry_after {
-        Some(ra) => format!(", retry-after is {}s", ra),
-        None => String::new(),
-    };
-    let base = format!("⚠ {}, waiting for {}s{}", label, delay_secs, retry_info);
-    let _ = tx.send(StreamChunk::Status(format!("{}, retrying now... (attempt {}/{})", base, attempt + 1, max_retries)));
-    log_to_file(is_logging, log_file, session_id, "RETRY", &format!("waiting {}s (attempt {}/{})", delay_secs, attempt + 1, max_retries));
-    for remaining in (1..delay_secs).rev() {
-        let _ = tx.send(StreamChunk::StatusTick(format!("{}, retrying in {}s (attempt {}/{})", base, remaining, attempt + 1, max_retries)));
+    let ra_str = retry_after.map_or("none".to_string(), |v| format!("{}s", v));
+    log_to_file(is_logging, log_file, session_id, "RETRY", &format!("{}, retry-after: {}, waiting: {}s (attempt {}/{})", label, ra_str, delay_secs, attempt + 1, max_retries));
+    for sec in 1..=delay_secs {
+        let _ = tx.send(StreamChunk::StatusTick(format!("⏳ {}s (attempt {}/{})", sec, attempt + 1, max_retries)));
         std::thread::sleep(std::time::Duration::from_secs(1));
     }
-    let _ = tx.send(StreamChunk::StatusTick(format!("{}, retrying now... (attempt {}/{})", base, attempt + 1, max_retries)));
 }
 
 async fn send_with_retry(
@@ -3956,9 +4036,13 @@ async fn send_with_retry(
                     .get("retry-after")
                     .and_then(|v| v.to_str().ok())
                     .and_then(|s| s.parse::<u64>().ok());
-                let delay_secs = retry_after
-                    .unwrap_or_else(|| if attempt == 0 { 10 } else { 2u64.pow(attempt) + 1 });
-                let delay_secs = if attempt == 0 { delay_secs.max(10) } else { delay_secs.min(60) };
+                let delay_secs = match attempt {
+                    0 => 20u64,
+                    1 => 40,
+                    2 => 60,
+                    _ => 60,
+                };
+                let delay_secs = retry_after.map_or(delay_secs, |ra| delay_secs.max(ra));
                 let _ = resp.text().await;
                 retry_countdown("Rate limited (429)", delay_secs, retry_after, attempt, max_retries, tx, is_logging, log_file, session_id);
                 continue;
@@ -4318,21 +4402,23 @@ mod tests {
     fn retry_countdown_sends_correct_messages() {
         use std::sync::mpsc;
         let (tx, rx) = mpsc::channel();
-        retry_countdown("Test error", 1, Some(5), 0, 3, &tx, false, "", "");
+        retry_countdown("Test error", 3, Some(5), 0, 3, &tx, false, "", "");
         drop(tx);
-        let msgs: Vec<String> = rx.iter().filter_map(|m| match m { StreamChunk::Status(s) | StreamChunk::StatusTick(s) => Some(s), _ => None }).collect();
-        assert!(msgs[0].contains("⚠ Test error, waiting for 1s, retry-after is 5s, retrying now... (attempt 1/3)"), "got: {}", msgs[0]);
-        assert!(msgs.iter().any(|m| m.contains("retrying now...")), "got: {:?}", msgs);
+        let msgs: Vec<String> = rx.iter().filter_map(|m| match m { StreamChunk::StatusTick(s) => Some(s), _ => None }).collect();
+        assert_eq!(msgs.len(), 3, "should have 3 ticks for 3s delay: {:?}", msgs);
+        assert!(msgs[0].contains("1s (attempt 1/3)"), "got: {}", msgs[0]);
+        assert!(msgs[1].contains("2s (attempt 1/3)"), "got: {}", msgs[1]);
+        assert!(msgs[2].contains("3s (attempt 1/3)"), "got: {}", msgs[2]);
     }
 
     #[test]
     fn retry_countdown_no_detail() {
         use std::sync::mpsc;
         let (tx, rx) = mpsc::channel();
-        retry_countdown("Rate limited (429)", 1, None, 1, 3, &tx, false, "", "");
+        retry_countdown("Rate limited (429)", 2, None, 1, 3, &tx, false, "", "");
         drop(tx);
-        let msgs: Vec<String> = rx.iter().filter_map(|m| match m { StreamChunk::Status(s) | StreamChunk::StatusTick(s) => Some(s), _ => None }).collect();
-        assert!(msgs[0].contains("⚠ Rate limited (429), waiting for 1s, retrying now... (attempt 2/3)"), "got: {}", msgs[0]);
+        let msgs: Vec<String> = rx.iter().filter_map(|m| match m { StreamChunk::StatusTick(s) => Some(s), _ => None }).collect();
+        assert!(msgs.iter().any(|m| m.contains("attempt 2/3")), "should show correct attempt: {:?}", msgs);
     }
 
     #[test]
@@ -4375,10 +4461,22 @@ mod tests {
             drop(tx);
             let msgs: Vec<String> = rx.iter().filter_map(|m| match m { StreamChunk::Status(s) | StreamChunk::StatusTick(s) => Some(s), _ => None }).collect();
             assert!(result.is_err(), "should fail after retries + server error");
-            assert!(msgs.iter().any(|m| m.contains("waiting for 1s, retry-after is 1s")), "should show wait and retry-after: {:?}", msgs);
             assert!(msgs.iter().any(|m| m.contains("attempt 1/2")), "should show attempt count: {:?}", msgs);
             assert!(msgs.iter().any(|m| m.contains("attempt 2/2")), "should show second attempt: {:?}", msgs);
-            assert!(msgs.iter().any(|m| m.contains("retrying now...")), "should show countdown reaching zero: {:?}", msgs);
         });
+    }
+
+    #[test]
+    fn retry_countdown_actually_waits() {
+        use std::sync::mpsc;
+        use std::time::Instant;
+        let (tx, rx) = mpsc::channel();
+        let start = Instant::now();
+        retry_countdown("Test", 3, None, 0, 3, &tx, false, "", "");
+        let elapsed = start.elapsed().as_secs();
+        drop(tx);
+        let _: Vec<_> = rx.iter().collect();
+        assert!(elapsed >= 2, "expected >=2s wait, got {}s", elapsed);
+        assert!(elapsed <= 4, "expected <=4s wait, got {}s", elapsed);
     }
 }

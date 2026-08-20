@@ -40,6 +40,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut app = App::new(Config::load());
     let result = run_app(&mut terminal, &mut app);
 
+    crate::app::log_to_file(app.is_logging, &app.log_file, &app.session_id, "END", "Program exited");
+
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
@@ -66,30 +68,7 @@ where
             let size = terminal.size()?;
             app.terminal_height = size.height;
 
-            match event::read()? {
-                Event::Key(key) => {
-                    app.handle_global_key(key);
-                }
-                Event::Mouse(mouse) => match mouse.kind {
-                    MouseEventKind::ScrollUp => app.scroll_up(),
-                    MouseEventKind::ScrollDown => app.scroll_down(),
-                    MouseEventKind::Down(MouseButton::Left) => {
-                        let size = terminal.size()?;
-                        app.handle_click(mouse.column, mouse.row, size.width, size.height);
-                    }
-                    MouseEventKind::Up(MouseButton::Left) => {
-                        app.handle_mouse_up();
-                    }
-                    MouseEventKind::Drag(MouseButton::Left) => {
-                        let size = terminal.size()?;
-                        let input_start = size.height.saturating_sub(6);
-                        app.handle_mouse_drag(mouse.row, input_start);
-                    }
-                    _ => {}
-                },
-                _ => {}
-            }
-            while event::poll(Duration::ZERO)? {
+            if !app.retrying {
                 match event::read()? {
                     Event::Key(key) => {
                         app.handle_global_key(key);
@@ -113,6 +92,36 @@ where
                     },
                     _ => {}
                 }
+                while event::poll(Duration::ZERO)? {
+                    match event::read()? {
+                        Event::Key(key) => {
+                            app.handle_global_key(key);
+                        }
+                        Event::Mouse(mouse) => match mouse.kind {
+                            MouseEventKind::ScrollUp => app.scroll_up(),
+                            MouseEventKind::ScrollDown => app.scroll_down(),
+                            MouseEventKind::Down(MouseButton::Left) => {
+                                let size = terminal.size()?;
+                                app.handle_click(mouse.column, mouse.row, size.width, size.height);
+                            }
+                            MouseEventKind::Up(MouseButton::Left) => {
+                                app.handle_mouse_up();
+                            }
+                            MouseEventKind::Drag(MouseButton::Left) => {
+                                let size = terminal.size()?;
+                                let input_start = size.height.saturating_sub(6);
+                                app.handle_mouse_drag(mouse.row, input_start);
+                            }
+                            _ => {}
+                        },
+                        _ => {}
+                    }
+                }
+            } else {
+                // During retry: drain all pending events without processing
+                while event::poll(Duration::ZERO)? {
+                    let _ = event::read()?;
+                }
             }
         }
 
@@ -135,10 +144,11 @@ fn ui(f: &mut Frame, app: &mut App) {
     ])
     .split(area);
 
-    app.main_menu.render_bar(f, app.agentic_mode, &app.theme, main_chunks[0]);
+    app.main_menu.render_bar(f, app.agentic_mode, &app.theme, main_chunks[0], &app.status_message);
     render_keybar(f, app, main_chunks[2]);
 
     let show_terminal = app.terminal_state.visible && app.terminal_state.is_running();
+    let has_status = !app.status_message.is_empty();
 
     if show_terminal {
         let content_chunks = Layout::horizontal([
@@ -147,20 +157,44 @@ fn ui(f: &mut Frame, app: &mut App) {
         ])
         .split(main_chunks[1]);
 
+        if has_status {
+            let left_chunks = Layout::vertical([
+                Constraint::Min(3),
+                Constraint::Length(1),
+                Constraint::Length(5),
+            ])
+            .split(content_chunks[0]);
+            app.output_width = left_chunks[0].width;
+            render_output(f, app, left_chunks[0]);
+            render_status_bar(f, &app.status_message, left_chunks[1]);
+            render_input(f, app, left_chunks[2]);
+        } else {
             let left_chunks =
                 Layout::vertical([Constraint::Min(3), Constraint::Length(5)]).split(content_chunks[0]);
-
             app.output_width = left_chunks[0].width;
             render_output(f, app, left_chunks[0]);
             render_input(f, app, left_chunks[1]);
-            render_terminal_panel(f, app, content_chunks[1]);
+        }
+        render_terminal_panel(f, app, content_chunks[1]);
     } else {
-        let content_chunks =
-            Layout::vertical([Constraint::Min(3), Constraint::Length(5)]).split(main_chunks[1]);
-
-        app.output_width = content_chunks[0].width;
-        render_output(f, app, content_chunks[0]);
-        render_input(f, app, content_chunks[1]);
+        if has_status {
+            let content_chunks = Layout::vertical([
+                Constraint::Min(3),
+                Constraint::Length(1),
+                Constraint::Length(5),
+            ])
+            .split(main_chunks[1]);
+            app.output_width = content_chunks[0].width;
+            render_output(f, app, content_chunks[0]);
+            render_status_bar(f, &app.status_message, content_chunks[1]);
+            render_input(f, app, content_chunks[2]);
+        } else {
+            let content_chunks =
+                Layout::vertical([Constraint::Min(3), Constraint::Length(5)]).split(main_chunks[1]);
+            app.output_width = content_chunks[0].width;
+            render_output(f, app, content_chunks[0]);
+            render_input(f, app, content_chunks[1]);
+        }
     }
 
     if app.main_menu.is_open() {
@@ -193,6 +227,11 @@ fn ui(f: &mut Frame, app: &mut App) {
 
     if app.show_settings_dialog {
         render_settings_dialog(f, app, area);
+    }
+
+    if app.show_retry_paused {
+        let mb = ui::MessageBox::new("Retry Paused", &app.retry_paused_message);
+        mb.render(f, area, true);
     }
 }
 
@@ -629,6 +668,18 @@ fn render_send_button(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(Line::from(Span::styled(btn_text, btn_style))), btn_area);
 }
 
+fn render_status_bar(f: &mut Frame, status: &str, area: Rect) {
+    let line = Line::from(Span::styled(
+        format!(" {} ", status),
+        Style::default()
+            .fg(Color::Yellow)
+            .bg(Color::DarkGray)
+            .add_modifier(Modifier::BOLD),
+    ));
+    let bar = Paragraph::new(line).style(Style::default().bg(Color::DarkGray));
+    f.render_widget(bar, area);
+}
+
 fn render_keybar(f: &mut Frame, app: &App, area: Rect) {
     let agentic_label = if app.agentic_mode {
         " AGENTIC "
@@ -643,40 +694,29 @@ fn render_keybar(f: &mut Frame, app: &App, area: Rect) {
 
     let terminal_hint = if app.terminal_state.is_running() {
         if app.terminal_state.visible {
-            " Ctrl+T:HideTerm "
+            " Ctrl+T "
         } else {
-            " Ctrl+T:ShowTerm "
+            " Ctrl+T "
         }
     } else {
         ""
     };
 
     let resize_hint = if app.terminal_state.is_running() && app.terminal_state.visible {
-        " \u{2190}\u{2192}:Resize "
+        " \u{2190}\u{2192} "
     } else {
         ""
     };
 
     let text = match app.input_mode {
-        InputMode::Normal => {
-            if !app.status_message.is_empty() {
-                format!(
-                    " {} | F9:Menu F10:Quit Ctrl+S:Save{}{}{}{}",
-                    app.status_message, agentic_label, focus_label, terminal_hint, resize_hint
-                )
-            } else {
-                format!(
-                    " F9:Menu  F10:Quit  Ctrl+S:Save  Mouse:Click/Scroll{}{}{}{}",
-                    agentic_label, focus_label, terminal_hint, resize_hint
-                )
-            }
-        }
-        InputMode::Input => {
-            format!(
-                " Enter:Send  Alt+Enter:Newline  \u{2190}\u{2191}\u{2193}\u{2192}:Cursor{}{}",
-                agentic_label, terminal_hint
-            )
-        }
+        InputMode::Normal => format!(
+            " F9:Menu  F10:Quit  Ctrl+S:Save  Mouse:Scroll{}{}{}{}",
+            agentic_label, focus_label, terminal_hint, resize_hint
+        ),
+        InputMode::Input => format!(
+            " Enter:Send  Alt+Enter:Newline{}{}",
+            agentic_label, terminal_hint
+        ),
         InputMode::Menu => " \u{2190}\u{2192}:Navigate  \u{2191}\u{2193}:Select  Enter:Open  Esc:Close"
             .to_string(),
     };
@@ -1194,7 +1234,7 @@ fn render_load_dialog(f: &mut Frame, app: &App, area: Rect) {
 
 fn render_settings_dialog(f: &mut Frame, app: &App, area: Rect) {
     let dialog_w: u16 = 60;
-    let dialog_h: u16 = 20;
+    let dialog_h: u16 = 22;
 
     let popup_area = Rect {
         x: (area.width.saturating_sub(dialog_w)) / 2,
@@ -1215,6 +1255,7 @@ fn render_settings_dialog(f: &mut Frame, app: &App, area: Rect) {
         ("Top-P:", SettingsFocus::TopP),
         ("Top-K:", SettingsFocus::TopK),
         ("Max Rounds:", SettingsFocus::MaxToolRounds),
+        ("Max Retries:", SettingsFocus::MaxRetries),
         ("Justify:", SettingsFocus::Justify),
     ];
 
@@ -1266,6 +1307,7 @@ fn render_settings_dialog(f: &mut Frame, app: &App, area: Rect) {
                 SettingsFocus::TopP => &app.settings_top_p,
                 SettingsFocus::TopK => &app.settings_top_k,
                 SettingsFocus::MaxToolRounds => &app.settings_max_tool_rounds,
+                SettingsFocus::MaxRetries => &app.settings_max_retries,
                 _ => "",
             };
 
@@ -1301,7 +1343,7 @@ fn render_settings_dialog(f: &mut Frame, app: &App, area: Rect) {
         }
     }
 
-    let num_fields = 7u16;
+    let num_fields = 8u16;
     let btn_y = inner.y + num_fields * 2 + 1;
     let save_label = "Save";
     let cancel_label = "Cancel";

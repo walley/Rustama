@@ -14,6 +14,7 @@ pub struct Config {
     pub system_prompt: String,
     pub proxy: Option<String>,
     pub max_tool_rounds: usize,
+    pub max_retries: u32,
     pub temperature: f64,
     pub top_p: f64,
     pub top_k: u32,
@@ -42,6 +43,7 @@ impl Default for Config {
             system_prompt: "You are a coding assistant with access to tools. When the user asks you to do something, use the available tools to accomplish the task. Always use tools when needed - do not just describe what you would do. Execute the actual tool calls. After using a tool, continue working until the task is complete.".to_string(),
             proxy: None,
             max_tool_rounds: 10,
+            max_retries: 10,
             temperature: 1.0,
             top_p: 0.9,
             top_k: 40,
@@ -116,6 +118,8 @@ impl Config {
              # proxy = http://proxy:8080\n\n\
              # Max agentic tool rounds per request (1-100, default: 10)\n\
              max_tool_rounds = {}\n\n\
+             # Max API retries on 429/rate-limit errors (1-50, default: 10)\n\
+             max_retries = {}\n\n\
              # Sampling temperature (0.0-2.0, default: 1.0)\n\
              temperature = {}\n\n\
              # Top-p sampling (0.0-1.0, default: 0.9)\n\
@@ -125,7 +129,7 @@ impl Config {
               # Justify paragraphs in output (true/false, default: false)\n\
               justify = {}\n",
             self.ollama_url, self.model, self.save_path, self.agentic, self.timeout_secs,
-            self.logging, self.logfile, self.system_prompt, self.max_tool_rounds,
+            self.logging, self.logfile, self.system_prompt, self.max_tool_rounds, self.max_retries,
             self.temperature, self.top_p, self.top_k, self.justify,
         )
     }
@@ -172,6 +176,13 @@ impl Config {
             if let Ok(n) = v.parse::<usize>() {
                 if n >= 1 && n <= 100 {
                     cfg.max_tool_rounds = n;
+                }
+            }
+        }
+        if let Some(v) = values.get("max_retries") {
+            if let Ok(n) = v.parse::<u32>() {
+                if n >= 1 && n <= 50 {
+                    cfg.max_retries = n;
                 }
             }
         }
@@ -263,6 +274,7 @@ impl Config {
             lines.push("# proxy = off".to_string());
         }
         lines.push(format!("max_tool_rounds = {}", self.max_tool_rounds));
+        lines.push(format!("max_retries = {}", self.max_retries));
         lines.push(format!("temperature = {}", self.temperature));
         lines.push(format!("top_p = {}", self.top_p));
         lines.push(format!("top_k = {}", self.top_k));
