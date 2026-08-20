@@ -3924,6 +3924,7 @@ fn build_blocking_client(proxy: &Option<String>) -> reqwest::blocking::Client {
 
 fn retry_countdown(
     label: &str,
+    detail: Option<&str>,
     delay_secs: u64,
     attempt: u32,
     max_retries: u32,
@@ -3932,7 +3933,10 @@ fn retry_countdown(
     log_file: &str,
     session_id: &str,
 ) {
-    let header = format!("⚠ {}, retrying", label);
+    let header = match detail {
+        Some(d) if !d.is_empty() => format!("⚠ {} — {}", label, d),
+        _ => format!("⚠ {}, retrying", label),
+    };
     let _ = tx.send(StreamChunk::Status(format!("{} in {}s (attempt {}/{})", header, delay_secs, attempt + 1, max_retries)));
     log_to_file(is_logging, log_file, session_id, "RETRY", &format!("{} in {}s", label, delay_secs));
     for remaining in (1..delay_secs).rev() {
@@ -3940,6 +3944,32 @@ fn retry_countdown(
         std::thread::sleep(std::time::Duration::from_secs(1));
     }
     let _ = tx.send(StreamChunk::StatusTick(format!("{} now... (attempt {}/{})", header, attempt + 1, max_retries)));
+}
+
+fn parse_rate_limit_message(body: &str) -> Option<String> {
+    if let Ok(val) = serde_json::from_str::<serde_json::Value>(body) {
+        // OpenAI format: {"error": {"message": "..."}}
+        if let Some(msg) = val.get("error").and_then(|e| e.get("message")).and_then(|m| m.as_str()) {
+            let trimmed = msg.trim();
+            if !trimmed.is_empty() {
+                return Some(if trimmed.len() > 120 { format!("{}…", &trimmed[..trimmed.floor_char_boundary(120)]) } else { trimmed.to_string() });
+            }
+        }
+        // Ollama format: {"error": "..."}
+        if let Some(msg) = val.get("error").and_then(|e| e.as_str()) {
+            let trimmed = msg.trim();
+            if !trimmed.is_empty() {
+                return Some(if trimmed.len() > 120 { format!("{}…", &trimmed[..trimmed.floor_char_boundary(120)]) } else { trimmed.to_string() });
+            }
+        }
+    }
+    // Fallback: raw body truncated
+    let trimmed = body.trim();
+    if !trimmed.is_empty() {
+        Some(if trimmed.len() > 120 { format!("{}…", &trimmed[..trimmed.floor_char_boundary(120)]) } else { trimmed.to_string() })
+    } else {
+        None
+    }
 }
 
 async fn send_with_retry(
@@ -3965,29 +3995,33 @@ async fn send_with_retry(
         }
         match req.send().await {
             Ok(resp) if resp.status().as_u16() == 429 && attempt < max_retries => {
-                let delay_secs = resp.headers()
+                let retry_after = resp.headers()
                     .get("retry-after")
                     .and_then(|v| v.to_str().ok())
-                    .and_then(|s| s.parse::<u64>().ok())
-                    .unwrap_or_else(|| if attempt == 0 { 30 } else { 2u64.pow(attempt) + 1 });
-                let delay_secs = if attempt == 0 { delay_secs.min(30) } else { delay_secs.min(60) };
-                let _ = resp.text().await;
-                retry_countdown("Rate limited (429)", delay_secs, attempt, max_retries, tx, is_logging, log_file, session_id);
+                    .and_then(|s| s.parse::<u64>().ok());
+                let delay_secs = retry_after
+                    .unwrap_or_else(|| if attempt == 0 { 10 } else { 2u64.pow(attempt) + 1 });
+                let delay_secs = if attempt == 0 { delay_secs.min(10) } else { delay_secs.min(60) };
+                let body = resp.text().await.unwrap_or_default();
+                let body_msg = parse_rate_limit_message(&body);
+                let retry_after_hint = retry_after.map(|s| format!("retry-after: {}s", s));
+                let detail = body_msg.as_deref().or(retry_after_hint.as_deref());
+                retry_countdown("Rate limited (429)", detail, delay_secs, attempt, max_retries, tx, is_logging, log_file, session_id);
                 continue;
             }
             Ok(resp) if resp.status().is_server_error() && attempt < max_retries => {
                 let status = resp.status();
-                let delay_secs = if attempt == 0 { 30 } else { 2u64.pow(attempt) + 1 };
+                let delay_secs = if attempt == 0 { 10 } else { 2u64.pow(attempt) + 1 };
                 let _ = resp.text().await;
-                retry_countdown(&format!("Server error ({})", status), delay_secs, attempt, max_retries, tx, is_logging, log_file, session_id);
+                retry_countdown(&format!("Server error ({})", status), None, delay_secs, attempt, max_retries, tx, is_logging, log_file, session_id);
                 continue;
             }
             Ok(resp) => return Ok(resp),
             Err(e) => {
                 last_err = Some(e);
                 if attempt < max_retries {
-                    let delay_secs = if attempt == 0 { 30 } else { 2u64.pow(attempt) + 1 };
-                    retry_countdown("Request error", delay_secs, attempt, max_retries, tx, is_logging, log_file, session_id);
+                    let delay_secs = if attempt == 0 { 10 } else { 2u64.pow(attempt) + 1 };
+                    retry_countdown("Request error", None, delay_secs, attempt, max_retries, tx, is_logging, log_file, session_id);
                     continue;
                 }
             }
@@ -4306,7 +4340,7 @@ fn parse_text_tool_calls(text: &str) -> Vec<serde_json::Value> {
 }
 #[cfg(test)]
 mod tests {
-    use super::terminal_command;
+    use super::{terminal_command, parse_rate_limit_message, retry_countdown, send_with_retry, StreamChunk};
 
     #[test]
     fn wraps_simple_command() {
@@ -4324,5 +4358,109 @@ mod tests {
         assert_eq!(terminal_command("cat < file"), "cat < file");
         assert_eq!(terminal_command("FOO=1 bar"), "stdbuf -oL -eL FOO=1 bar");
         assert_eq!(terminal_command(""), "");
+    }
+
+    #[test]
+    fn parse_rate_limit_openai_format() {
+        let body = r#"{"error": {"message": "rate limit exceeded, slow down", "type": "rate_limit_exceeded"}}"#;
+        assert_eq!(parse_rate_limit_message(body).unwrap(), "rate limit exceeded, slow down");
+    }
+
+    #[test]
+    fn parse_rate_limit_ollama_format() {
+        let body = r#"{"error": "model is loading, try again later"}"#;
+        assert_eq!(parse_rate_limit_message(body).unwrap(), "model is loading, try again later");
+    }
+
+    #[test]
+    fn parse_rate_limit_raw_text() {
+        let body = "Too Many Requests";
+        assert_eq!(parse_rate_limit_message(body).unwrap(), "Too Many Requests");
+    }
+
+    #[test]
+    fn parse_rate_limit_empty() {
+        assert!(parse_rate_limit_message("").is_none());
+        assert!(parse_rate_limit_message("   ").is_none());
+    }
+
+    #[test]
+    fn parse_rate_limit_long_message_truncated() {
+        let long_msg = "x".repeat(200);
+        let body = format!(r#"{{"error": {{"message": "{}"}}}}"#, long_msg);
+        let result = parse_rate_limit_message(&body).unwrap();
+        assert!(result.chars().count() <= 121, "chars={}, result={}", result.chars().count(), result);
+        assert!(result.ends_with('…'));
+    }
+
+    #[test]
+    fn retry_countdown_sends_correct_messages() {
+        use std::sync::mpsc;
+        let (tx, rx) = mpsc::channel();
+        retry_countdown("Test error", Some("server said slow down"), 1, 0, 3, &tx, false, "", "");
+        drop(tx);
+        let msgs: Vec<String> = rx.iter().filter_map(|m| match m { StreamChunk::Status(s) | StreamChunk::StatusTick(s) => Some(s), _ => None }).collect();
+        assert!(msgs[0].contains("Test error — server said slow down"), "got: {}", msgs[0]);
+        assert!(msgs[0].contains("1s"), "got: {}", msgs[0]);
+        assert!(msgs[0].contains("attempt 1/3"), "got: {}", msgs[0]);
+        assert!(msgs.iter().any(|m| m.contains("now...")), "got: {:?}", msgs);
+    }
+
+    #[test]
+    fn retry_countdown_no_detail() {
+        use std::sync::mpsc;
+        let (tx, rx) = mpsc::channel();
+        retry_countdown("Rate limited (429)", None, 1, 1, 3, &tx, false, "", "");
+        drop(tx);
+        let msgs: Vec<String> = rx.iter().filter_map(|m| match m { StreamChunk::Status(s) | StreamChunk::StatusTick(s) => Some(s), _ => None }).collect();
+        assert!(msgs[0].contains("retrying"), "got: {}", msgs[0]);
+        assert!(msgs[0].contains("attempt 2/3"), "got: {}", msgs[0]);
+    }
+
+    #[test]
+    fn mock_server_429_flow() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        std::thread::spawn(move || {
+            for i in 0..3 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buf = [0u8; 4096];
+                stream.read(&mut buf).unwrap();
+                if i < 2 {
+                    let body = r#"{"error": {"message": "quota exceeded"}}"#;
+                    let resp = format!(
+                        "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nRetry-After: 1\r\nContent-Length: {}\r\n\r\n{}",
+                        body.len(), body
+                    );
+                    stream.write_all(resp.as_bytes()).unwrap();
+                } else {
+                    drop(stream);
+                }
+            }
+        });
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let client = reqwest::Client::new();
+            let (tx, rx) = std::sync::mpsc::channel();
+            let body = serde_json::json!({"model": "test"});
+            let url = format!("http://{}/api/chat", addr);
+            let result = send_with_retry(&client, reqwest::Method::POST, &url, None, &body, 2, &tx, false, "", "test").await;
+            drop(tx);
+            let msgs: Vec<String> = rx.iter().filter_map(|m| match m { StreamChunk::Status(s) | StreamChunk::StatusTick(s) => Some(s), _ => None }).collect();
+            assert!(result.is_err(), "should fail after retries + server error");
+            assert!(msgs.iter().any(|m| m.contains("quota exceeded")), "should show server message: {:?}", msgs);
+            assert!(msgs.iter().any(|m| m.contains("attempt 1/2")), "should show attempt count: {:?}", msgs);
+            assert!(msgs.iter().any(|m| m.contains("attempt 2/2")), "should show second attempt: {:?}", msgs);
+            assert!(msgs.iter().any(|m| m.contains("now...")), "should show countdown reaching zero: {:?}", msgs);
+        });
     }
 }

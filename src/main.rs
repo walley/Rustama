@@ -570,6 +570,7 @@ fn render_input(f: &mut Frame, app: &App, area: Rect) {
         .border_style(border_style);
 
     let mut textarea = app.textarea.clone();
+    textarea.set_cursor_line_style(Style::default());
     textarea.set_block(block);
     f.render_widget(&textarea, area);
     render_send_button(f, app, area);
@@ -714,8 +715,8 @@ fn render_about_popup(f: &mut Frame, area: Rect, theme: &Theme) {
                 .add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
-        Line::from("A terminal interface for Ollama LLM."),
-        Line::from("Supports markdown rendering and saving."),
+        Line::from("A terminal AI coding agent for Ollama LLMs."),
+        Line::from("Supports markdown rendering, agentic tools, and saving."),
         Line::from(""),
         Line::from("Built with ratatui + crossterm"),
         Line::from(""),
