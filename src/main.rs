@@ -118,9 +118,48 @@ where
                     }
                 }
             } else {
-                // During retry: drain all pending events without processing
+                // During retry: allow scrolling and text selection, block everything else
+                match event::read()? {
+                    Event::Mouse(mouse) => match mouse.kind {
+                        MouseEventKind::ScrollUp => app.scroll_up(),
+                        MouseEventKind::ScrollDown => app.scroll_down(),
+                        MouseEventKind::Down(MouseButton::Left) => {
+                            let size = terminal.size()?;
+                            app.handle_click(mouse.column, mouse.row, size.width, size.height);
+                        }
+                        MouseEventKind::Up(MouseButton::Left) => {
+                            app.handle_mouse_up();
+                        }
+                        MouseEventKind::Drag(MouseButton::Left) => {
+                            let size = terminal.size()?;
+                            let input_start = size.height.saturating_sub(6);
+                            app.handle_mouse_drag(mouse.row, input_start);
+                        }
+                        _ => {}
+                    },
+                    _ => {}
+                }
                 while event::poll(Duration::ZERO)? {
-                    let _ = event::read()?;
+                    match event::read()? {
+                        Event::Mouse(mouse) => match mouse.kind {
+                            MouseEventKind::ScrollUp => app.scroll_up(),
+                            MouseEventKind::ScrollDown => app.scroll_down(),
+                            MouseEventKind::Down(MouseButton::Left) => {
+                                let size = terminal.size()?;
+                                app.handle_click(mouse.column, mouse.row, size.width, size.height);
+                            }
+                            MouseEventKind::Up(MouseButton::Left) => {
+                                app.handle_mouse_up();
+                            }
+                            MouseEventKind::Drag(MouseButton::Left) => {
+                                let size = terminal.size()?;
+                                let input_start = size.height.saturating_sub(6);
+                                app.handle_mouse_drag(mouse.row, input_start);
+                            }
+                            _ => {}
+                        },
+                        _ => {}
+                    }
                 }
             }
         }
@@ -458,29 +497,26 @@ fn render_output(f: &mut Frame, app: &mut App, area: Rect) {
     let selected_lines: Vec<Line<'static>>;
     let render_lines: &[Line<'static>] = if let (Some(s), Some(e)) = (app.selection_start, app.selection_end) {
         if !app.cached_wrapped.is_empty() {
-            let s = s.min(app.cached_wrapped.len() - 1);
-            let e = e.min(app.cached_wrapped.len() - 1);
-            if s <= e {
-                selected_lines = app
-                    .cached_wrapped
-                    .iter()
-                    .enumerate()
-                    .map(|(i, l)| {
-                        if i >= s && i <= e {
-                            let mut hl = l.clone();
-                            for span in &mut hl.spans {
-                                span.style = span.style.add_modifier(Modifier::REVERSED);
-                            }
-                            hl
-                        } else {
-                            l.clone()
+            let s_raw = s.min(app.cached_wrapped.len() - 1);
+            let e_raw = e.min(app.cached_wrapped.len() - 1);
+            let (s, e) = if s_raw <= e_raw { (s_raw, e_raw) } else { (e_raw, s_raw) };
+            selected_lines = app
+                .cached_wrapped
+                .iter()
+                .enumerate()
+                .map(|(i, l)| {
+                    if i >= s && i <= e {
+                        let mut hl = l.clone();
+                        for span in &mut hl.spans {
+                            span.style = span.style.add_modifier(Modifier::REVERSED);
                         }
-                    })
-                    .collect();
-                &selected_lines
-            } else {
-                lines
-            }
+                        hl
+                    } else {
+                        l.clone()
+                    }
+                })
+                .collect();
+            &selected_lines
         } else {
             lines
         }

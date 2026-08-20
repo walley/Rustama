@@ -2484,7 +2484,9 @@ impl App {
             if let Some(text) = self.selected_text() {
                 if !text.trim().is_empty() {
                     self.primary_selection.set_text(text.clone());
-                    let count = self.selection_end.unwrap_or(0).saturating_sub(self.selection_start.unwrap_or(0)) + 1;
+                    let s = self.selection_start.unwrap_or(0);
+                    let e = self.selection_end.unwrap_or(0);
+                    let count = if s <= e { e - s + 1 } else { s - e + 1 };
                     self.status_message = format!("Selected {} line(s) copied to X selection", count);
                 }
             }
@@ -2495,7 +2497,8 @@ impl App {
     fn selected_text(&self) -> Option<String> {
         let start = self.selection_start?;
         let end = self.selection_end?;
-        if start > end || start >= self.cached_wrapped.len() {
+        let (start, end) = if start <= end { (start, end) } else { (end, start) };
+        if start >= self.cached_wrapped.len() {
             return None;
         }
         let end = end.min(self.cached_wrapped.len() - 1);
@@ -4104,7 +4107,7 @@ fn retry_countdown(
     let ra_str = retry_after.map_or("none".to_string(), |v| format!("{}s", v));
     log_to_file(is_logging, log_file, session_id, "RETRY", &format!("{}, retry-after: {}, waiting: {}s (attempt {}/{})", label, ra_str, delay_secs, attempt + 1, max_retries));
     for sec in 1..=delay_secs {
-        let _ = tx.send(StreamChunk::StatusTick(format!("⏳ {}s (attempt {}/{})", sec, attempt + 1, max_retries)));
+        let _ = tx.send(StreamChunk::StatusTick(format!("⏳ {}/{}s (attempt {}/{})", sec, delay_secs, attempt + 1, max_retries)));
         std::thread::sleep(std::time::Duration::from_secs(1));
     }
 }
@@ -4506,9 +4509,9 @@ mod tests {
         drop(tx);
         let msgs: Vec<String> = rx.iter().filter_map(|m| match m { StreamChunk::StatusTick(s) => Some(s), _ => None }).collect();
         assert_eq!(msgs.len(), 3, "should have 3 ticks for 3s delay: {:?}", msgs);
-        assert!(msgs[0].contains("1s (attempt 1/3)"), "got: {}", msgs[0]);
-        assert!(msgs[1].contains("2s (attempt 1/3)"), "got: {}", msgs[1]);
-        assert!(msgs[2].contains("3s (attempt 1/3)"), "got: {}", msgs[2]);
+        assert!(msgs[0].contains("1/3s (attempt 1/3)"), "got: {}", msgs[0]);
+        assert!(msgs[1].contains("2/3s (attempt 1/3)"), "got: {}", msgs[1]);
+        assert!(msgs[2].contains("3/3s (attempt 1/3)"), "got: {}", msgs[2]);
     }
 
     #[test]
