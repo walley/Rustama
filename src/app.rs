@@ -142,10 +142,87 @@ pub enum StreamChunk {
 
 const TERMINAL_BUFFER_MAX: usize = 102400;
 
+pub struct TerminalBuffer {
+    pub content: String,
+    pub total_bytes_written: u64,
+    pub buffer_start_offset: u64,
+}
+
+impl TerminalBuffer {
+    pub fn new() -> Self {
+        TerminalBuffer {
+            content: String::new(),
+            total_bytes_written: 0,
+            buffer_start_offset: 0,
+        }
+    }
+
+    pub fn read_incremental(&self, cursor: Option<u64>) -> serde_json::Value {
+        let total = self.total_bytes_written;
+        let start = self.buffer_start_offset;
+
+        match cursor {
+            None => {
+                let output = if self.content.len() > 4000 {
+                    self.content[self.content.len() - 4000..].to_string()
+                } else {
+                    self.content.clone()
+                };
+                serde_json::json!({
+                    "output": output,
+                    "cursor": total,
+                    "gap": false,
+                })
+            }
+            Some(c) => {
+                if c > total {
+                    // Cursor is ahead of what's been written — invalid/stale cursor
+                    serde_json::json!({
+                        "output": "",
+                        "cursor": total,
+                        "gap": false,
+                        "error": format!("Invalid cursor {}: beyond total bytes written ({})", c, total),
+                    })
+                } else if c == total {
+                    // Exactly at the end — nothing new
+                    serde_json::json!({
+                        "output": "",
+                        "cursor": total,
+                        "gap": false,
+                    })
+                } else if c >= start {
+                    let offset = (c - start) as usize;
+                    let output = if offset < self.content.len() {
+                        self.content[offset..].to_string()
+                    } else {
+                        String::new()
+                    };
+                    serde_json::json!({
+                        "output": output,
+                        "cursor": total,
+                        "gap": false,
+                    })
+                } else {
+                    let output = if self.content.len() > 4000 {
+                        self.content[self.content.len() - 4000..].to_string()
+                    } else {
+                        self.content.clone()
+                    };
+                    serde_json::json!({
+                        "output": output,
+                        "cursor": total,
+                        "gap": true,
+                    })
+                }
+            }
+        }
+    }
+}
+
 pub struct TerminalState {
-    pub buffer: Arc<Mutex<String>>,
+    pub buffer: Arc<Mutex<TerminalBuffer>>,
     pub stdin_tx: Option<std::sync::mpsc::Sender<String>>,
-    pub child: Option<Child>,
+    pub child: Arc<Mutex<Option<Child>>>,
     pub reader_stdout: Option<JoinHandle<()>>,
     pub reader_stderr: Option<JoinHandle<()>>,
     pub stdin_writer: Option<JoinHandle<()>>,
@@ -192,9 +269,9 @@ fn terminal_command(command: &str) -> String {
 impl TerminalState {
     pub fn new() -> Self {
         TerminalState {
-            buffer: Arc::new(Mutex::new(String::new())),
+            buffer: Arc::new(Mutex::new(TerminalBuffer::new())),
             stdin_tx: None,
-            child: None,
+            child: Arc::new(Mutex::new(None)),
             reader_stdout: None,
             reader_stderr: None,
             stdin_writer: None,
@@ -205,7 +282,17 @@ impl TerminalState {
     }
 
     pub fn is_running(&self) -> bool {
-        self.stdin_tx.is_some()
+        if self.stdin_tx.is_none() {
+            return false;
+        }
+        // Check if child process has exited
+        let mut child = self.child.lock().unwrap();
+        if let Some(ref mut c) = *child {
+            if let Ok(Some(_)) = c.try_wait() {
+                return false;
+            }
+        }
+        true
     }
 
     pub fn open(&mut self, command: &str) -> String {
@@ -219,7 +306,7 @@ impl TerminalState {
         }
 
         let (stdin_tx, stdin_rx) = std::sync::mpsc::channel::<String>();
-        let buffer = Arc::new(Mutex::new(String::new()));
+        let buffer = Arc::new(Mutex::new(TerminalBuffer::new()));
 
         let wrapped = terminal_command(command);
         match std::process::Command::new("sh")
@@ -256,12 +343,14 @@ impl TerminalState {
                                 Ok(0) => break,
                                 Ok(n) => {
                                     if let Ok(text) = String::from_utf8(buf[..n].to_vec()) {
-                                        let mut buffer = buffer.lock().unwrap();
-                                        buffer.push_str(&text);
-                                        let len = buffer.len();
+                                        let mut b = buffer.lock().unwrap();
+                                        b.total_bytes_written += text.len() as u64;
+                                        b.content.push_str(&text);
+                                        let len = b.content.len();
                                         if len > TERMINAL_BUFFER_MAX {
                                             let drain_to = len - TERMINAL_BUFFER_MAX / 2;
-                                            *buffer = buffer.split_off(drain_to);
+                                            b.buffer_start_offset += drain_to as u64;
+                                            b.content = b.content.split_off(drain_to);
                                         }
                                     }
                                 }
@@ -281,12 +370,14 @@ impl TerminalState {
                                 Ok(0) => break,
                                 Ok(n) => {
                                     if let Ok(text) = String::from_utf8(buf[..n].to_vec()) {
-                                        let mut buffer = buffer.lock().unwrap();
-                                        buffer.push_str(&text);
-                                        let len = buffer.len();
+                                        let mut b = buffer.lock().unwrap();
+                                        b.total_bytes_written += text.len() as u64;
+                                        b.content.push_str(&text);
+                                        let len = b.content.len();
                                         if len > TERMINAL_BUFFER_MAX {
                                             let drain_to = len - TERMINAL_BUFFER_MAX / 2;
-                                            *buffer = buffer.split_off(drain_to);
+                                            b.buffer_start_offset += drain_to as u64;
+                                            b.content = b.content.split_off(drain_to);
                                         }
                                     }
                                 }
@@ -298,7 +389,7 @@ impl TerminalState {
 
                 self.buffer = buffer;
                 self.stdin_tx = Some(stdin_tx);
-                self.child = Some(child);
+                *self.child.lock().unwrap() = Some(child);
                 self.reader_stdout = Some(reader_stdout);
                 self.reader_stderr = Some(reader_stderr);
                 self.stdin_writer = Some(stdin_writer);
@@ -322,18 +413,14 @@ impl TerminalState {
         }
     }
 
-    pub fn read_buffer(&self) -> String {
-        let buffer = self.buffer.lock().unwrap();
-        if buffer.len() > 4000 {
-            buffer[buffer.len() - 4000..].to_string()
-        } else {
-            buffer.clone()
-        }
+    pub fn read_buffer_incremental(&self, cursor: Option<u64>) -> serde_json::Value {
+        let b = self.buffer.lock().unwrap();
+        b.read_incremental(cursor)
     }
 
     pub fn close(&mut self) -> String {
         self.stdin_tx.take();
-        if let Some(mut child) = self.child.take() {
+        if let Some(mut child) = self.child.lock().unwrap().take() {
             let _ = child.kill();
             let _ = child.wait();
         }
@@ -348,7 +435,7 @@ impl TerminalState {
         }
         self.visible = false;
         self.command.clear();
-        *self.buffer.lock().unwrap() = String::new();
+        *self.buffer.lock().unwrap() = TerminalBuffer::new();
         "Terminal closed".to_string()
     }
 }
@@ -864,7 +951,12 @@ impl App {
             "terminal_open" => {
                 let args: serde_json::Value = serde_json::from_str(args_json).unwrap_or(serde_json::json!({}));
                 let command = args["command"].as_str().unwrap_or("");
-                Some(self.terminal_state.open(command))
+                let result = self.terminal_state.open(command);
+                let cursor = self.terminal_state.buffer.lock().unwrap().total_bytes_written;
+                Some(serde_json::json!({
+                    "status": result,
+                    "cursor": cursor,
+                }).to_string())
             }
             "terminal_send" => {
                 if !self.terminal_state.is_running() {
@@ -878,7 +970,10 @@ impl App {
                 if !self.terminal_state.is_running() {
                     self.terminal_state.open("bash");
                 }
-                Some(self.terminal_state.read_buffer())
+                let args: serde_json::Value = serde_json::from_str(args_json).unwrap_or(serde_json::json!({}));
+                let cursor = args["cursor"].as_u64();
+                let result = self.terminal_state.read_buffer_incremental(cursor);
+                Some(result.to_string())
             }
             "terminal_close" => Some(self.terminal_state.close()),
             _ => None,
@@ -3915,7 +4010,7 @@ fn get_tool_definitions() -> Vec<serde_json::Value> {
             "type": "function",
             "function": {
                 "name": "terminal_open",
-                "description": "Open a terminal session to run a command. The terminal panel becomes visible so you can observe the output. Use terminal_send to interact and terminal_read to check output. Use terminal_close when done.",
+                "description": "Open a terminal session to run a command. The terminal panel becomes visible so you can observe the output. Returns JSON with 'status' (message) and 'cursor' (pass this to terminal_read for incremental reads). Use terminal_send to interact and terminal_read to check output. Use terminal_close when done.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -3949,10 +4044,15 @@ fn get_tool_definitions() -> Vec<serde_json::Value> {
             "type": "function",
             "function": {
                 "name": "terminal_read",
-                "description": "Read the current output buffer from the terminal. Returns the most recent output (up to 4000 chars).",
+                "description": "Read output from the terminal session. Returns JSON with 'output' (the text), 'cursor' (a position to pass on the next read for incremental output), and 'gap' (true if some output was lost due to buffer overflow). On the first read, omit 'cursor'. On subsequent reads, pass the 'cursor' value from the previous response to get only new output.",
                 "parameters": {
                     "type": "object",
-                    "properties": {}
+                    "properties": {
+                        "cursor": {
+                            "type": "integer",
+                            "description": "Optional cursor from a previous terminal_read response. When provided, only output written after that cursor is returned. Omit for the first read or to get the full tail window."
+                        }
+                    }
                 }
             }
         }),
@@ -4478,5 +4578,123 @@ mod tests {
         let _: Vec<_> = rx.iter().collect();
         assert!(elapsed >= 2, "expected >=2s wait, got {}s", elapsed);
         assert!(elapsed <= 4, "expected <=4s wait, got {}s", elapsed);
+    }
+
+    // --- TerminalBuffer cursor arithmetic tests ---
+
+    use super::TerminalBuffer;
+
+    fn make_buffer(content: &str, total: u64, start_offset: u64) -> TerminalBuffer {
+        TerminalBuffer {
+            content: content.to_string(),
+            total_bytes_written: total,
+            buffer_start_offset: start_offset,
+        }
+    }
+
+    #[test]
+    fn cursor_empty_read_no_cursor() {
+        let b = make_buffer("", 0, 0);
+        let result = b.read_incremental(None);
+        assert_eq!(result["output"].as_str().unwrap(), "");
+        assert_eq!(result["cursor"].as_u64().unwrap(), 0);
+        assert_eq!(result["gap"].as_bool().unwrap(), false);
+    }
+
+    #[test]
+    fn cursor_empty_read_with_cursor() {
+        let b = make_buffer("", 0, 0);
+        let result = b.read_incremental(Some(0));
+        assert_eq!(result["output"].as_str().unwrap(), "");
+        assert_eq!(result["cursor"].as_u64().unwrap(), 0);
+    }
+
+    #[test]
+    fn cursor_read_no_cursor_returns_tail() {
+        let b = make_buffer("hello world", 11, 0);
+        let result = b.read_incremental(None);
+        assert_eq!(result["output"].as_str().unwrap(), "hello world");
+        assert_eq!(result["cursor"].as_u64().unwrap(), 11);
+    }
+
+    #[test]
+    fn cursor_incremental_returns_only_new() {
+        let b = make_buffer("abcxyz", 6, 0);
+        let result = b.read_incremental(Some(3));
+        assert_eq!(result["output"].as_str().unwrap(), "xyz");
+        assert_eq!(result["cursor"].as_u64().unwrap(), 6);
+        assert_eq!(result["gap"].as_bool().unwrap(), false);
+    }
+
+    #[test]
+    fn cursor_at_end_returns_empty() {
+        let b = make_buffer("abc", 3, 0);
+        let result = b.read_incremental(Some(3));
+        assert_eq!(result["output"].as_str().unwrap(), "");
+        assert_eq!(result["cursor"].as_u64().unwrap(), 3);
+    }
+
+    #[test]
+    fn cursor_past_end_returns_error() {
+        let b = make_buffer("abc", 3, 0);
+        let result = b.read_incremental(Some(100));
+        assert_eq!(result["output"].as_str().unwrap(), "");
+        assert_eq!(result["cursor"].as_u64().unwrap(), 3);
+        assert!(result["error"].as_str().is_some(), "should have error for out-of-range cursor");
+    }
+
+    #[test]
+    fn cursor_evicted_returns_gap() {
+        // Buffer started at offset 1000, content is "xyz" (3 bytes), total written 1003
+        // Asking for cursor=500 which is before buffer_start_offset=1000
+        let b = make_buffer("xyz", 1003, 1000);
+        let result = b.read_incremental(Some(500));
+        assert_eq!(result["output"].as_str().unwrap(), "xyz");
+        assert_eq!(result["cursor"].as_u64().unwrap(), 1003);
+        assert_eq!(result["gap"].as_bool().unwrap(), true);
+    }
+
+    #[test]
+    fn cursor_at_buffer_start_returns_all() {
+        let b = make_buffer("abc", 1003, 1000);
+        let result = b.read_incremental(Some(1000));
+        assert_eq!(result["output"].as_str().unwrap(), "abc");
+        assert_eq!(result["gap"].as_bool().unwrap(), false);
+    }
+
+    #[test]
+    fn cursor_exact_boundary_after_drain() {
+        // Simulate: wrote 10000 bytes, drained 5000 from front
+        // Buffer now holds bytes 5000..10000, content length = 5000
+        let content = "x".repeat(5000);
+        let b = make_buffer(&content, 10000, 5000);
+        let result = b.read_incremental(Some(5000));
+        assert_eq!(result["output"].as_str().unwrap().len(), 5000);
+        assert_eq!(result["cursor"].as_u64().unwrap(), 10000);
+        assert_eq!(result["gap"].as_bool().unwrap(), false);
+    }
+
+    #[test]
+    fn cursor_just_before_buffer_start_is_gap() {
+        let content = "x".repeat(5000);
+        let b = make_buffer(&content, 10000, 5000);
+        let result = b.read_incremental(Some(4999));
+        assert_eq!(result["gap"].as_bool().unwrap(), true);
+        assert_eq!(result["cursor"].as_u64().unwrap(), 10000);
+    }
+
+    #[test]
+    fn cursor_monotonic_across_multiple_reads() {
+        let mut b = make_buffer("aaaa", 4, 0);
+        let r1 = b.read_incremental(None);
+        let c1 = r1["cursor"].as_u64().unwrap();
+
+        b.content.push_str("bbbb");
+        b.total_bytes_written = 8;
+        let r2 = b.read_incremental(Some(c1));
+        let c2 = r2["cursor"].as_u64().unwrap();
+
+        assert_eq!(r2["output"].as_str().unwrap(), "bbbb");
+        assert!(c2 > c1, "cursor must be monotonic: {} <= {}", c2, c1);
     }
 }

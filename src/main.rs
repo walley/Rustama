@@ -495,7 +495,11 @@ fn render_output(f: &mut Frame, app: &mut App, area: Rect) {
     };
 
     let streaming_part = if app.is_loading {
-        " [streaming] "
+        if app.retrying {
+            " [waiting] "
+        } else {
+            " [streaming] "
+        }
     } else {
         ""
     };
@@ -616,8 +620,13 @@ fn render_input(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_terminal_panel(f: &mut Frame, app: &App, area: Rect) {
-    let buffer = app.terminal_state.buffer.lock().unwrap();
-    let lines: Vec<Line> = buffer
+    let b = app.terminal_state.buffer.lock().unwrap();
+    let content = if b.content.len() > 4000 {
+        &b.content[b.content.len() - 4000..]
+    } else {
+        &b.content
+    };
+    let lines: Vec<Line> = content
         .lines()
         .map(|l| {
             Line::from(Span::styled(
