@@ -905,14 +905,10 @@ impl MainMenu {
         MenuAction::None
     }
 
-    pub fn render_bar(
-        &self,
-        f: &mut Frame,
-        agentic_mode: bool,
-        theme: &Theme,
-        area: Rect,
-        status_message: &str,
-    ) {
+    /// Renders the top menu bar: the menu names on the left and the clock
+    /// (`HH:MM`) on the right. Status text and mode indicators belong to the
+    /// status bar / keybar, not here.
+    pub fn render_bar(&self, f: &mut Frame, area: Rect) {
         let normal_style = Style::default().fg(Color::White).bg(Color::DarkGray);
         let selected_style = Style::default().fg(Color::Black).bg(Color::White);
 
@@ -937,25 +933,12 @@ impl MainMenu {
             normal_style
         };
 
-        let agentic_indicator = if agentic_mode {
-            Span::styled(
-                " [AGENTIC] ",
-                Style::default()
-                    .fg(theme.list_selected_fg)
-                    .bg(theme.list_selected_indicator_bg)
-                    .add_modifier(Modifier::BOLD),
-            )
-        } else {
-            Span::styled(" ", normal_style)
-        };
-
         let now = chrono::Local::now();
         let clock = format!("  {}  ", now.format("%H:%M"));
         let clock_len = clock.len() as u16;
-        let status_len = if status_message.is_empty() { 0 } else { status_message.len() as u16 + 3 };
-        let used = 6 + 1 + 6 + 1 + 6 + 1 + 5 + 1 + agentic_indicator.width() as u16 + status_len;
+        let used = 6 + 1 + 6 + 1 + 6 + 1 + 5 + 1;
         let pad = area.width.saturating_sub(used + clock_len);
-        let mut menu_bar_spans = vec![
+        let menu_bar_spans = vec![
             Span::styled(" File ", file_style),
             Span::styled(" ", normal_style),
             Span::styled(" Edit ", edit_style),
@@ -963,19 +946,9 @@ impl MainMenu {
             Span::styled(" View ", view_style),
             Span::styled(" ", normal_style),
             Span::styled(" Help ", help_style),
-            agentic_indicator,
+            Span::styled(" ".repeat(pad as usize), normal_style),
+            Span::styled(clock, normal_style),
         ];
-        if !status_message.is_empty() {
-            menu_bar_spans.push(Span::styled(
-                format!(" {} ", status_message),
-                Style::default().fg(Color::Yellow).bg(Color::DarkGray).add_modifier(Modifier::BOLD),
-            ));
-        }
-        menu_bar_spans.push(Span::styled(" ".repeat(pad as usize), normal_style));
-        menu_bar_spans.push(Span::styled(
-            clock,
-            Style::default().fg(Color::White).bg(Color::DarkGray),
-        ));
         let menu_bar = Line::from(menu_bar_spans);
 
         f.render_widget(Paragraph::new(menu_bar).style(normal_style), area);

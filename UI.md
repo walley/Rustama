@@ -300,7 +300,7 @@ Menu contents (defined in `item_names()`):
   - `Enter` — activate the selected item, close the menu, return its `MenuAction`.
   - `Esc` — close the menu.
 - `handle_click(col, row) -> MenuAction` — mouse support: row `0` toggles/switches menus; clicks inside the submenu activate items; clicks elsewhere close the menu.
-- `render_bar(f, agentic_mode, theme, area, status_message)` — renders the bar: menu names, an `[AGENTIC]` indicator when agentic mode is on, an optional status message, and a clock (`HH:MM`) on the right.
+- `render_bar(f, area)` — renders the bar: the menu names on the left and a clock (`HH:MM`) on the right. Nothing else is drawn here — status text and the mode indicator (agentic/chat) belong to the status bar.
 - `render_submenu(f, menu_bar_area)` — renders the open drop-down list under the active menu.
 
 ### Usage
@@ -311,7 +311,7 @@ let action = self.main_menu.handle_key(key);
 let action = self.main_menu.handle_click(col, row);
 
 // rendering (main.rs)
-app.main_menu.render_bar(f, app.agentic_mode, &app.theme, menu_area, &app.status_message);
+app.main_menu.render_bar(f, menu_area);
 if app.main_menu.is_open() {
     app.main_menu.render_submenu(f, menu_area);
 }
@@ -425,6 +425,28 @@ match cb.hit_test(col, row, area) {
     ConfirmHit::None => {}
 }
 ```
+
+---
+
+## Status Bar
+
+Not a `ui.rs` widget — rendered by `render_status_bar()` in `main.rs`. It is the
+single line between the **Output** and **Input** areas and is always visible.
+
+Format (left to right, `|` separated):
+
+```
+ MODE | message | tokens
+```
+
+- **Mode** — always present. `AGENTIC` (black bold on cyan) when agentic mode is
+  on, `CHAT` (white bold) otherwise.
+- **Message** — `app.status_message`, shown when non-empty. Yellow bold while a
+  request is loading/retrying, white bold otherwise.
+- **Tokens** — `app.format_token_stats()` (cyan), shown when token stats exist.
+
+The keybar (bottom line) only shows key hints and the focus indicator; mode and
+status text live exclusively in the status bar.
 
 ---
 

@@ -19,7 +19,7 @@ mod config;
 mod primary_selection;
 mod ui;
 use app::{App, ChatMessage, Focus, InputMode, ModelDialogFocus, SaveDialogFocus, SettingsFocus};
-use ui::{dialog_block, Button, ConfirmationBox, FileActionDialog, Theme};
+use ui::{dialog_block, Button, ConfirmationBox, FileActionDialog};
 use config::Config;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -177,13 +177,13 @@ fn ui(f: &mut Frame, app: &mut App) {
     ])
     .split(area);
 
-    app.main_menu.render_bar(f, app.agentic_mode, &app.theme, main_chunks[0], &app.status_message);
+    app.main_menu.render_bar(f, main_chunks[0]);
     render_keybar(f, app, main_chunks[2]);
 
     let show_terminal = app.terminal_state.visible && app.terminal_state.is_running();
-    let has_token_stats = app.token_stats.prompt_tokens > 0 || app.token_stats.response_tokens > 0;
-    let has_status = !app.status_message.is_empty() || has_token_stats;
 
+    // The status bar always has content (the mode indicator), so it is
+    // always rendered between the output and input areas.
     if show_terminal {
         let content_chunks = Layout::horizontal([
             Constraint::Percentage(100 - app.terminal_state.width_pct),
@@ -191,44 +191,28 @@ fn ui(f: &mut Frame, app: &mut App) {
         ])
         .split(main_chunks[1]);
 
-        if has_status {
-            let left_chunks = Layout::vertical([
-                Constraint::Min(3),
-                Constraint::Length(1),
-                Constraint::Length(5),
-            ])
-            .split(content_chunks[0]);
-            app.output_width = left_chunks[0].width;
-            render_output(f, app, left_chunks[0]);
-            render_status_bar(f, app, left_chunks[1]);
-            render_input(f, app, left_chunks[2]);
-        } else {
-            let left_chunks =
-                Layout::vertical([Constraint::Min(3), Constraint::Length(5)]).split(content_chunks[0]);
-            app.output_width = left_chunks[0].width;
-            render_output(f, app, left_chunks[0]);
-            render_input(f, app, left_chunks[1]);
-        }
+        let left_chunks = Layout::vertical([
+            Constraint::Min(3),
+            Constraint::Length(1),
+            Constraint::Length(5),
+        ])
+        .split(content_chunks[0]);
+        app.output_width = left_chunks[0].width;
+        render_output(f, app, left_chunks[0]);
+        render_status_bar(f, app, left_chunks[1]);
+        render_input(f, app, left_chunks[2]);
         render_terminal_panel(f, app, content_chunks[1]);
     } else {
-        if has_status {
-            let content_chunks = Layout::vertical([
-                Constraint::Min(3),
-                Constraint::Length(1),
-                Constraint::Length(5),
-            ])
-            .split(main_chunks[1]);
-            app.output_width = content_chunks[0].width;
-            render_output(f, app, content_chunks[0]);
-            render_status_bar(f, app, content_chunks[1]);
-            render_input(f, app, content_chunks[2]);
-        } else {
-            let content_chunks =
-                Layout::vertical([Constraint::Min(3), Constraint::Length(5)]).split(main_chunks[1]);
-            app.output_width = content_chunks[0].width;
-            render_output(f, app, content_chunks[0]);
-            render_input(f, app, content_chunks[1]);
-        }
+        let content_chunks = Layout::vertical([
+            Constraint::Min(3),
+            Constraint::Length(1),
+            Constraint::Length(5),
+        ])
+        .split(main_chunks[1]);
+        app.output_width = content_chunks[0].width;
+        render_output(f, app, content_chunks[0]);
+        render_status_bar(f, app, content_chunks[1]);
+        render_input(f, app, content_chunks[2]);
     }
 
     if app.main_menu.is_open() {
@@ -669,9 +653,29 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
     let activity = app.status_message.trim().to_string();
     let token_info = app.format_token_stats();
 
-    let mut spans: Vec<Span> = Vec::new();
+    // Mode indicator always leads the bar: "mode | messages | tokens".
+    let (mode_label, mode_style) = if app.agentic_mode {
+        (
+            " AGENTIC ",
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
+        (
+            " CHAT ",
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        )
+    };
+
+    let sep_style = Style::default().fg(Color::Gray);
+    let mut spans: Vec<Span> = vec![Span::styled(mode_label, mode_style)];
 
     if !activity.is_empty() {
+        spans.push(Span::styled("|", sep_style));
         let style = if app.is_loading || app.retrying {
             Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
         } else {
@@ -681,17 +685,11 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
     }
 
     if !token_info.is_empty() {
-        if !spans.is_empty() {
-            spans.push(Span::styled(" | ", Style::default().fg(Color::DarkGray)));
-        }
+        spans.push(Span::styled("|", sep_style));
         spans.push(Span::styled(
             format!(" {} ", token_info),
             Style::default().fg(Color::Cyan),
         ));
-    }
-
-    if spans.is_empty() {
-        return;
     }
 
     let line = Line::from(spans);
@@ -700,12 +698,6 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_keybar(f: &mut Frame, app: &App, area: Rect) {
-    let agentic_label = if app.agentic_mode {
-        " AGENTIC "
-    } else {
-        ""
-    };
-
     let focus_label = match app.focus {
         Focus::Output => " [OUTPUT] ",
         Focus::Input => " [INPUT] ",
@@ -729,12 +721,12 @@ fn render_keybar(f: &mut Frame, app: &App, area: Rect) {
 
     let text = match app.input_mode {
         InputMode::Normal => format!(
-            " F9:Menu  F10:Quit  Ctrl+S:Save  Mouse:Scroll{}{}{}{}",
-            agentic_label, focus_label, terminal_hint, resize_hint
+            " F9:Menu  F10:Quit  Ctrl+S:Save  Mouse:Scroll{}{}{}",
+            focus_label, terminal_hint, resize_hint
         ),
         InputMode::Input => format!(
-            " Enter:Send  Alt+Enter:Newline{}{}",
-            agentic_label, terminal_hint
+            " Enter:Send  Alt+Enter:Newline{}",
+            terminal_hint
         ),
         InputMode::Menu => " \u{2190}\u{2192}:Navigate  \u{2191}\u{2193}:Select  Enter:Open  Esc:Close"
             .to_string(),

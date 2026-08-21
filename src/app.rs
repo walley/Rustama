@@ -141,6 +141,10 @@ pub enum StreamChunk {
     StatusTick(String),
     ToolCalls(Vec<serde_json::Value>),
     Truncated(String),
+    /// Token usage mid-stream (e.g. attached to the finish chunk before
+    /// tool calls are executed). `check_responses` folds it into the stats
+    /// that the next `Done`/`ToolCalls` transition reports.
+    Stats(TokenStats),
 }
 
 const TERMINAL_BUFFER_MAX: usize = 102400;
@@ -544,6 +548,9 @@ pub struct App {
     pub retry_paused_message: String,
     pub pending_continuation: bool,
     pub continuation_count: u32,
+    /// Token usage received mid-stream (via `StreamChunk::Stats`) that has not
+    /// been committed to `token_stats` yet.
+    last_stats: TokenStats,
 }
 
 impl App {
@@ -654,6 +661,7 @@ impl App {
             retry_paused_message: String::new(),
             pending_continuation: false,
             continuation_count: 0,
+            last_stats: TokenStats::default(),
         };
         app.session_name = app.session_id.clone();
         log_to_file(app.is_logging, &app.log_file, &app.session_id, "START", "Program started");
@@ -1052,6 +1060,11 @@ impl App {
                         self.retrying = true;
                         self.auto_scroll = true;
                     }
+                    Ok(StreamChunk::Stats(stats)) => {
+                        // Mid-stream usage report; committed on the next
+                        // Done/ToolCalls transition.
+                        self.last_stats = stats;
+                    }
                     Ok(StreamChunk::Truncated(msg)) => {
                         self.status_message = msg.clone();
                         self.retrying = false;
@@ -1134,6 +1147,10 @@ impl App {
                         }
                         self.pending_tool_calls = tool_calls;
                         self.is_loading = false;
+                        // The finish chunk carried usage (sent as Stats): commit it.
+                        if self.last_stats.prompt_tokens > 0 || self.last_stats.response_tokens > 0 {
+                            self.token_stats = self.last_stats.clone();
+                        }
                         self.status_message = self.format_token_stats();
                         self.response_rx = None;
                         self.tool_round_count += 1;
@@ -1149,7 +1166,13 @@ impl App {
                     }
                     Ok(StreamChunk::Done(stats)) => {
                         self.retrying = false;
-                        self.token_stats = stats;
+                        // A bare `[DONE]` sentinel or stream close reports default
+                        // stats; keep the ones received earlier via Stats.
+                        self.token_stats = if stats.prompt_tokens > 0 || stats.response_tokens > 0 {
+                            stats
+                        } else {
+                            self.last_stats.clone()
+                        };
 
                         // If Truncated already committed the partial text, handle continuation
                         if self.pending_continuation {
@@ -1510,6 +1533,11 @@ impl App {
                                         }
                                         if let Ok(json) = serde_json::from_str::<serde_json::Value>(&line) {
                                             if is_cloud {
+                                                // Usage can ride on any chunk (nested under
+                                                // choices[i] or top-level); forward it whenever present.
+                                                if usage_from_json(&json).is_some() {
+                                                    let _ = tx.send(StreamChunk::Stats(parse_usage_stats(&json)));
+                                                }
                                                 if let Some(reasoning) = json["choices"][0]["delta"]["reasoning_content"].as_str()
                                                     && !reasoning.is_empty() {
                                                         let _ = tx.send(StreamChunk::Thinking(reasoning.to_string()));
@@ -1550,6 +1578,9 @@ impl App {
                                                      let stats = parse_usage_stats(&json);
                                                     log_to_file(is_logging, &log_file, &session_id, "STREAM_END", &format!("{} finish_reason={}", api_url, finish.unwrap_or("?")));
                                                     if !tool_call_map.is_empty() {
+                                                        if stats.prompt_tokens > 0 || stats.response_tokens > 0 {
+                                                            let _ = tx.send(StreamChunk::Stats(stats));
+                                                        }
                                                         let mut calls: Vec<serde_json::Value> = tool_call_map.into_values().collect();
                                                         calls.sort_by_key(|tc| tc["index"].as_u64().unwrap_or(0));
                                                         let _ = tx.send(StreamChunk::ToolCalls(calls));
@@ -1870,6 +1901,11 @@ impl App {
                                         }
                                         if let Ok(json) = serde_json::from_str::<serde_json::Value>(&line) {
                                             if is_cloud {
+                                                // Usage can ride on any chunk (nested under
+                                                // choices[i] or top-level); forward it whenever present.
+                                                if usage_from_json(&json).is_some() {
+                                                    let _ = tx.send(StreamChunk::Stats(parse_usage_stats(&json)));
+                                                }
                                                 if let Some(reasoning) = json["choices"][0]["delta"]["reasoning_content"].as_str()
                                                     && !reasoning.is_empty() {
                                                         let _ = tx.send(StreamChunk::Thinking(reasoning.to_string()));
@@ -1910,6 +1946,9 @@ impl App {
                                                      let stats = parse_usage_stats(&json);
                                                     log_to_file(is_logging, &log_file, &session_id, "STREAM_END", &format!("{} finish_reason={}", api_url, finish.unwrap_or("?")));
                                                     if !tool_call_map.is_empty() {
+                                                        if stats.prompt_tokens > 0 || stats.response_tokens > 0 {
+                                                            let _ = tx.send(StreamChunk::Stats(stats));
+                                                        }
                                                         let mut calls: Vec<serde_json::Value> = tool_call_map.into_values().collect();
                                                         calls.sort_by_key(|tc| tc["index"].as_u64().unwrap_or(0));
                                                         let _ = tx.send(StreamChunk::ToolCalls(calls));
@@ -3852,14 +3891,101 @@ fn parse_token_stats(json: &serde_json::Value) -> TokenStats {
     }
 }
 
+/// Locates the `usage` object in an OpenAI-compatible chunk.
+///
+/// Two layouts exist in the wild:
+/// - top-level `usage` on a usage-only final chunk (OpenAI spec: `choices` is
+///   empty and `usage` is a sibling of `choices`),
+/// - `usage` nested inside `choices[i]` (e.g. Kimi K3 attaches it to the final
+///   chunk that carries `finish_reason`).
+fn usage_from_json(json: &serde_json::Value) -> Option<&serde_json::Value> {
+    if !json["usage"].is_null() {
+        return Some(&json["usage"]);
+    }
+    json["choices"]
+        .as_array()
+        .and_then(|choices| choices.iter().find_map(|c| {
+            if c["usage"].is_null() { None } else { Some(&c["usage"]) }
+        }))
+}
+
 fn parse_usage_stats(json: &serde_json::Value) -> TokenStats {
+    let usage = match usage_from_json(json) {
+        Some(u) => u,
+        None => return TokenStats::default(),
+    };
     TokenStats {
-        prompt_tokens: json["usage"]["prompt_tokens"].as_u64().unwrap_or(0),
-        response_tokens: json["usage"]["completion_tokens"].as_u64().unwrap_or(0),
-        cached_tokens: json["usage"]["prompt_tokens_details"]["cached_tokens"].as_u64().unwrap_or(0),
-        reasoning_tokens: json["usage"]["completion_tokens_details"]["reasoning_tokens"].as_u64().unwrap_or(0),
+        prompt_tokens: usage["prompt_tokens"].as_u64().unwrap_or(0),
+        response_tokens: usage["completion_tokens"].as_u64().unwrap_or(0),
+        cached_tokens: usage["prompt_tokens_details"]["cached_tokens"].as_u64().unwrap_or(0),
+        reasoning_tokens: usage["completion_tokens_details"]["reasoning_tokens"].as_u64().unwrap_or(0),
         total_duration_ms: 0,
         tokens_per_sec: 0.0,
+    }
+}
+
+#[cfg(test)]
+mod usage_tests {
+    use super::*;
+
+    #[test]
+    fn usage_top_level_openai_style() {
+        // OpenAI spec: usage-only final chunk, empty choices, top-level usage.
+        let json = serde_json::json!({
+            "id": "chatcmpl-1",
+            "object": "chat.completion.chunk",
+            "choices": [],
+            "usage": {
+                "prompt_tokens": 120,
+                "completion_tokens": 42,
+                "total_tokens": 162,
+                "prompt_tokens_details": {"cached_tokens": 100},
+                "completion_tokens_details": {"reasoning_tokens": 10}
+            }
+        });
+        let stats = parse_usage_stats(&json);
+        assert_eq!(stats.prompt_tokens, 120);
+        assert_eq!(stats.response_tokens, 42);
+        assert_eq!(stats.cached_tokens, 100);
+        assert_eq!(stats.reasoning_tokens, 10);
+    }
+
+    #[test]
+    fn usage_nested_in_choices_kimi_style() {
+        // Kimi K3: usage nested inside choices[0] on the finish chunk.
+        let json = serde_json::json!({
+            "id": "chatcmpl-2",
+            "object": "chat.completion.chunk",
+            "choices": [{
+                "index": 0,
+                "delta": {},
+                "finish_reason": "tool_calls",
+                "usage": {
+                    "prompt_tokens": 56525,
+                    "completion_tokens": 338,
+                    "total_tokens": 56863,
+                    "cached_tokens": 55808,
+                    "completion_tokens_details": {"reasoning_tokens": 218},
+                    "prompt_tokens_details": {"cached_tokens": 55808}
+                }
+            }]
+        });
+        let stats = parse_usage_stats(&json);
+        assert_eq!(stats.prompt_tokens, 56525);
+        assert_eq!(stats.response_tokens, 338);
+        assert_eq!(stats.cached_tokens, 55808);
+        assert_eq!(stats.reasoning_tokens, 218);
+    }
+
+    #[test]
+    fn usage_absent_yields_default() {
+        let json = serde_json::json!({
+            "choices": [{"index": 0, "delta": {"content": "hi"}, "finish_reason": null}]
+        });
+        assert!(usage_from_json(&json).is_none());
+        let stats = parse_usage_stats(&json);
+        assert_eq!(stats.prompt_tokens, 0);
+        assert_eq!(stats.response_tokens, 0);
     }
 }
 
