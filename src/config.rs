@@ -303,7 +303,7 @@ fn default_cloud_conf() -> String {
      \n\
      [mistral-small]\n\
      api_url = https://api.mistral.ai/v1/chat/completions\n\
-     api_key = XJUStDrci7RWGaYXPxKWJ0urj4vlYqKA\n\
+     api_key = YOUR_MISTRAL_API_KEY\n\
      \n\
      [kimi-k3]\n\
      api_url = https://api.moonshot.ai/v1/chat/completions\n\
@@ -311,6 +311,11 @@ fn default_cloud_conf() -> String {
      \n\
      "
     .to_string()
+}
+
+/// A key left at its shipped placeholder (`YOUR_...`) counts as "not configured".
+fn is_placeholder_key(key: &str) -> bool {
+    key.starts_with("YOUR_")
 }
 
 fn parse_cloud_models(content: &str) -> Vec<CloudModel> {
@@ -329,7 +334,9 @@ fn parse_cloud_models(content: &str) -> Vec<CloudModel> {
 
         if line.starts_with('[') && line.ends_with(']') {
             if let Some(name) = current_name.take()
-                && !current_url.is_empty() && !current_key.is_empty() {
+                && !current_url.is_empty()
+                && !current_key.is_empty()
+                && !is_placeholder_key(&current_key) {
                     let api_model = if current_api_model.is_empty() {
                         name.clone()
                     } else {
@@ -366,7 +373,9 @@ fn parse_cloud_models(content: &str) -> Vec<CloudModel> {
     }
 
     if let Some(name) = current_name
-        && !current_url.is_empty() && !current_key.is_empty() {
+        && !current_url.is_empty()
+        && !current_key.is_empty()
+        && !is_placeholder_key(&current_key) {
             let api_model = if current_api_model.is_empty() {
                 name.clone()
             } else {
@@ -430,4 +439,59 @@ fn parse_ini(content: &str) -> HashMap<String, String> {
         }
     }
     map
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn placeholder_keys_are_skipped() {
+        let conf = "[mistral-small]\n\
+                    api_url = https://api.mistral.ai/v1/chat/completions\n\
+                    api_key = YOUR_MISTRAL_API_KEY\n\
+                    \n\
+                    [kimi-k3]\n\
+                    api_url = https://api.moonshot.ai/v1/chat/completions\n\
+                    api_key = YOUR_MOONSHOT_API_KEY\n";
+        assert!(parse_cloud_models(conf).is_empty());
+    }
+
+    #[test]
+    fn real_keys_are_registered() {
+        let conf = "[mistral-small]\n\
+                    api_url = https://api.mistral.ai/v1/chat/completions\n\
+                    api_key = abc123realkey\n";
+        let models = parse_cloud_models(conf);
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].name, "mistral-small");
+        assert_eq!(models[0].api_key, "abc123realkey");
+        assert_eq!(models[0].api_model, "mistral-small"); // defaults to section name
+    }
+
+    #[test]
+    fn mixed_placeholder_and_real() {
+        let conf = "[placeholder]\n\
+                    api_url = https://example.com/v1/chat/completions\n\
+                    api_key = YOUR_KEY_HERE\n\
+                    \n\
+                    [real]\n\
+                    api_url = https://example.com/v1/chat/completions\n\
+                    api_key = sk-live-123\n";
+        let models = parse_cloud_models(conf);
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].name, "real");
+    }
+
+    #[test]
+    fn missing_key_is_skipped() {
+        let conf = "[nokey]\napi_url = https://example.com\n";
+        assert!(parse_cloud_models(conf).is_empty());
+    }
+
+    #[test]
+    fn shipped_default_conf_has_no_real_keys() {
+        // Regression: the default config must never embed a live credential.
+        assert!(parse_cloud_models(&default_cloud_conf()).is_empty());
+    }
 }

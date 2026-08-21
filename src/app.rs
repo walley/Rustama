@@ -1434,237 +1434,15 @@ impl App {
         let top_k = self.top_k;
         let proxy = if cloud_model.is_some() { self.proxy.clone() } else { None };
         let max_retries = self.max_retries;
+        let agentic = self.agentic_mode;
 
         self.log_event("PROMPT", &serde_json::to_string_pretty(&api_messages).unwrap_or_default());
 
-        let (tx, rx) = mpsc::channel();
+        let rx = stream_chat_request(
+            api_messages, agentic, model, url, cloud_model, is_logging,
+            log_file, session_id, temperature, top_p, top_k, proxy, max_retries,
+        );
         self.response_rx = Some(rx);
-
-        std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-
-            rt.block_on(async {
-                let client = build_reqwest_client(&proxy);
-
-                let (api_url, headers, body) = if let Some(ref cloud) = cloud_model {
-                    let mut body = serde_json::json!({
-                        "model": cloud.api_model,
-                        "messages": api_messages,
-                        "stream": true,
-                        "max_tokens": cloud.max_output_tokens,
-                    });
-                    body["tools"] = serde_json::json!(get_tool_definitions());
-                    body["temperature"] = serde_json::json!(temperature);
-                    body["top_p"] = serde_json::json!(top_p);
-                    let mut headers = reqwest::header::HeaderMap::new();
-                    headers.insert(
-                        "Authorization",
-                        reqwest::header::HeaderValue::from_str(&format!("Bearer {}", cloud.api_key)).unwrap(),
-                    );
-                    headers.insert(
-                        "Content-Type",
-                        reqwest::header::HeaderValue::from_static("application/json"),
-                    );
-                    (cloud.api_url.clone(), Some(headers), body)
-                } else {
-                    let mut body = serde_json::json!({
-                        "model": model,
-                        "messages": api_messages,
-                        "stream": true,
-                        "tools": get_tool_definitions(),
-                    });
-                    let mut options = serde_json::json!({});
-                    options["temperature"] = serde_json::json!(temperature);
-                    options["top_p"] = serde_json::json!(top_p);
-                    if top_k > 0 {
-                        options["top_k"] = serde_json::json!(top_k);
-                    }
-                    body["options"] = options;
-                    (format!("{}/api/chat", url), None, body)
-                };
-
-                log_to_file(is_logging, &log_file, &session_id, "REQUEST", &format!("{} {}", api_url, serde_json::to_string(&body).unwrap_or_default()));
-
-                let result = send_with_retry(&client, reqwest::Method::POST, &api_url, headers, &body, max_retries, &tx, is_logging, &log_file, &session_id).await;
-
-                let is_cloud = cloud_model.is_some();
-                match result {
-                    Ok(mut resp) => {
-                        if !resp.status().is_success() {
-                            let status = resp.status();
-                            let body = resp.text().await.unwrap_or_default();
-                            let msg = format!("HTTP {}: {}", status, truncate(&body, 200));
-                            log_to_file(is_logging, &log_file, &session_id, "HTTP_ERROR", &msg);
-                            if status.as_u16() == 429 {
-                                let _ = tx.send(StreamChunk::RetryPaused(format!("Max retries ({}) reached. Request paused.", max_retries)));
-                            } else {
-                                let _ = tx.send(StreamChunk::Error(msg));
-                            }
-                            return;
-                        }
-                        let mut buffer = String::new();
-                        let mut tool_call_map: std::collections::HashMap<u32, serde_json::Value> = std::collections::HashMap::new();
-                        loop {
-                            match resp.chunk().await {
-                                Ok(Some(chunk)) => {
-                                    buffer.push_str(&String::from_utf8_lossy(&chunk));
-                                    while let Some(pos) = buffer.find('\n') {
-                                        let raw = buffer[..pos].trim().to_string();
-                                        buffer = buffer[pos + 1..].to_string();
-                                        if raw.is_empty() {
-                                            continue;
-                                        }
-                                        let line = if is_cloud {
-                                            raw.strip_prefix("data: ").unwrap_or(&raw).trim().to_string()
-                                        } else {
-                                            raw
-                                        };
-                                        log_to_file(is_logging, &log_file, &session_id, "RESPONSE", &line);
-                                        if line == "[DONE]" {
-                                            log_to_file(is_logging, &log_file, &session_id, "STREAM_END", "DONE sentinel");
-                                            let _ = tx.send(StreamChunk::Done(TokenStats::default()));
-                                            return;
-                                        }
-                                        if line.is_empty() {
-                                            continue;
-                                        }
-                                        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&line) {
-                                            if is_cloud {
-                                                // Usage can ride on any chunk (nested under
-                                                // choices[i] or top-level); forward it whenever present.
-                                                if usage_from_json(&json).is_some() {
-                                                    let _ = tx.send(StreamChunk::Stats(parse_usage_stats(&json)));
-                                                }
-                                                if let Some(reasoning) = json["choices"][0]["delta"]["reasoning_content"].as_str()
-                                                    && !reasoning.is_empty() {
-                                                        let _ = tx.send(StreamChunk::Thinking(reasoning.to_string()));
-                                                    }
-                                                if let Some(delta) = json["choices"][0]["delta"]["content"].as_str()
-                                                    && !delta.is_empty() {
-                                                        let _ = tx.send(StreamChunk::Text(delta.to_string()));
-                                                    }
-                                                if let Some(tc_array) = json["choices"][0]["delta"]["tool_calls"].as_array() {
-                                                    for tc in tc_array {
-                                                        let idx = tc["index"].as_u64().unwrap_or(0) as u32;
-                                                        let entry = tool_call_map.entry(idx).or_insert_with(|| {
-                                                            let mut base = serde_json::json!({
-                                                                "index": idx,
-                                                                "type": "function",
-                                                                "function": {"name": "", "arguments": ""}
-                                                            });
-                                                            if let Some(id) = tc["id"].as_str() {
-                                                                base["id"] = serde_json::json!(id);
-                                                            }
-                                                            base
-                                                        });
-                                                        if let Some(id) = tc["id"].as_str() {
-                                                            entry["id"] = serde_json::json!(id);
-                                                        }
-                                                        if let Some(name) = tc["function"]["name"].as_str()
-                                                            && !name.is_empty() {
-                                                                entry["function"]["name"] = serde_json::json!(name);
-                                                            }
-                                                        if let Some(args) = tc["function"]["arguments"].as_str() {
-                                                            let existing = entry["function"]["arguments"].as_str().unwrap_or("").to_string();
-                                                            entry["function"]["arguments"] = serde_json::json!(format!("{}{}", existing, args));
-                                                        }
-                                                    }
-                                                }
-                                                let finish = json["choices"][0]["finish_reason"].as_str();
-                                                if finish == Some("stop") || finish == Some("tool_calls") {
-                                                     let stats = parse_usage_stats(&json);
-                                                    log_to_file(is_logging, &log_file, &session_id, "STREAM_END", &format!("{} finish_reason={}", api_url, finish.unwrap_or("?")));
-                                                    if !tool_call_map.is_empty() {
-                                                        if stats.prompt_tokens > 0 || stats.response_tokens > 0 {
-                                                            let _ = tx.send(StreamChunk::Stats(stats));
-                                                        }
-                                                        let mut calls: Vec<serde_json::Value> = tool_call_map.into_values().collect();
-                                                        calls.sort_by_key(|tc| tc["index"].as_u64().unwrap_or(0));
-                                                        let _ = tx.send(StreamChunk::ToolCalls(calls));
-                                                    } else {
-                                                        let _ = tx.send(StreamChunk::Done(stats));
-                                                    }
-                                                    return;
-                                                }
-                                                if finish == Some("length") || finish == Some("max_tokens") {
-                                                    let stats = parse_usage_stats(&json);
-                                                    log_to_file(is_logging, &log_file, &session_id, "STREAM_TRUNCATED", &format!("{} finish_reason={}", api_url, finish.unwrap_or("?")));
-                                                    let _ = tx.send(StreamChunk::Truncated(format!(
-                                                        "Response truncated (finish_reason={}). Output limit reached.", finish.unwrap_or("?")
-                                                    )));
-                                                    let _ = tx.send(StreamChunk::Done(stats));
-                                                    return;
-                                                }
-                                            } else {
-                                                if let Some(thinking) = json["message"]["thinking"].as_str()
-                                                    && !thinking.is_empty() {
-                                                        let _ = tx.send(StreamChunk::Thinking(thinking.to_string()));
-                                                    }
-                                                if let Some(content) = json["message"]["content"].as_str()
-                                                    && !content.is_empty() {
-                                                        let _ = tx.send(StreamChunk::Text(content.to_string()));
-                                                    }
-                                                if let Some(tool_calls) = json["message"]["tool_calls"].as_array() {
-                                                    for tc in tool_calls {
-                                                        let idx = tc["index"].as_u64().unwrap_or(0) as u32;
-                                                        let entry = tool_call_map.entry(idx).or_insert_with(|| {
-                                                            serde_json::json!({
-                                                                "index": idx,
-                                                                "type": "function",
-                                                                "function": {"name": "", "arguments": ""}
-                                                            })
-                                                        });
-                                                        if let Some(name) = tc["function"]["name"].as_str() {
-                                                            entry["function"]["name"] = serde_json::json!(name);
-                                                        }
-                                                        if let Some(id) = tc["id"].as_str() {
-                                                            entry["id"] = serde_json::json!(id);
-                                                        }
-                                                        if let Some(args) = tc["function"]["arguments"].as_str() {
-                                                            entry["function"]["arguments"] = serde_json::json!(args);
-                                                        } else {
-                                                            entry["function"]["arguments"] = serde_json::json!(tc["function"]["arguments"].to_string());
-                                                        }
-                                                    }
-                                                }
-                                                if json["done"].as_bool() == Some(true) {
-                                                    log_to_file(is_logging, &log_file, &session_id, "STREAM_END", &format!("{} done=true tokens={}", api_url, json["eval_count"].as_u64().unwrap_or(0)));
-                                                    if !tool_call_map.is_empty() {
-                                                        let calls: Vec<serde_json::Value> = tool_call_map.into_values().collect();
-                                                        let _ = tx.send(StreamChunk::ToolCalls(calls));
-                                                    } else {
-                                                        let stats = parse_token_stats(&json);
-                                                        let _ = tx.send(StreamChunk::Done(stats));
-                                                    }
-                                                    return;
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                Ok(None) => {
-                                    log_to_file(is_logging, &log_file, &session_id, "STREAM_END", "stream closed");
-                                    let _ = tx.send(StreamChunk::Done(TokenStats::default()));
-                                    return;
-                                }
-                                Err(e) => {
-                                    log_to_file(is_logging, &log_file, &session_id, "STREAM_ERROR", &format!("{} | buffer: {:?}", e, buffer));
-                                    let _ = tx.send(StreamChunk::Error(format!("Stream error: {} | last bytes: {:?}", e, truncate(&buffer, 200))));
-                                    return;
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        log_to_file(is_logging, &log_file, &session_id, "CONNECT_ERROR", &e.to_string());
-                        let _ = tx.send(StreamChunk::Error(format!("Failed to connect: {}", e)));
-                    }
-                }
-            });
-        });
     }
 
     fn send_to_ollama_async(&mut self) {
@@ -1803,236 +1581,11 @@ impl App {
 
         self.log_event("PROMPT", &serde_json::to_string_pretty(&api_messages).unwrap_or_default());
 
-        let (tx, rx) = mpsc::channel();
+        let rx = stream_chat_request(
+            api_messages, agentic, model, url, cloud_model, is_logging,
+            log_file, session_id, temperature, top_p, top_k, proxy, max_retries,
+        );
         self.response_rx = Some(rx);
-
-        std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-
-            rt.block_on(async {
-                let client = build_reqwest_client(&proxy);
-
-                let (api_url, headers, body) = if let Some(ref cloud) = cloud_model {
-                    let mut body = serde_json::json!({
-                        "model": cloud.api_model,
-                        "messages": api_messages,
-                        "stream": true,
-                        "max_tokens": cloud.max_output_tokens,
-                    });
-                    body["tools"] = serde_json::json!(get_tool_definitions());
-                    body["temperature"] = serde_json::json!(temperature);
-                    body["top_p"] = serde_json::json!(top_p);
-                    let mut headers = reqwest::header::HeaderMap::new();
-                    headers.insert(
-                        "Authorization",
-                        reqwest::header::HeaderValue::from_str(&format!("Bearer {}", cloud.api_key)).unwrap(),
-                    );
-                    headers.insert(
-                        "Content-Type",
-                        reqwest::header::HeaderValue::from_static("application/json"),
-                    );
-                    (cloud.api_url.clone(), Some(headers), body)
-                } else {
-                    let mut body = serde_json::json!({
-                        "model": model,
-                        "messages": api_messages,
-                        "stream": true,
-                    });
-                    if agentic {
-                        body["tools"] = serde_json::json!(get_tool_definitions());
-                    }
-                    let mut options = serde_json::json!({});
-                    options["temperature"] = serde_json::json!(temperature);
-                    options["top_p"] = serde_json::json!(top_p);
-                    if top_k > 0 {
-                        options["top_k"] = serde_json::json!(top_k);
-                    }
-                    body["options"] = options;
-                    (format!("{}/api/chat", url), None, body)
-                };
-
-                log_to_file(is_logging, &log_file, &session_id, "REQUEST", &format!("{} {}", api_url, serde_json::to_string(&body).unwrap_or_default()));
-
-                let result = send_with_retry(&client, reqwest::Method::POST, &api_url, headers, &body, max_retries, &tx, is_logging, &log_file, &session_id).await;
-
-                let is_cloud = cloud_model.is_some();
-                match result {
-                    Ok(mut resp) => {
-                        if !resp.status().is_success() {
-                            let status = resp.status();
-                            let body = resp.text().await.unwrap_or_default();
-                            let msg = format!("HTTP {}: {}", status, truncate(&body, 200));
-                            log_to_file(is_logging, &log_file, &session_id, "HTTP_ERROR", &msg);
-                            if status.as_u16() == 429 {
-                                let _ = tx.send(StreamChunk::RetryPaused(format!("Max retries ({}) reached. Request paused.", max_retries)));
-                            } else {
-                                let _ = tx.send(StreamChunk::Error(msg));
-                            }
-                            return;
-                        }
-                        let mut buffer = String::new();
-                        let mut tool_call_map: std::collections::HashMap<u32, serde_json::Value> = std::collections::HashMap::new();
-                        loop {
-                            match resp.chunk().await {
-                                Ok(Some(chunk)) => {
-                                    buffer.push_str(&String::from_utf8_lossy(&chunk));
-                                    while let Some(pos) = buffer.find('\n') {
-                                        let raw = buffer[..pos].trim().to_string();
-                                        buffer = buffer[pos + 1..].to_string();
-                                        if raw.is_empty() {
-                                            continue;
-                                        }
-                                        let line = if is_cloud {
-                                            raw.strip_prefix("data: ").unwrap_or(&raw).trim().to_string()
-                                        } else {
-                                            raw
-                                        };
-                                        log_to_file(is_logging, &log_file, &session_id, "RESPONSE", &line);
-                                        if line == "[DONE]" {
-                                            log_to_file(is_logging, &log_file, &session_id, "STREAM_END", "DONE sentinel");
-                                            let _ = tx.send(StreamChunk::Done(TokenStats::default()));
-                                            return;
-                                        }
-                                        if line.is_empty() {
-                                            continue;
-                                        }
-                                        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&line) {
-                                            if is_cloud {
-                                                // Usage can ride on any chunk (nested under
-                                                // choices[i] or top-level); forward it whenever present.
-                                                if usage_from_json(&json).is_some() {
-                                                    let _ = tx.send(StreamChunk::Stats(parse_usage_stats(&json)));
-                                                }
-                                                if let Some(reasoning) = json["choices"][0]["delta"]["reasoning_content"].as_str()
-                                                    && !reasoning.is_empty() {
-                                                        let _ = tx.send(StreamChunk::Thinking(reasoning.to_string()));
-                                                    }
-                                                if let Some(delta) = json["choices"][0]["delta"]["content"].as_str()
-                                                    && !delta.is_empty() {
-                                                        let _ = tx.send(StreamChunk::Text(delta.to_string()));
-                                                    }
-                                                if let Some(tc_array) = json["choices"][0]["delta"]["tool_calls"].as_array() {
-                                                    for tc in tc_array {
-                                                        let idx = tc["index"].as_u64().unwrap_or(0) as u32;
-                                                        let entry = tool_call_map.entry(idx).or_insert_with(|| {
-                                                            let mut base = serde_json::json!({
-                                                                "index": idx,
-                                                                "type": "function",
-                                                                "function": {"name": "", "arguments": ""}
-                                                            });
-                                                            if let Some(id) = tc["id"].as_str() {
-                                                                base["id"] = serde_json::json!(id);
-                                                            }
-                                                            base
-                                                        });
-                                                        if let Some(id) = tc["id"].as_str() {
-                                                            entry["id"] = serde_json::json!(id);
-                                                        }
-                                                        if let Some(name) = tc["function"]["name"].as_str()
-                                                            && !name.is_empty() {
-                                                                entry["function"]["name"] = serde_json::json!(name);
-                                                            }
-                                                        if let Some(args) = tc["function"]["arguments"].as_str() {
-                                                            let existing = entry["function"]["arguments"].as_str().unwrap_or("").to_string();
-                                                            entry["function"]["arguments"] = serde_json::json!(format!("{}{}", existing, args));
-                                                        }
-                                                    }
-                                                }
-                                                let finish = json["choices"][0]["finish_reason"].as_str();
-                                                if finish == Some("stop") || finish == Some("tool_calls") {
-                                                     let stats = parse_usage_stats(&json);
-                                                    log_to_file(is_logging, &log_file, &session_id, "STREAM_END", &format!("{} finish_reason={}", api_url, finish.unwrap_or("?")));
-                                                    if !tool_call_map.is_empty() {
-                                                        if stats.prompt_tokens > 0 || stats.response_tokens > 0 {
-                                                            let _ = tx.send(StreamChunk::Stats(stats));
-                                                        }
-                                                        let mut calls: Vec<serde_json::Value> = tool_call_map.into_values().collect();
-                                                        calls.sort_by_key(|tc| tc["index"].as_u64().unwrap_or(0));
-                                                        let _ = tx.send(StreamChunk::ToolCalls(calls));
-                                                    } else {
-                                                        let _ = tx.send(StreamChunk::Done(stats));
-                                                    }
-                                                    return;
-                                                }
-                                                if finish == Some("length") || finish == Some("max_tokens") {
-                                                    let stats = parse_usage_stats(&json);
-                                                    log_to_file(is_logging, &log_file, &session_id, "STREAM_TRUNCATED", &format!("{} finish_reason={}", api_url, finish.unwrap_or("?")));
-                                                    let _ = tx.send(StreamChunk::Truncated(format!(
-                                                        "Response truncated (finish_reason={}). Output limit reached.", finish.unwrap_or("?")
-                                                    )));
-                                                    let _ = tx.send(StreamChunk::Done(stats));
-                                                    return;
-                                                }
-                                            } else {
-                                                if let Some(thinking) = json["message"]["thinking"].as_str()
-                                                    && !thinking.is_empty() {
-                                                        let _ = tx.send(StreamChunk::Thinking(thinking.to_string()));
-                                                    }
-                                                if let Some(content) = json["message"]["content"].as_str()
-                                                    && !content.is_empty() {
-                                                        let _ = tx.send(StreamChunk::Text(content.to_string()));
-                                                    }
-                                                if let Some(tool_calls) = json["message"]["tool_calls"].as_array() {
-                                                    for tc in tool_calls {
-                                                        let idx = tc["index"].as_u64().unwrap_or(0) as u32;
-                                                        let entry = tool_call_map.entry(idx).or_insert_with(|| {
-                                                            serde_json::json!({
-                                                                "index": idx,
-                                                                "type": "function",
-                                                                "function": {"name": "", "arguments": ""}
-                                                            })
-                                                        });
-                                                        if let Some(name) = tc["function"]["name"].as_str() {
-                                                            entry["function"]["name"] = serde_json::json!(name);
-                                                        }
-                                                        if let Some(id) = tc["id"].as_str() {
-                                                            entry["id"] = serde_json::json!(id);
-                                                        }
-                                                        if let Some(args) = tc["function"]["arguments"].as_str() {
-                                                            entry["function"]["arguments"] = serde_json::json!(args);
-                                                        } else {
-                                                            entry["function"]["arguments"] = serde_json::json!(tc["function"]["arguments"].to_string());
-                                                        }
-                                                    }
-                                                }
-                                                if json["done"].as_bool() == Some(true) {
-                                                    log_to_file(is_logging, &log_file, &session_id, "STREAM_END", &format!("{} done=true tokens={}", api_url, json["eval_count"].as_u64().unwrap_or(0)));
-                                                    if !tool_call_map.is_empty() {
-                                                        let calls: Vec<serde_json::Value> = tool_call_map.into_values().collect();
-                                                        let _ = tx.send(StreamChunk::ToolCalls(calls));
-                                                    } else {
-                                                        let stats = parse_token_stats(&json);
-                                                        let _ = tx.send(StreamChunk::Done(stats));
-                                                    }
-                                                    return;
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                Ok(None) => {
-                                    log_to_file(is_logging, &log_file, &session_id, "STREAM_END", "stream closed");
-                                    let _ = tx.send(StreamChunk::Done(TokenStats::default()));
-                                    return;
-                                }
-                                Err(e) => {
-                                    log_to_file(is_logging, &log_file, &session_id, "STREAM_ERROR", &format!("{} | buffer: {:?}", e, buffer));
-                                    let _ = tx.send(StreamChunk::Error(format!("Stream error: {} | last bytes: {:?}", e, truncate(&buffer, 200))));
-                                    return;
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        log_to_file(is_logging, &log_file, &session_id, "CONNECT_ERROR", &e.to_string());
-                        let _ = tx.send(StreamChunk::Error(format!("Failed to connect: {}", e)));
-                    }
-                }
-            });
-        });
     }
 
     pub fn export_output(&mut self) {
@@ -4986,4 +4539,262 @@ mod tests {
 
         ts.close();
     }
+}
+
+/// Shared HTTP-send + SSE/Ollama-JSON stream-parse machinery.
+///
+/// Sends `api_messages` to the cloud or Ollama chat endpoint (with tools
+/// attached when `agentic`), spawns a background thread with its own tokio
+/// runtime, and forwards parsed `StreamChunk`s over the returned channel.
+///
+/// Both `send_to_ollama_async_with` (user prompt) and `send_tool_results_async`
+/// (agentic tool round) build their message list and then delegate here — the
+/// request/response plumbing was previously duplicated in both.
+#[allow(clippy::too_many_arguments)]
+fn stream_chat_request(
+    api_messages: Vec<serde_json::Value>,
+    agentic: bool,
+    model: String,
+    url: String,
+    cloud_model: Option<CloudModel>,
+    is_logging: bool,
+    log_file: String,
+    session_id: String,
+    temperature: f64,
+    top_p: f64,
+    top_k: u32,
+    proxy: Option<String>,
+    max_retries: u32,
+) -> mpsc::Receiver<StreamChunk> {
+    let (tx, rx) = mpsc::channel();
+
+std::thread::spawn(move || {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    rt.block_on(async {
+        let client = build_reqwest_client(&proxy);
+
+        let (api_url, headers, body) = if let Some(ref cloud) = cloud_model {
+            let mut body = serde_json::json!({
+                "model": cloud.api_model,
+                "messages": api_messages,
+                "stream": true,
+                "max_tokens": cloud.max_output_tokens,
+            });
+            body["tools"] = serde_json::json!(get_tool_definitions());
+            body["temperature"] = serde_json::json!(temperature);
+            body["top_p"] = serde_json::json!(top_p);
+            let mut headers = reqwest::header::HeaderMap::new();
+            headers.insert(
+                "Authorization",
+                reqwest::header::HeaderValue::from_str(&format!("Bearer {}", cloud.api_key)).unwrap(),
+            );
+            headers.insert(
+                "Content-Type",
+                reqwest::header::HeaderValue::from_static("application/json"),
+            );
+            (cloud.api_url.clone(), Some(headers), body)
+        } else {
+            let mut body = serde_json::json!({
+                "model": model,
+                "messages": api_messages,
+                "stream": true,
+            });
+            if agentic {
+                body["tools"] = serde_json::json!(get_tool_definitions());
+            }
+            let mut options = serde_json::json!({});
+            options["temperature"] = serde_json::json!(temperature);
+            options["top_p"] = serde_json::json!(top_p);
+            if top_k > 0 {
+                options["top_k"] = serde_json::json!(top_k);
+            }
+            body["options"] = options;
+            (format!("{}/api/chat", url), None, body)
+        };
+
+        log_to_file(is_logging, &log_file, &session_id, "REQUEST", &format!("{} {}", api_url, serde_json::to_string(&body).unwrap_or_default()));
+
+        let result = send_with_retry(&client, reqwest::Method::POST, &api_url, headers, &body, max_retries, &tx, is_logging, &log_file, &session_id).await;
+
+        let is_cloud = cloud_model.is_some();
+        match result {
+            Ok(mut resp) => {
+                if !resp.status().is_success() {
+                    let status = resp.status();
+                    let body = resp.text().await.unwrap_or_default();
+                    let msg = format!("HTTP {}: {}", status, truncate(&body, 200));
+                    log_to_file(is_logging, &log_file, &session_id, "HTTP_ERROR", &msg);
+                    if status.as_u16() == 429 {
+                        let _ = tx.send(StreamChunk::RetryPaused(format!("Max retries ({}) reached. Request paused.", max_retries)));
+                    } else {
+                        let _ = tx.send(StreamChunk::Error(msg));
+                    }
+                    return;
+                }
+                let mut buffer = String::new();
+                let mut tool_call_map: std::collections::HashMap<u32, serde_json::Value> = std::collections::HashMap::new();
+                loop {
+                    match resp.chunk().await {
+                        Ok(Some(chunk)) => {
+                            buffer.push_str(&String::from_utf8_lossy(&chunk));
+                            while let Some(pos) = buffer.find('\n') {
+                                let raw = buffer[..pos].trim().to_string();
+                                buffer = buffer[pos + 1..].to_string();
+                                if raw.is_empty() {
+                                    continue;
+                                }
+                                let line = if is_cloud {
+                                    raw.strip_prefix("data: ").unwrap_or(&raw).trim().to_string()
+                                } else {
+                                    raw
+                                };
+                                log_to_file(is_logging, &log_file, &session_id, "RESPONSE", &line);
+                                if line == "[DONE]" {
+                                    log_to_file(is_logging, &log_file, &session_id, "STREAM_END", "DONE sentinel");
+                                    let _ = tx.send(StreamChunk::Done(TokenStats::default()));
+                                    return;
+                                }
+                                if line.is_empty() {
+                                    continue;
+                                }
+                                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&line) {
+                                    if is_cloud {
+                                        // Usage can ride on any chunk (nested under
+                                        // choices[i] or top-level); forward it whenever present.
+                                        if usage_from_json(&json).is_some() {
+                                            let _ = tx.send(StreamChunk::Stats(parse_usage_stats(&json)));
+                                        }
+                                        if let Some(reasoning) = json["choices"][0]["delta"]["reasoning_content"].as_str()
+                                            && !reasoning.is_empty() {
+                                                let _ = tx.send(StreamChunk::Thinking(reasoning.to_string()));
+                                            }
+                                        if let Some(delta) = json["choices"][0]["delta"]["content"].as_str()
+                                            && !delta.is_empty() {
+                                                let _ = tx.send(StreamChunk::Text(delta.to_string()));
+                                            }
+                                        if let Some(tc_array) = json["choices"][0]["delta"]["tool_calls"].as_array() {
+                                            for tc in tc_array {
+                                                let idx = tc["index"].as_u64().unwrap_or(0) as u32;
+                                                let entry = tool_call_map.entry(idx).or_insert_with(|| {
+                                                    let mut base = serde_json::json!({
+                                                        "index": idx,
+                                                        "type": "function",
+                                                        "function": {"name": "", "arguments": ""}
+                                                    });
+                                                    if let Some(id) = tc["id"].as_str() {
+                                                        base["id"] = serde_json::json!(id);
+                                                    }
+                                                    base
+                                                });
+                                                if let Some(id) = tc["id"].as_str() {
+                                                    entry["id"] = serde_json::json!(id);
+                                                }
+                                                if let Some(name) = tc["function"]["name"].as_str()
+                                                    && !name.is_empty() {
+                                                        entry["function"]["name"] = serde_json::json!(name);
+                                                    }
+                                                if let Some(args) = tc["function"]["arguments"].as_str() {
+                                                    let existing = entry["function"]["arguments"].as_str().unwrap_or("").to_string();
+                                                    entry["function"]["arguments"] = serde_json::json!(format!("{}{}", existing, args));
+                                                }
+                                            }
+                                        }
+                                        let finish = json["choices"][0]["finish_reason"].as_str();
+                                        if finish == Some("stop") || finish == Some("tool_calls") {
+                                             let stats = parse_usage_stats(&json);
+                                            log_to_file(is_logging, &log_file, &session_id, "STREAM_END", &format!("{} finish_reason={}", api_url, finish.unwrap_or("?")));
+                                            if !tool_call_map.is_empty() {
+                                                if stats.prompt_tokens > 0 || stats.response_tokens > 0 {
+                                                    let _ = tx.send(StreamChunk::Stats(stats));
+                                                }
+                                                let mut calls: Vec<serde_json::Value> = tool_call_map.into_values().collect();
+                                                calls.sort_by_key(|tc| tc["index"].as_u64().unwrap_or(0));
+                                                let _ = tx.send(StreamChunk::ToolCalls(calls));
+                                            } else {
+                                                let _ = tx.send(StreamChunk::Done(stats));
+                                            }
+                                            return;
+                                        }
+                                        if finish == Some("length") || finish == Some("max_tokens") {
+                                            let stats = parse_usage_stats(&json);
+                                            log_to_file(is_logging, &log_file, &session_id, "STREAM_TRUNCATED", &format!("{} finish_reason={}", api_url, finish.unwrap_or("?")));
+                                            let _ = tx.send(StreamChunk::Truncated(format!(
+                                                "Response truncated (finish_reason={}). Output limit reached.", finish.unwrap_or("?")
+                                            )));
+                                            let _ = tx.send(StreamChunk::Done(stats));
+                                            return;
+                                        }
+                                    } else {
+                                        if let Some(thinking) = json["message"]["thinking"].as_str()
+                                            && !thinking.is_empty() {
+                                                let _ = tx.send(StreamChunk::Thinking(thinking.to_string()));
+                                            }
+                                        if let Some(content) = json["message"]["content"].as_str()
+                                            && !content.is_empty() {
+                                                let _ = tx.send(StreamChunk::Text(content.to_string()));
+                                            }
+                                        if let Some(tool_calls) = json["message"]["tool_calls"].as_array() {
+                                            for tc in tool_calls {
+                                                let idx = tc["index"].as_u64().unwrap_or(0) as u32;
+                                                let entry = tool_call_map.entry(idx).or_insert_with(|| {
+                                                    serde_json::json!({
+                                                        "index": idx,
+                                                        "type": "function",
+                                                        "function": {"name": "", "arguments": ""}
+                                                    })
+                                                });
+                                                if let Some(name) = tc["function"]["name"].as_str() {
+                                                    entry["function"]["name"] = serde_json::json!(name);
+                                                }
+                                                if let Some(id) = tc["id"].as_str() {
+                                                    entry["id"] = serde_json::json!(id);
+                                                }
+                                                if let Some(args) = tc["function"]["arguments"].as_str() {
+                                                    entry["function"]["arguments"] = serde_json::json!(args);
+                                                } else {
+                                                    entry["function"]["arguments"] = serde_json::json!(tc["function"]["arguments"].to_string());
+                                                }
+                                            }
+                                        }
+                                        if json["done"].as_bool() == Some(true) {
+                                            log_to_file(is_logging, &log_file, &session_id, "STREAM_END", &format!("{} done=true tokens={}", api_url, json["eval_count"].as_u64().unwrap_or(0)));
+                                            if !tool_call_map.is_empty() {
+                                                let calls: Vec<serde_json::Value> = tool_call_map.into_values().collect();
+                                                let _ = tx.send(StreamChunk::ToolCalls(calls));
+                                            } else {
+                                                let stats = parse_token_stats(&json);
+                                                let _ = tx.send(StreamChunk::Done(stats));
+                                            }
+                                            return;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Ok(None) => {
+                            log_to_file(is_logging, &log_file, &session_id, "STREAM_END", "stream closed");
+                            let _ = tx.send(StreamChunk::Done(TokenStats::default()));
+                            return;
+                        }
+                        Err(e) => {
+                            log_to_file(is_logging, &log_file, &session_id, "STREAM_ERROR", &format!("{} | buffer: {:?}", e, buffer));
+                            let _ = tx.send(StreamChunk::Error(format!("Stream error: {} | last bytes: {:?}", e, truncate(&buffer, 200))));
+                            return;
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                log_to_file(is_logging, &log_file, &session_id, "CONNECT_ERROR", &e.to_string());
+                let _ = tx.send(StreamChunk::Error(format!("Failed to connect: {}", e)));
+            }
+        }
+    });
+});
+
+    rx
 }
