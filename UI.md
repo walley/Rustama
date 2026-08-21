@@ -157,14 +157,23 @@ Items are appended top-to-bottom with the `add_*` methods:
 
 | Method | Item type | Height |
 |---|---|---|
-| `add_label(text)` | Static text line | 1 |
+| `add_label(text)` | Static text line (white) | 1 |
+| `add_label_colored(text, color)` | Static text line in a custom color | 1 |
 | `add_text_input(label, value, cursor, focused)` | Label + input line (shows cursor when focused) | 2 |
 | `add_dropdown(label, items, state)` | Expandable dropdown (`DialogDropdownState`) | 1 or `1 + items.len()` |
-| `add_file_list(entries, selection, scroll, focused)` | Scrollable file list, `entries: Vec<(String, bool /*is_dir*/)>` | up to 12 |
+| `add_file_list(entries, selection, scroll, focused)` | **Bordered**, scrollable file list, `entries: Vec<(String, bool /*is_dir*/)>` | up to 14 (12 rows + borders), clamped to fit above the button row |
 | `add_button(label, focused)` | Button row (consecutive calls append to the same row) | 1 |
 
 Buttons are special: they are always rendered right-aligned on a single row, 2 lines
 above the bottom of the dialog's inner area, regardless of insertion order.
+
+The file list is drawn inside its own bordered box (border in `theme.focus_fg`
+when the list has keyboard focus, `theme.dialog_border` otherwise). There is no
+selection arrow — the selected row is highlighted full-width with
+`theme.list_selected_bg`, and directories are shown with a trailing `/`. The
+visible window is clamped to the space above the button row, and the effective
+scroll is adjusted at render/hit-test time so the selection is always visible
+(place the file list last, just before the buttons).
 
 ### Supporting types
 
@@ -175,6 +184,11 @@ pub enum DialogItem {
     Dropdown { label: String, items: Vec<String>, state: DialogDropdownState },
     FileList { entries: Vec<(String, bool)>, selection: usize, scroll: usize, focused: bool },
     Buttons(Vec<DialogButton>),
+}
+
+pub struct DialogLabel {
+    pub text: String,
+    pub fg: Option<Color>,   // None -> white
 }
 
 pub struct DialogDropdownState {
@@ -190,7 +204,8 @@ pub struct DialogDropdownState {
 pub fn render(&self, f: &mut Frame, area: Rect, theme: &Theme) -> DialogAreas
 ```
 
-- Sizes itself to `2/3` of `area` (minimum 40×10), centered.
+- Sizes itself to `2/3` of `area` (minimum 40×10), centered; the size formula is
+  shared with `hit_test` via `FileActionDialog::dialog_size(area)`.
 - Returns `DialogAreas { popup, inner, item_areas }` with the exact `Rect` of every
   rendered item — useful for mouse handling.
 
@@ -305,8 +320,8 @@ if app.main_menu.is_open() {
 
 ## MessageBox
 
-A simple centered modal showing a title, a multi-line message, and an **OK** button.
-Uses `Theme::default()` internally.
+A simple centered modal showing a title, a (possibly long, multi-paragraph)
+message, and an **OK** button.
 
 ```rust
 pub struct MessageBox {
@@ -318,14 +333,26 @@ pub struct MessageBox {
 **Methods:**
 
 - `MessageBox::new(title, message) -> MessageBox`
-- `render(f, area, focused)` — renders the box (width up to 50, height = message lines + 4) with the OK button centered below the text; `focused` highlights the button.
+- `render(f, area, focused, theme)` — renders the box; `focused` highlights the OK button.
 - `hit_test(col, row, area) -> bool` — returns `true` when the OK button was clicked.
+
+**Layout behavior (multirow text support):**
+
+- The message is **word-wrapped** to the box width; explicit `\n` newlines and
+  blank lines are preserved, and words longer than the wrap width are hard-split.
+- The width auto-sizes to the longest source line (including the 2-column text
+  indent), capped at 46 inner columns (50 total), and shrinks to fit small terminals.
+- Height = wrapped line count + 4 rows of chrome; the OK button is centered one
+  row below the text.
+- Both `render` and `hit_test` share a single internal `layout()` computation,
+  so the clickable button area always matches what is drawn. When changing the
+  layout, only `layout()` needs to be updated.
 
 **Usage:**
 
 ```rust
 let mb = MessageBox::new("Retry Paused", &app.retry_paused_message);
-mb.render(f, area, true);
+mb.render(f, area, true, &app.theme);
 
 if mb.hit_test(col, row, area) {
     // OK clicked — dismiss

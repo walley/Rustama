@@ -462,6 +462,7 @@ pub struct App {
     pub focus: Focus,
     pub main_menu: MainMenu,
     pub show_about: bool,
+    pub about_message: String,
     pub show_quit_confirm: bool,
     pub is_loading: bool,
     pub retrying: bool,
@@ -564,6 +565,10 @@ impl App {
             focus: Focus::Input,
             main_menu: MainMenu::new(),
             show_about: false,
+            about_message: format!(
+                "Rustama v{}\n\nA terminal AI coding agent for Ollama LLMs.\nSupports markdown rendering, agentic tools, and saving.\n\nBuilt with ratatui + crossterm",
+                env!("CARGO_PKG_VERSION")
+            ),
             show_quit_confirm: false,
             is_loading: false,
             retrying: false,
@@ -3100,34 +3105,9 @@ impl App {
     }
 
     fn handle_about_dialog_click(&mut self, col: u16, row: u16, width: u16, height: u16) {
-        let dialog_w: u16 = 50;
-        let dialog_h: u16 = 10;
-        let dialog_x = (width.saturating_sub(dialog_w)) / 2;
-        let dialog_y = (height.saturating_sub(dialog_h)) / 2;
-        let inner_x = dialog_x + 1;
-        let inner_y = dialog_y + 1;
-        let inner_h = dialog_h - 2;
-
-        if col < dialog_x
-            || col >= dialog_x + dialog_w
-            || row < dialog_y
-            || row >= dialog_y + dialog_h
-        {
-            self.show_about = false;
-            return;
-        }
-
-        let btn_y = inner_y + inner_h - 1;
-        let ok_btn = Button::new(
-            "OK",
-            inner_x + 20,
-            btn_y,
-            true,
-            Color::Cyan,
-            Color::Cyan,
-        );
-
-        if ok_btn.is_clicked(col, row) {
+        let area = Rect::new(0, 0, width, height);
+        let mb = crate::ui::MessageBox::new("About", &self.about_message);
+        if mb.hit_test(col, row, area) {
             self.show_about = false;
         }
     }
@@ -3323,13 +3303,13 @@ impl App {
                 };
             }
             KeyCode::Left => {
-                if self.file_dialog_focus == FileDialogFocus::Cancel {
-                    self.file_dialog_focus = FileDialogFocus::Open;
+                if self.file_dialog_focus == FileDialogFocus::Open {
+                    self.file_dialog_focus = FileDialogFocus::Cancel;
                 }
             }
             KeyCode::Right => {
-                if self.file_dialog_focus == FileDialogFocus::Open {
-                    self.file_dialog_focus = FileDialogFocus::Cancel;
+                if self.file_dialog_focus == FileDialogFocus::Cancel {
+                    self.file_dialog_focus = FileDialogFocus::Open;
                 }
             }
             KeyCode::Up => {
@@ -3385,60 +3365,64 @@ impl App {
         }
     }
 
+    /// Builds the FileActionDialog for the current file dialog state.
+    /// Shared by rendering (main.rs) and mouse hit testing so the two
+    /// always describe the same layout.
+    pub fn build_file_action_dialog(&self, area: Rect) -> FileActionDialog {
+        let is_load_session = self.file_dialog_mode == FileDialogMode::LoadSession;
+        let title = if is_load_session { "Load Session" } else { "Load File" };
+        let mut d = FileActionDialog::new(title);
+
+        // Show the current directory, truncated from the left if too long.
+        let (dialog_w, _) = FileActionDialog::dialog_size(area);
+        let max_path_chars = dialog_w.saturating_sub(2) as usize;
+        let path_display = self.file_dialog_path.display().to_string();
+        let path_len = path_display.chars().count();
+        let path_str = if path_len > max_path_chars && max_path_chars > 3 {
+            let tail: String = path_display
+                .chars()
+                .skip(path_len - (max_path_chars - 3))
+                .collect();
+            format!("...{}", tail)
+        } else {
+            path_display
+        };
+        d.add_label_colored(&path_str, self.theme.path_fg);
+
+        d.add_file_list(
+            self.file_dialog_entries.clone(),
+            self.file_dialog_selection,
+            self.file_dialog_scroll,
+            self.file_dialog_focus == FileDialogFocus::List,
+        );
+
+        // Buttons render right-aligned in insertion order: [Cancel]  [Load/Open]
+        d.add_button("Cancel", self.file_dialog_focus == FileDialogFocus::Cancel);
+        let open_label = if is_load_session { "Load" } else { "Open" };
+        d.add_button(open_label, self.file_dialog_focus == FileDialogFocus::Open);
+        d
+    }
+
     fn handle_file_dialog_click(&mut self, col: u16, row: u16, width: u16, height: u16) {
-        let dialog_w: u16 = 60;
-        let entry_count = self.file_dialog_entries.len().min(12) as u16;
-        let dialog_h = entry_count + 6;
-        let dialog_x = (width.saturating_sub(dialog_w)) / 2;
-        let dialog_y = (height.saturating_sub(dialog_h)) / 2;
-        let inner_x = dialog_x + 1;
-        let inner_y = dialog_y + 1;
-
-        if col < dialog_x
-            || col >= dialog_x + dialog_w
-            || row < dialog_y
-            || row >= dialog_y + dialog_h
-        {
-            self.show_file_dialog = false;
-            return;
-        }
-
-        let list_h = self.file_dialog_entries.len().min(12) as u16;
-        if row > inner_y && row < inner_y + 1 + list_h {
-            let idx = (row - inner_y - 1 + self.file_dialog_scroll as u16) as usize;
-            if idx < self.file_dialog_entries.len() {
+        let area = Rect::new(0, 0, width, height);
+        let dlg = self.build_file_action_dialog(area);
+        match dlg.hit_test(col, row, area) {
+            DialogHit::Outside => {
+                self.show_file_dialog = false;
+            }
+            DialogHit::FileListItem(_, idx) => {
                 self.file_dialog_selection = idx;
                 self.file_dialog_focus = FileDialogFocus::List;
             }
-            return;
-        }
-
-        let btn_y = inner_y + list_h + 1;
-        let btn_label = if self.file_dialog_mode == FileDialogMode::LoadSession { "Load" } else { "Open" };
-        let open_btn = Button::new(
-            btn_label,
-            inner_x + 8,
-            btn_y,
-            self.file_dialog_focus == FileDialogFocus::Open,
-            Color::Green,
-            Color::Green,
-        );
-        let cancel_btn = Button::new(
-            "Cancel",
-            inner_x + 19,
-            btn_y,
-            self.file_dialog_focus == FileDialogFocus::Cancel,
-            Color::Red,
-            Color::Red,
-        );
-
-        if open_btn.is_clicked(col, row) {
-            self.file_dialog_focus = FileDialogFocus::Open;
-            self.open_selected_file();
-            return;
-        }
-        if cancel_btn.is_clicked(col, row) {
-            self.show_file_dialog = false;
+            DialogHit::Button(_, bi) => {
+                if bi == 0 {
+                    self.show_file_dialog = false;
+                } else {
+                    self.file_dialog_focus = FileDialogFocus::Open;
+                    self.open_selected_file();
+                }
+            }
+            _ => {}
         }
     }
 

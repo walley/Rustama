@@ -18,7 +18,7 @@ mod app;
 mod config;
 mod primary_selection;
 mod ui;
-use app::{App, ChatMessage, FileDialogFocus, FileDialogMode, Focus, InputMode, ModelDialogFocus, SaveDialogFocus, SettingsFocus};
+use app::{App, ChatMessage, Focus, InputMode, ModelDialogFocus, SaveDialogFocus, SettingsFocus};
 use ui::{dialog_block, Button, FileActionDialog, Theme};
 use config::Config;
 
@@ -236,7 +236,8 @@ fn ui(f: &mut Frame, app: &mut App) {
     }
 
     if app.show_about {
-        render_about_popup(f, area, &app.theme);
+        let mb = ui::MessageBox::new("About", &app.about_message);
+        mb.render(f, area, true, &app.theme);
     }
 
     if app.show_quit_confirm {
@@ -265,7 +266,7 @@ fn ui(f: &mut Frame, app: &mut App) {
 
     if app.show_retry_paused {
         let mb = ui::MessageBox::new("Retry Paused", &app.retry_paused_message);
-        mb.render(f, area, true);
+        mb.render(f, area, true, &app.theme);
     }
 }
 
@@ -747,72 +748,6 @@ fn render_keybar(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(keybar, area);
 }
 
-fn render_about_popup(f: &mut Frame, area: Rect, theme: &Theme) {
-    let popup_width = 50.min(area.width.saturating_sub(4));
-    let popup_height = 10.min(area.height.saturating_sub(4));
-    let popup_area = Rect {
-        x: (area.width.saturating_sub(popup_width)) / 2,
-        y: (area.height.saturating_sub(popup_height)) / 2,
-        width: popup_width,
-        height: popup_height,
-    };
-
-    f.render_widget(Clear, popup_area);
-    f.render_widget(dialog_block("About", theme), popup_area);
-
-    let inner = popup_area.inner(Margin::new(1, 1));
-
-    let version = env!("CARGO_PKG_VERSION");
-    let about_text = vec![
-        Line::from(""),
-        Line::from(Span::styled(
-            format!("Rustama v{}", version),
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::from(""),
-        Line::from("A terminal AI coding agent for Ollama LLMs."),
-        Line::from("Supports markdown rendering, agentic tools, and saving."),
-        Line::from(""),
-        Line::from("Built with ratatui + crossterm"),
-        Line::from(""),
-    ];
-
-    let text_area = Rect {
-        x: inner.x,
-        y: inner.y,
-        width: inner.width,
-        height: inner.height - 1,
-    };
-    f.render_widget(Paragraph::new(about_text).alignment(Alignment::Center), text_area);
-
-    let btn_y = inner.y + inner.height - 1;
-    let ok_btn = Button::new(
-        "OK",
-        inner.x + 20,
-        btn_y,
-        true,
-        Color::Cyan,
-        Color::Cyan,
-    );
-
-    let (ok_text, ok_style) = ok_btn.render();
-    let buttons = Line::from(vec![
-        Span::raw("                    "),
-        Span::styled(ok_text, ok_style),
-        Span::raw("                    "),
-    ]);
-
-    let btn_area = Rect {
-        x: inner.x,
-        y: btn_y,
-        width: inner.width,
-        height: 1,
-    };
-    f.render_widget(Paragraph::new(buttons), btn_area);
-}
-
 fn render_quit_confirm_popup(f: &mut Frame, area: Rect, theme: &Theme) {
     let popup_width = 40.min(area.width.saturating_sub(4));
     let popup_height = 8.min(area.height.saturating_sub(4));
@@ -1001,149 +936,8 @@ fn render_model_dialog(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_file_dialog(f: &mut Frame, app: &App, area: Rect) {
-    let entry_count = app.file_dialog_entries.len().min(12) as u16;
-    let dialog_w = 60u16;
-    let dialog_h = entry_count + 6;
-
-    let is_load_session = app.file_dialog_mode == FileDialogMode::LoadSession;
-    let title = if is_load_session { "Load Session" } else { "Load File" };
-
-    let popup_area = Rect {
-        x: (area.width.saturating_sub(dialog_w)) / 2,
-        y: (area.height.saturating_sub(dialog_h)) / 2,
-        width: dialog_w,
-        height: dialog_h,
-    };
-
-    f.render_widget(Clear, popup_area);
-    f.render_widget(dialog_block(title, &app.theme), popup_area);
-
-    let inner = popup_area.inner(Margin::new(1, 1));
-
-    let path_display = app.file_dialog_path.display().to_string();
-    let path_str = if path_display.len() > (inner.width as usize) {
-        format!("...{}", &path_display[path_display.len() - inner.width as usize + 3..])
-    } else {
-        path_display
-    };
-    let path_line = Paragraph::new(Line::from(Span::styled(
-        format!("  {}", path_str),
-        Style::default().fg(app.theme.path_fg),
-    )));
-    let path_area = Rect {
-        x: inner.x,
-        y: inner.y,
-        width: inner.width,
-        height: 1,
-    };
-    f.render_widget(path_line, path_area);
-
-    let list_y = inner.y + 1;
-    let list_h = entry_count;
-    let list_area = Rect {
-        x: inner.x,
-        y: list_y,
-        width: inner.width,
-        height: list_h,
-    };
-
-    let visible_start = app.file_dialog_scroll;
-    let visible_end = (visible_start + list_h as usize).min(app.file_dialog_entries.len());
-
-    let items: Vec<ListItem> = app.file_dialog_entries[visible_start..visible_end]
-        .iter()
-        .enumerate()
-        .map(|(i, (name, is_dir))| {
-            let real_idx = visible_start + i;
-            let is_selected = real_idx == app.file_dialog_selection;
-
-            let mut spans = Vec::new();
-            if is_selected {
-                spans.push(Span::styled(
-                    " > ",
-                    Style::default()
-                        .fg(Color::Black)
-                        .bg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                ));
-            } else {
-                spans.push(Span::styled("   ", Style::default()));
-            }
-
-            let icon = if name == ".." {
-                "  "
-            } else if *is_dir {
-                "  "
-            } else {
-                "  "
-            };
-
-            let display_name = if *is_dir && name != ".." {
-                format!("{}/", name)
-            } else {
-                name.clone()
-            };
-
-            let name_style = if is_selected {
-                Style::default()
-                    .fg(app.theme.list_selected_fg)
-                    .bg(app.theme.list_selected_bg)
-                    .add_modifier(Modifier::BOLD)
-            } else if *is_dir {
-                Style::default()
-                    .fg(app.theme.dir_fg)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(app.theme.file_fg)
-            };
-
-            spans.push(Span::styled(icon, name_style));
-            spans.push(Span::styled(display_name, name_style));
-
-            ListItem::new(Line::from(spans))
-        })
-        .collect();
-
-    let list = List::new(items).style(Style::default().bg(Color::Black));
-    f.render_widget(list, list_area);
-
-    let btn_y = inner.y + list_h + 1;
-    let btn_label = if is_load_session { "Load" } else { "Open" };
-    let open_btn = Button::new(
-        btn_label,
-        inner.x + 8,
-        btn_y,
-        app.file_dialog_focus == FileDialogFocus::Open,
-        Color::Green,
-        Color::Green,
-    );
-    let cancel_btn = Button::new(
-        "Cancel",
-        inner.x + 21,
-        btn_y,
-        app.file_dialog_focus == FileDialogFocus::Cancel,
-        Color::Red,
-        Color::Red,
-    );
-
-    let (open_text, open_style) = open_btn.render();
-    let (cancel_text, cancel_style) = cancel_btn.render();
-
-    let buttons = Line::from(vec![
-        Span::raw("        "),
-        Span::styled(open_text, open_style),
-        Span::raw("     "),
-        Span::styled(cancel_text, cancel_style),
-        Span::raw("        "),
-    ]);
-
-    let btn_area = Rect {
-        x: inner.x,
-        y: btn_y,
-        width: inner.width,
-        height: 1,
-    };
-    f.render_widget(Paragraph::new(buttons), btn_area);
+    let dlg = app.build_file_action_dialog(area);
+    let _ = dlg.render(f, area, &app.theme);
 }
 
 fn render_save_dialog(f: &mut Frame, app: &App, area: Rect) {
