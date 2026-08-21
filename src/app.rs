@@ -464,6 +464,7 @@ pub struct App {
     pub show_about: bool,
     pub about_message: String,
     pub show_quit_confirm: bool,
+    pub quit_confirm_focus: crate::ui::ConfirmFocus,
     pub is_loading: bool,
     pub retrying: bool,
     pub status_message: String,
@@ -570,6 +571,7 @@ impl App {
                 env!("CARGO_PKG_VERSION")
             ),
             show_quit_confirm: false,
+            quit_confirm_focus: crate::ui::ConfirmFocus::No,
             is_loading: false,
             retrying: false,
             status_message: String::new(),
@@ -680,7 +682,7 @@ impl App {
                 return;
             }
             KeyCode::F(10) => {
-                self.show_quit_confirm = true;
+                self.open_quit_confirm();
                 return;
             }
             KeyCode::Char('t' | 'T')
@@ -932,7 +934,7 @@ impl App {
             MenuAction::LoadSession => self.open_load_session_dialog(),
             MenuAction::SaveSession => self.open_save_dialog(),
             MenuAction::ExportChat => self.open_export_dialog(),
-            MenuAction::Quit => self.show_quit_confirm = true,
+            MenuAction::Quit => self.open_quit_confirm(),
             MenuAction::OpenModelDialog => self.open_model_dialog(),
             MenuAction::ToggleAgenticMode(_) => {
                 self.agentic_mode = !self.agentic_mode;
@@ -3112,14 +3114,36 @@ impl App {
         }
     }
 
+    fn open_quit_confirm(&mut self) {
+        self.show_quit_confirm = true;
+        // Default to the safe choice.
+        self.quit_confirm_focus = crate::ui::ConfirmFocus::No;
+    }
+
     fn handle_quit_confirm_key(&mut self, key: KeyEvent) {
+        use crate::ui::ConfirmFocus;
         match key.code {
             KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
                 self.show_quit_confirm = false;
             }
-            KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
                 self.terminal_state.close();
                 self.should_quit = true;
+            }
+            KeyCode::Enter => match self.quit_confirm_focus {
+                ConfirmFocus::Yes => {
+                    self.terminal_state.close();
+                    self.should_quit = true;
+                }
+                ConfirmFocus::No => {
+                    self.show_quit_confirm = false;
+                }
+            },
+            KeyCode::Left | KeyCode::Right | KeyCode::Tab | KeyCode::BackTab => {
+                self.quit_confirm_focus = match self.quit_confirm_focus {
+                    ConfirmFocus::Yes => ConfirmFocus::No,
+                    ConfirmFocus::No => ConfirmFocus::Yes,
+                };
             }
             _ => {}
         }
@@ -3135,34 +3159,18 @@ impl App {
     }
 
     fn handle_quit_confirm_click(&mut self, col: u16, row: u16, width: u16, height: u16) {
-        let dialog_w: u16 = 40;
-        let dialog_h: u16 = 8;
-        let dialog_x = (width.saturating_sub(dialog_w)) / 2;
-        let dialog_y = (height.saturating_sub(dialog_h)) / 2;
-        let inner_x = dialog_x + 1;
-        let inner_y = dialog_y + 1;
-        let inner_h = dialog_h - 2;
-
-        if col < dialog_x
-            || col >= dialog_x + dialog_w
-            || row < dialog_y
-            || row >= dialog_y + dialog_h
-        {
-            self.show_quit_confirm = false;
-            return;
-        }
-
-        let btn_y = inner_y + inner_h - 1;
-        let yes_btn = Button::new("Yes", inner_x + 9, btn_y, true, Color::Cyan, Color::Cyan);
-        let no_btn = Button::new("No", inner_x + 16, btn_y, true, Color::Cyan, Color::Cyan);
-
-        if yes_btn.is_clicked(col, row) {
-            self.terminal_state.close();
-            self.should_quit = true;
-            return;
-        }
-        if no_btn.is_clicked(col, row) {
-            self.show_quit_confirm = false;
+        use crate::ui::ConfirmHit;
+        let area = Rect::new(0, 0, width, height);
+        let cb = crate::ui::ConfirmationBox::new("Confirm Quit", "Are you sure you want to quit?");
+        match cb.hit_test(col, row, area) {
+            ConfirmHit::Yes => {
+                self.terminal_state.close();
+                self.should_quit = true;
+            }
+            ConfirmHit::No | ConfirmHit::Outside => {
+                self.show_quit_confirm = false;
+            }
+            ConfirmHit::None => {}
         }
     }
 
@@ -3532,7 +3540,7 @@ impl App {
                 Some(if self.justify { "Justify: ON" } else { "Justify: OFF" }.to_string())
             }
             "quit" | "q" | "exit" => {
-                self.show_quit_confirm = true;
+                self.open_quit_confirm();
                 Some(String::new())
             }
             _ => Some(format!("Unknown command: /{}. Type /help for available commands.", cmd)),

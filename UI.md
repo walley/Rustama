@@ -15,6 +15,7 @@ All widgets are built on top of [ratatui](https://docs.rs/ratatui/) and are used
 | [`FileActionDialog`](#fileactiondialog) | struct | Composite modal dialog builder |
 | [`MainMenu`](#mainmenu) | struct | Top menu bar (File / Edit / View / Help) |
 | [`MessageBox`](#messagebox) | struct | Simple modal message box with an OK button |
+| [`ConfirmationBox`](#confirmationbox) | struct | Modal yes/no confirmation box ("confirmationbox" class) |
 
 ---
 
@@ -356,6 +357,72 @@ mb.render(f, area, true, &app.theme);
 
 if mb.hit_test(col, row, area) {
     // OK clicked — dismiss
+}
+```
+
+---
+
+## ConfirmationBox
+
+The **confirmationbox** class: a modal variant of [`MessageBox`](#messagebox) for
+yes/no questions. Shows a title, a word-wrapped message, and two buttons —
+confirm (`Yes`, green) and cancel (`No`, red) — centered as a pair below the
+text. Used for the *Confirm Quit* dialog.
+
+```rust
+pub struct ConfirmationBox {
+    pub title: String,
+    pub message: String,
+    pub confirm_label: String,   // default "Yes"
+    pub cancel_label: String,    // default "No"
+}
+```
+
+### Supporting types
+
+```rust
+pub enum ConfirmFocus { Yes, No }        // which button is focused
+pub enum ConfirmHit { Outside, Yes, No, None }  // hit_test result
+```
+
+**Methods:**
+
+- `ConfirmationBox::new(title, message) -> ConfirmationBox` — default `Yes`/`No` labels.
+- `with_labels(confirm, cancel) -> ConfirmationBox` — builder override for the button labels.
+- `render(f, area, focus, theme)` — renders the box; the focused button is highlighted.
+- `hit_test(col, row, area) -> ConfirmHit` — `Outside` clicks can be used to cancel,
+  `None` means inside the popup but on no button.
+
+**Layout behavior:**
+
+- Same conventions as `MessageBox`: the message is **word-wrapped** to the box
+  width (explicit newlines and blank lines preserved, long words hard-split),
+  width auto-sizes to the longest source line (capped at 46 inner columns) but
+  always grows enough to fit both buttons, and height = wrapped line count + 4
+  rows of chrome.
+- The button pair is centered on one row, one row below the text, with the
+  confirm button on the left and the cancel button on the right.
+- Both `render` and `hit_test` share a single internal `layout()` computation —
+  when changing the layout, only `layout()` needs to be updated.
+
+**Keyboard conventions (implemented by the caller, see `app.rs`):**
+
+- `←` / `→` / `Tab` / `Shift+Tab` — move focus between the two buttons.
+- `Enter` — activate the focused button.
+- `y` / `n` — direct hotkeys, `Esc` — cancel.
+
+**Usage (quit confirmation, from `main.rs` / `app.rs`):**
+
+```rust
+// rendering
+let cb = ConfirmationBox::new("Confirm Quit", "Are you sure you want to quit?");
+cb.render(f, area, app.quit_confirm_focus, &app.theme);
+
+// mouse handling
+match cb.hit_test(col, row, area) {
+    ConfirmHit::Yes => { /* confirmed */ }
+    ConfirmHit::No | ConfirmHit::Outside => { /* dismissed */ }
+    ConfirmHit::None => {}
 }
 ```
 

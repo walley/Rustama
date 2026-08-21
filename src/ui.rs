@@ -1165,6 +1165,191 @@ impl MessageBox {
     }
 }
 
+/// Which button of a [`ConfirmationBox`] currently has focus.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfirmFocus {
+    Yes,
+    No,
+}
+
+/// Result of a [`ConfirmationBox::hit_test`] mouse query.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfirmHit {
+    /// Click outside the popup.
+    Outside,
+    /// Click on the confirm (left) button.
+    Yes,
+    /// Click on the cancel (right) button.
+    No,
+    /// Click inside the popup, but on no button.
+    None,
+}
+
+/// A modal confirmation box ("confirmationbox" class): title, a wrapped
+/// message, and two buttons — confirm (default `Yes`) and cancel
+/// (default `No`). Same widget family as [`MessageBox`], sharing its
+/// layout conventions: both `render` and `hit_test` go through a single
+/// internal `layout()` so they always agree.
+pub struct ConfirmationBox {
+    pub title: String,
+    pub message: String,
+    pub confirm_label: String,
+    pub cancel_label: String,
+}
+
+impl ConfirmationBox {
+    /// Creates a confirmation box with the default `Yes` / `No` buttons.
+    pub fn new(title: &str, message: &str) -> Self {
+        ConfirmationBox {
+            title: title.to_string(),
+            message: message.to_string(),
+            confirm_label: "Yes".to_string(),
+            cancel_label: "No".to_string(),
+        }
+    }
+
+    /// Overrides the button labels (confirm first, cancel second).
+    /// Part of the "confirmationbox" class API for reuse beyond the quit dialog.
+    #[allow(dead_code)]
+    pub fn with_labels(mut self, confirm: &str, cancel: &str) -> Self {
+        self.confirm_label = confirm.to_string();
+        self.cancel_label = cancel.to_string();
+        self
+    }
+
+    /// Single source of truth for the popup layout so `render` and
+    /// `hit_test` always agree. Returns
+    /// `(popup_area, wrapped_lines, confirm_button_rect, cancel_button_rect)`.
+    fn layout(&self, area: Rect) -> (Rect, Vec<String>, Rect, Rect) {
+        // Margin::new(2, 1) -> 4 columns of horizontal chrome, 2 rows vertical.
+        let max_inner_w = (area.width.saturating_sub(8)) as usize;
+        let content_w = self
+            .message
+            .lines()
+            .map(|l| l.chars().count() + 2) // 2-column text indent
+            .max()
+            .unwrap_or(0);
+        let inner_w = content_w.min(46).min(max_inner_w).max(10);
+        let lines = MessageBox::wrap_message(&self.message, inner_w.saturating_sub(2).max(1));
+        let msg_height = lines.len() as u16;
+
+        // Make sure both buttons (centered as a pair) always fit.
+        let confirm_w = self.confirm_label.len() as u16 + 4;
+        let cancel_w = self.cancel_label.len() as u16 + 4;
+        let btn_gap: u16 = 2;
+        let buttons_w = confirm_w + btn_gap + cancel_w;
+        let min_inner_w = buttons_w + 4; // a little breathing room
+
+        let dialog_w = ((inner_w as u16).max(min_inner_w) + 4)
+            .min(area.width.saturating_sub(4))
+            .max(16);
+        let dialog_h = 4 + msg_height;
+        let popup_area = Rect {
+            x: area.x + (area.width.saturating_sub(dialog_w)) / 2,
+            y: area.y + (area.height.saturating_sub(dialog_h)) / 2,
+            width: dialog_w,
+            height: dialog_h.min(area.height),
+        };
+        let inner = popup_area.inner(Margin::new(2, 1));
+        let btn_y = inner.y + msg_height + 1;
+        let btn_start_x = inner.x + (inner.width.saturating_sub(buttons_w)) / 2;
+        let confirm_area = Rect {
+            x: btn_start_x,
+            y: btn_y,
+            width: confirm_w,
+            height: 1,
+        };
+        let cancel_area = Rect {
+            x: btn_start_x + confirm_w + btn_gap,
+            y: btn_y,
+            width: cancel_w,
+            height: 1,
+        };
+        (popup_area, lines, confirm_area, cancel_area)
+    }
+
+    pub fn render(&self, f: &mut Frame, area: Rect, focus: ConfirmFocus, theme: &Theme) {
+        let (popup_area, lines, confirm_area, cancel_area) = self.layout(area);
+
+        f.render_widget(Clear, popup_area);
+        f.render_widget(dialog_block(&self.title, theme), popup_area);
+
+        let inner = popup_area.inner(Margin::new(2, 1));
+        for (i, line) in lines.iter().enumerate() {
+            let para = Paragraph::new(Line::from(Span::styled(
+                format!("  {}", line),
+                Style::default().fg(Color::White),
+            )));
+            let line_area = Rect {
+                x: inner.x,
+                y: inner.y + i as u16,
+                width: inner.width,
+                height: 1,
+            };
+            f.render_widget(para, line_area);
+        }
+
+        let yes_btn = Button::new(
+            &self.confirm_label,
+            confirm_area.x,
+            confirm_area.y,
+            focus == ConfirmFocus::Yes,
+            Color::Green,
+            Color::Green,
+        );
+        let no_btn = Button::new(
+            &self.cancel_label,
+            cancel_area.x,
+            cancel_area.y,
+            focus == ConfirmFocus::No,
+            Color::Red,
+            Color::Red,
+        );
+
+        let (yes_display, yes_style) = yes_btn.render();
+        let (no_display, no_style) = no_btn.render();
+
+        let yes_para = Paragraph::new(Line::from(Span::styled(yes_display, yes_style)));
+        f.render_widget(yes_para, confirm_area);
+        let no_para = Paragraph::new(Line::from(Span::styled(no_display, no_style)));
+        f.render_widget(no_para, cancel_area);
+    }
+
+    pub fn hit_test(&self, col: u16, row: u16, area: Rect) -> ConfirmHit {
+        let (popup_area, _, confirm_area, cancel_area) = self.layout(area);
+        if col < popup_area.x
+            || col >= popup_area.x + popup_area.width
+            || row < popup_area.y
+            || row >= popup_area.y + popup_area.height
+        {
+            return ConfirmHit::Outside;
+        }
+        let yes_btn = Button::new(
+            &self.confirm_label,
+            confirm_area.x,
+            confirm_area.y,
+            true,
+            Color::Green,
+            Color::Green,
+        );
+        let no_btn = Button::new(
+            &self.cancel_label,
+            cancel_area.x,
+            cancel_area.y,
+            true,
+            Color::Red,
+            Color::Red,
+        );
+        if yes_btn.is_clicked(col, row) {
+            return ConfirmHit::Yes;
+        }
+        if no_btn.is_clicked(col, row) {
+            return ConfirmHit::No;
+        }
+        ConfirmHit::None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

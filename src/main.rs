@@ -19,7 +19,7 @@ mod config;
 mod primary_selection;
 mod ui;
 use app::{App, ChatMessage, Focus, InputMode, ModelDialogFocus, SaveDialogFocus, SettingsFocus};
-use ui::{dialog_block, Button, FileActionDialog, Theme};
+use ui::{dialog_block, Button, ConfirmationBox, FileActionDialog, Theme};
 use config::Config;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -241,7 +241,8 @@ fn ui(f: &mut Frame, app: &mut App) {
     }
 
     if app.show_quit_confirm {
-        render_quit_confirm_popup(f, area, &app.theme);
+        let cb = ConfirmationBox::new("Confirm Quit", "Are you sure you want to quit?");
+        cb.render(f, area, app.quit_confirm_focus, &app.theme);
     }
 
     if app.show_model_dialog {
@@ -746,61 +747,6 @@ fn render_keybar(f: &mut Frame, app: &App, area: Rect) {
     .style(Style::default().bg(Color::DarkGray));
 
     f.render_widget(keybar, area);
-}
-
-fn render_quit_confirm_popup(f: &mut Frame, area: Rect, theme: &Theme) {
-    let popup_width = 40.min(area.width.saturating_sub(4));
-    let popup_height = 8.min(area.height.saturating_sub(4));
-    let popup_area = Rect {
-        x: (area.width.saturating_sub(popup_width)) / 2,
-        y: (area.height.saturating_sub(popup_height)) / 2,
-        width: popup_width,
-        height: popup_height,
-    };
-
-    f.render_widget(Clear, popup_area);
-    f.render_widget(dialog_block("Confirm Quit", theme), popup_area);
-
-    let inner = popup_area.inner(Margin::new(1, 1));
-
-    let text = vec![
-        Line::from(""),
-        Line::from(Span::styled(
-            "  Are you sure you want to quit?",
-            Style::default().fg(Color::White),
-        )),
-        Line::from(""),
-    ];
-
-    let text_area = Rect {
-        x: inner.x,
-        y: inner.y,
-        width: inner.width,
-        height: inner.height - 1,
-    };
-    f.render_widget(Paragraph::new(text), text_area);
-
-    let btn_y = inner.y + inner.height - 1;
-    let yes_btn = Button::new("Yes", inner.x + 10, btn_y, true, Color::Cyan, Color::Cyan);
-    let no_btn = Button::new("No", inner.x + 22, btn_y, true, Color::Cyan, Color::Cyan);
-
-    let (yes_text, yes_style) = yes_btn.render();
-    let (no_text, no_style) = no_btn.render();
-    let buttons = Line::from(vec![
-        Span::raw("         "),
-        Span::styled(yes_text, yes_style),
-        Span::raw("  "),
-        Span::styled(no_text, no_style),
-        Span::raw("          "),
-    ]);
-
-    let btn_area = Rect {
-        x: inner.x,
-        y: btn_y,
-        width: inner.width,
-        height: 1,
-    };
-    f.render_widget(Paragraph::new(buttons), btn_area);
 }
 
 fn render_model_dialog(f: &mut Frame, app: &App, area: Rect) {
