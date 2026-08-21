@@ -124,6 +124,8 @@ impl ExportFormat {
 pub struct TokenStats {
     pub prompt_tokens: u64,
     pub response_tokens: u64,
+    pub cached_tokens: u64,
+    pub reasoning_tokens: u64,
     pub total_duration_ms: u64,
     pub tokens_per_sec: f64,
 }
@@ -308,10 +310,10 @@ impl TerminalState {
         let (stdin_tx, stdin_rx) = std::sync::mpsc::channel::<String>();
         let buffer = Arc::new(Mutex::new(TerminalBuffer::new()));
 
-        let wrapped = terminal_command(command);
-        match std::process::Command::new("sh")
-            .arg("-c")
-            .arg(&wrapped)
+        // Always spawn bash — commands are sent through stdin.
+        // This keeps one process, one buffer, one monotonic cursor
+        // across the entire session lifecycle.
+        match std::process::Command::new("bash")
             .env("PYTHONUNBUFFERED", "1")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -394,9 +396,16 @@ impl TerminalState {
                 self.reader_stderr = Some(reader_stderr);
                 self.stdin_writer = Some(stdin_writer);
                 self.visible = true;
-                self.command = command.to_string();
 
-                format!("Terminal opened running: {}", command)
+                // If a command was provided, send it to the shell
+                if !command.trim().is_empty() {
+                    self.command = command.to_string();
+                    let _ = self.send_input(command);
+                    format!("Terminal opened running: {}", command)
+                } else {
+                    self.command = "bash".to_string();
+                    "Terminal opened: bash".to_string()
+                }
             }
             Err(e) => format!("Error opening terminal: {}", e),
         }
@@ -959,17 +968,11 @@ impl App {
                 }).to_string())
             }
             "terminal_send" => {
-                if !self.terminal_state.is_running() {
-                    self.terminal_state.open("bash");
-                }
                 let args: serde_json::Value = serde_json::from_str(args_json).unwrap_or(serde_json::json!({}));
                 let input = args["input"].as_str().unwrap_or("");
                 Some(self.terminal_state.send_input(input))
             }
             "terminal_read" => {
-                if !self.terminal_state.is_running() {
-                    self.terminal_state.open("bash");
-                }
                 let args: serde_json::Value = serde_json::from_str(args_json).unwrap_or(serde_json::json!({}));
                 let cursor = args["cursor"].as_u64();
                 let result = self.terminal_state.read_buffer_incremental(cursor);
@@ -3749,6 +3752,8 @@ fn parse_token_stats(json: &serde_json::Value) -> TokenStats {
     TokenStats {
         prompt_tokens: json["prompt_eval_count"].as_u64().unwrap_or(0),
         response_tokens,
+        cached_tokens: 0,
+        reasoning_tokens: 0,
         total_duration_ms: json["total_duration"].as_u64().unwrap_or(0) / 1_000_000,
         tokens_per_sec,
     }
@@ -3758,6 +3763,8 @@ fn parse_usage_stats(json: &serde_json::Value) -> TokenStats {
     TokenStats {
         prompt_tokens: json["usage"]["prompt_tokens"].as_u64().unwrap_or(0),
         response_tokens: json["usage"]["completion_tokens"].as_u64().unwrap_or(0),
+        cached_tokens: json["usage"]["prompt_tokens_details"]["cached_tokens"].as_u64().unwrap_or(0),
+        reasoning_tokens: json["usage"]["completion_tokens_details"]["reasoning_tokens"].as_u64().unwrap_or(0),
         total_duration_ms: 0,
         tokens_per_sec: 0.0,
     }
@@ -4699,5 +4706,71 @@ mod tests {
 
         assert_eq!(r2["output"].as_str().unwrap(), "bbbb");
         assert!(c2 > c1, "cursor must be monotonic: {} <= {}", c2, c1);
+    }
+
+    #[test]
+    fn terminal_open_output_captured() {
+        use super::TerminalState;
+        let mut ts = TerminalState::new();
+        let result = ts.open("echo CAPTURE_MARKER_42");
+        assert!(result.contains("Terminal opened"), "open should succeed: {}", result);
+
+        // Wait for the command to finish (echo is fast, but give it time)
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        let r = ts.read_buffer_incremental(None);
+        let output = r["output"].as_str().unwrap();
+        assert!(output.contains("CAPTURE_MARKER_42"),
+            "terminal_open command output should be in buffer, got: {}", output);
+        assert!(r["cursor"].as_u64().unwrap() > 0,
+            "cursor should have advanced past the output");
+
+        // Read again with cursor — should get empty (nothing new)
+        let cursor = r["cursor"].as_u64().unwrap();
+        let r2 = ts.read_buffer_incremental(Some(cursor));
+        assert_eq!(r2["output"].as_str().unwrap(), "");
+
+        ts.close();
+    }
+
+    #[test]
+    fn terminal_cursor_continuous_across_send() {
+        use super::TerminalState;
+        let mut ts = TerminalState::new();
+        let result = ts.open("echo BEFORE_SEND");
+        assert!(result.contains("Terminal opened"), "open: {}", result);
+
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        let r1 = ts.read_buffer_incremental(None);
+        let cursor_before = r1["cursor"].as_u64().unwrap();
+        assert!(cursor_before > 0, "should have output from open command");
+        assert!(r1["output"].as_str().unwrap().contains("BEFORE_SEND"),
+            "open command output: {}", r1["output"].as_str().unwrap());
+
+        // Send more input — same process, same buffer, cursor must remain valid
+        let send_result = ts.send_input("echo AFTER_SEND");
+        assert!(send_result.starts_with("Sent:"), "send: {}", send_result);
+
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        // Incremental read from old cursor — must return only new bytes
+        let r2 = ts.read_buffer_incremental(Some(cursor_before));
+        let new_output = r2["output"].as_str().unwrap();
+        assert!(new_output.contains("AFTER_SEND"),
+            "incremental read after send should contain AFTER_SEND, got: {}", new_output);
+
+        // Cursor must have advanced — never reset to 0
+        let cursor_after = r2["cursor"].as_u64().unwrap();
+        assert!(cursor_after > cursor_before,
+            "cursor must advance: {} <= {}", cursor_after, cursor_before);
+
+        // Full snapshot must contain both outputs
+        let r3 = ts.read_buffer_incremental(None);
+        let full = r3["output"].as_str().unwrap();
+        assert!(full.contains("BEFORE_SEND"), "full snapshot missing open output: {}", full);
+        assert!(full.contains("AFTER_SEND"), "full snapshot missing send output: {}", full);
+
+        ts.close();
     }
 }

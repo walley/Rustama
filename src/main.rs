@@ -541,12 +541,34 @@ fn render_output(f: &mut Frame, app: &mut App, area: Rect) {
     };
 
     let stats_part = if app.token_stats.prompt_tokens > 0 || app.token_stats.response_tokens > 0 {
+        let cached = if app.token_stats.cached_tokens > 0 {
+            format!(" ({}cached)", app.token_stats.cached_tokens)
+        } else {
+            String::new()
+        };
+        let reasoning = if app.token_stats.reasoning_tokens > 0 {
+            format!(" ({}reasoning)", app.token_stats.reasoning_tokens)
+        } else {
+            String::new()
+        };
+        let speed = if app.token_stats.tokens_per_sec > 0.0 {
+            format!(" {:.1}t/s", app.token_stats.tokens_per_sec)
+        } else {
+            String::new()
+        };
+        let duration = if app.token_stats.total_duration_ms > 0 {
+            format!(" {}ms", app.token_stats.total_duration_ms)
+        } else {
+            String::new()
+        };
         format!(
-            " | in:{} out:{} {:.1}t/s {}ms",
+            " | in:{}{} out:{}{}{}{}",
             app.token_stats.prompt_tokens,
+            cached,
             app.token_stats.response_tokens,
-            app.token_stats.tokens_per_sec,
-            app.token_stats.total_duration_ms,
+            reasoning,
+            speed,
+            duration,
         )
     } else {
         String::new()
