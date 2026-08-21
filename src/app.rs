@@ -140,6 +140,7 @@ pub enum StreamChunk {
     Status(String),
     StatusTick(String),
     ToolCalls(Vec<serde_json::Value>),
+    Truncated(String),
 }
 
 const TERMINAL_BUFFER_MAX: usize = 102400;
@@ -289,11 +290,10 @@ impl TerminalState {
         }
         // Check if child process has exited
         let mut child = self.child.lock().unwrap();
-        if let Some(ref mut c) = *child {
-            if let Ok(Some(_)) = c.try_wait() {
+        if let Some(ref mut c) = *child
+            && let Ok(Some(_)) = c.try_wait() {
                 return false;
             }
-        }
         true
     }
 
@@ -540,6 +540,8 @@ pub struct App {
     pub primary_selection: crate::primary_selection::PrimarySelection,
     pub show_retry_paused: bool,
     pub retry_paused_message: String,
+    pub pending_continuation: bool,
+    pub continuation_count: u32,
 }
 
 impl App {
@@ -643,6 +645,8 @@ impl App {
             primary_selection: crate::primary_selection::PrimarySelection::new(),
             show_retry_paused: false,
             retry_paused_message: String::new(),
+            pending_continuation: false,
+            continuation_count: 0,
         };
         app.session_name = app.session_id.clone();
         log_to_file(app.is_logging, &app.log_file, &app.session_id, "START", "Program started");
@@ -1041,6 +1045,31 @@ impl App {
                         self.retrying = true;
                         self.auto_scroll = true;
                     }
+                    Ok(StreamChunk::Truncated(msg)) => {
+                        self.status_message = msg.clone();
+                        self.retrying = false;
+                        self.pending_continuation = true;
+                        // Commit any partial thinking
+                        if !self.streaming_thinking.is_empty() {
+                            self.messages
+                                .push(ChatMessage::Thinking(self.streaming_thinking.clone()));
+                            self.streaming_thinking.clear();
+                        }
+                        // Commit partial assistant text (may be incomplete)
+                        if !self.streaming_text.is_empty() {
+                            self.messages
+                                .push(ChatMessage::Assistant(self.streaming_text.clone()));
+                            self.log_event("ASSISTANT", &self.streaming_text);
+                            self.streaming_text.clear();
+                        }
+                        // Discard partial tool-call map (arguments JSON may be incomplete)
+                        self.pending_tool_calls.clear();
+                        // Push visible warning — Done handler will set_auto_scroll
+                        self.messages.push(ChatMessage::App(format!(
+                            "⚠ {} Increase max_output_tokens in cloud_models.conf.",
+                            msg
+                        )));
+                    }
                     Ok(StreamChunk::ToolCalls(tool_calls)) => {
                         if !self.streaming_thinking.is_empty() {
                             self.messages
@@ -1098,7 +1127,7 @@ impl App {
                         }
                         self.pending_tool_calls = tool_calls;
                         self.is_loading = false;
-                        self.status_message.clear();
+                        self.status_message = self.format_token_stats();
                         self.response_rx = None;
                         self.tool_round_count += 1;
                         if self.tool_round_count >= self.max_tool_rounds {
@@ -1114,6 +1143,30 @@ impl App {
                     Ok(StreamChunk::Done(stats)) => {
                         self.retrying = false;
                         self.token_stats = stats;
+
+                        // If Truncated already committed the partial text, handle continuation
+                        if self.pending_continuation {
+                            self.pending_continuation = false;
+                            self.is_loading = false;
+                            self.status_message = self.format_token_stats();
+                            self.response_rx = None;
+                            if self.agentic_mode && self.continuation_count < 3 {
+                                self.continuation_count += 1;
+                                self.messages.push(ChatMessage::App(format!(
+                                    "Auto-continuing (attempt {}/3)...",
+                                    self.continuation_count
+                                )));
+                                self.set_auto_scroll();
+                                self.send_to_ollama_async_with(Some(
+                                    "Your previous response was truncated by the output token limit. Continue exactly from where you stopped.".to_string()
+                                ));
+                                break;
+                            }
+                            self.continuation_count = 0;
+                            self.set_auto_scroll();
+                            break;
+                        }
+
                         if !self.streaming_thinking.is_empty() {
                             self.messages
                                 .push(ChatMessage::Thinking(self.streaming_thinking.clone()));
@@ -1146,7 +1199,7 @@ impl App {
                                 self.streaming_thinking.clear();
                                 self.streaming_text.clear();
                                 self.is_loading = false;
-                                self.status_message.clear();
+                                self.status_message = self.format_token_stats();
                                 self.response_rx = None;
                                 self.tool_round_count += 1;
                                 if self.tool_round_count >= self.max_tool_rounds {
@@ -1169,7 +1222,7 @@ impl App {
                                 .push(ChatMessage::App("Error: Empty response from model".to_string()));
                         }
                         self.is_loading = false;
-                        self.status_message.clear();
+                        self.status_message = self.format_token_stats();
                         self.response_rx = None;
                         self.set_auto_scroll();
                         break;
@@ -1371,6 +1424,7 @@ impl App {
                         "model": cloud.api_model,
                         "messages": api_messages,
                         "stream": true,
+                        "max_tokens": cloud.max_output_tokens,
                     });
                     body["tools"] = serde_json::json!(get_tool_definitions());
                     body["temperature"] = serde_json::json!(temperature);
@@ -1447,108 +1501,109 @@ impl App {
                                         if line.is_empty() {
                                             continue;
                                         }
-                                        match serde_json::from_str::<serde_json::Value>(&line) {
-                                            Ok(json) => {
-                                                if is_cloud {
-                                                    if let Some(reasoning) = json["choices"][0]["delta"]["reasoning_content"].as_str() {
-                                                        if !reasoning.is_empty() {
-                                                            let _ = tx.send(StreamChunk::Thinking(reasoning.to_string()));
-                                                        }
+                                        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&line) {
+                                            if is_cloud {
+                                                if let Some(reasoning) = json["choices"][0]["delta"]["reasoning_content"].as_str()
+                                                    && !reasoning.is_empty() {
+                                                        let _ = tx.send(StreamChunk::Thinking(reasoning.to_string()));
                                                     }
-                                                    if let Some(delta) = json["choices"][0]["delta"]["content"].as_str() {
-                                                        if !delta.is_empty() {
-                                                            let _ = tx.send(StreamChunk::Text(delta.to_string()));
-                                                        }
+                                                if let Some(delta) = json["choices"][0]["delta"]["content"].as_str()
+                                                    && !delta.is_empty() {
+                                                        let _ = tx.send(StreamChunk::Text(delta.to_string()));
                                                     }
-                                                    if let Some(tc_array) = json["choices"][0]["delta"]["tool_calls"].as_array() {
-                                                        for tc in tc_array {
-                                                            let idx = tc["index"].as_u64().unwrap_or(0) as u32;
-                                                            let entry = tool_call_map.entry(idx).or_insert_with(|| {
-                                                                let mut base = serde_json::json!({
-                                                                    "index": idx,
-                                                                    "type": "function",
-                                                                    "function": {"name": "", "arguments": ""}
-                                                                });
-                                                                if let Some(id) = tc["id"].as_str() {
-                                                                    base["id"] = serde_json::json!(id);
-                                                                }
-                                                                base
+                                                if let Some(tc_array) = json["choices"][0]["delta"]["tool_calls"].as_array() {
+                                                    for tc in tc_array {
+                                                        let idx = tc["index"].as_u64().unwrap_or(0) as u32;
+                                                        let entry = tool_call_map.entry(idx).or_insert_with(|| {
+                                                            let mut base = serde_json::json!({
+                                                                "index": idx,
+                                                                "type": "function",
+                                                                "function": {"name": "", "arguments": ""}
                                                             });
                                                             if let Some(id) = tc["id"].as_str() {
-                                                                entry["id"] = serde_json::json!(id);
+                                                                base["id"] = serde_json::json!(id);
                                                             }
-                                                            if let Some(name) = tc["function"]["name"].as_str() {
-                                                                if !name.is_empty() {
-                                                                    entry["function"]["name"] = serde_json::json!(name);
-                                                                }
-                                                            }
-                                                            if let Some(args) = tc["function"]["arguments"].as_str() {
-                                                                let existing = entry["function"]["arguments"].as_str().unwrap_or("").to_string();
-                                                                entry["function"]["arguments"] = serde_json::json!(format!("{}{}", existing, args));
-                                                            }
+                                                            base
+                                                        });
+                                                        if let Some(id) = tc["id"].as_str() {
+                                                            entry["id"] = serde_json::json!(id);
                                                         }
-                                                    }
-                                                    let finish = json["choices"][0]["finish_reason"].as_str();
-                                                    if finish == Some("stop") || finish == Some("tool_calls") {
-                                                         let stats = parse_usage_stats(&json);
-                                                        log_to_file(is_logging, &log_file, &session_id, "STREAM_END", &format!("{} finish_reason={}", api_url, finish.unwrap_or("?")));
-                                                        if !tool_call_map.is_empty() {
-                                                            let mut calls: Vec<serde_json::Value> = tool_call_map.into_values().collect();
-                                                            calls.sort_by_key(|tc| tc["index"].as_u64().unwrap_or(0));
-                                                            let _ = tx.send(StreamChunk::ToolCalls(calls));
-                                                        } else {
-                                                            let _ = tx.send(StreamChunk::Done(stats));
-                                                        }
-                                                        return;
-                                                    }
-                                                } else {
-                                                    if let Some(thinking) = json["message"]["thinking"].as_str() {
-                                                        if !thinking.is_empty() {
-                                                            let _ = tx.send(StreamChunk::Thinking(thinking.to_string()));
-                                                        }
-                                                    }
-                                                    if let Some(content) = json["message"]["content"].as_str() {
-                                                        if !content.is_empty() {
-                                                            let _ = tx.send(StreamChunk::Text(content.to_string()));
-                                                        }
-                                                    }
-                                                    if let Some(tool_calls) = json["message"]["tool_calls"].as_array() {
-                                                        for tc in tool_calls {
-                                                            let idx = tc["index"].as_u64().unwrap_or(0) as u32;
-                                                            let entry = tool_call_map.entry(idx).or_insert_with(|| {
-                                                                serde_json::json!({
-                                                                    "index": idx,
-                                                                    "type": "function",
-                                                                    "function": {"name": "", "arguments": ""}
-                                                                })
-                                                            });
-                                                            if let Some(name) = tc["function"]["name"].as_str() {
+                                                        if let Some(name) = tc["function"]["name"].as_str()
+                                                            && !name.is_empty() {
                                                                 entry["function"]["name"] = serde_json::json!(name);
                                                             }
-                                                            if let Some(id) = tc["id"].as_str() {
-                                                                entry["id"] = serde_json::json!(id);
-                                                            }
-                                                            if let Some(args) = tc["function"]["arguments"].as_str() {
-                                                                entry["function"]["arguments"] = serde_json::json!(args);
-                                                            } else {
-                                                                entry["function"]["arguments"] = serde_json::json!(tc["function"]["arguments"].to_string());
-                                                            }
+                                                        if let Some(args) = tc["function"]["arguments"].as_str() {
+                                                            let existing = entry["function"]["arguments"].as_str().unwrap_or("").to_string();
+                                                            entry["function"]["arguments"] = serde_json::json!(format!("{}{}", existing, args));
                                                         }
-                                                    }
-                                                    if json["done"].as_bool() == Some(true) {
-                                                        log_to_file(is_logging, &log_file, &session_id, "STREAM_END", &format!("{} done=true tokens={}", api_url, json["eval_count"].as_u64().unwrap_or(0)));
-                                                        if !tool_call_map.is_empty() {
-                                                            let calls: Vec<serde_json::Value> = tool_call_map.into_values().collect();
-                                                            let _ = tx.send(StreamChunk::ToolCalls(calls));
-                                                        } else {
-                                                            let stats = parse_token_stats(&json);
-                                                            let _ = tx.send(StreamChunk::Done(stats));
-                                                        }
-                                                        return;
                                                     }
                                                 }
+                                                let finish = json["choices"][0]["finish_reason"].as_str();
+                                                if finish == Some("stop") || finish == Some("tool_calls") {
+                                                     let stats = parse_usage_stats(&json);
+                                                    log_to_file(is_logging, &log_file, &session_id, "STREAM_END", &format!("{} finish_reason={}", api_url, finish.unwrap_or("?")));
+                                                    if !tool_call_map.is_empty() {
+                                                        let mut calls: Vec<serde_json::Value> = tool_call_map.into_values().collect();
+                                                        calls.sort_by_key(|tc| tc["index"].as_u64().unwrap_or(0));
+                                                        let _ = tx.send(StreamChunk::ToolCalls(calls));
+                                                    } else {
+                                                        let _ = tx.send(StreamChunk::Done(stats));
+                                                    }
+                                                    return;
+                                                }
+                                                if finish == Some("length") || finish == Some("max_tokens") {
+                                                    let stats = parse_usage_stats(&json);
+                                                    log_to_file(is_logging, &log_file, &session_id, "STREAM_TRUNCATED", &format!("{} finish_reason={}", api_url, finish.unwrap_or("?")));
+                                                    let _ = tx.send(StreamChunk::Truncated(format!(
+                                                        "Response truncated (finish_reason={}). Output limit reached.", finish.unwrap_or("?")
+                                                    )));
+                                                    let _ = tx.send(StreamChunk::Done(stats));
+                                                    return;
+                                                }
+                                            } else {
+                                                if let Some(thinking) = json["message"]["thinking"].as_str()
+                                                    && !thinking.is_empty() {
+                                                        let _ = tx.send(StreamChunk::Thinking(thinking.to_string()));
+                                                    }
+                                                if let Some(content) = json["message"]["content"].as_str()
+                                                    && !content.is_empty() {
+                                                        let _ = tx.send(StreamChunk::Text(content.to_string()));
+                                                    }
+                                                if let Some(tool_calls) = json["message"]["tool_calls"].as_array() {
+                                                    for tc in tool_calls {
+                                                        let idx = tc["index"].as_u64().unwrap_or(0) as u32;
+                                                        let entry = tool_call_map.entry(idx).or_insert_with(|| {
+                                                            serde_json::json!({
+                                                                "index": idx,
+                                                                "type": "function",
+                                                                "function": {"name": "", "arguments": ""}
+                                                            })
+                                                        });
+                                                        if let Some(name) = tc["function"]["name"].as_str() {
+                                                            entry["function"]["name"] = serde_json::json!(name);
+                                                        }
+                                                        if let Some(id) = tc["id"].as_str() {
+                                                            entry["id"] = serde_json::json!(id);
+                                                        }
+                                                        if let Some(args) = tc["function"]["arguments"].as_str() {
+                                                            entry["function"]["arguments"] = serde_json::json!(args);
+                                                        } else {
+                                                            entry["function"]["arguments"] = serde_json::json!(tc["function"]["arguments"].to_string());
+                                                        }
+                                                    }
+                                                }
+                                                if json["done"].as_bool() == Some(true) {
+                                                    log_to_file(is_logging, &log_file, &session_id, "STREAM_END", &format!("{} done=true tokens={}", api_url, json["eval_count"].as_u64().unwrap_or(0)));
+                                                    if !tool_call_map.is_empty() {
+                                                        let calls: Vec<serde_json::Value> = tool_call_map.into_values().collect();
+                                                        let _ = tx.send(StreamChunk::ToolCalls(calls));
+                                                    } else {
+                                                        let stats = parse_token_stats(&json);
+                                                        let _ = tx.send(StreamChunk::Done(stats));
+                                                    }
+                                                    return;
+                                                }
                                             }
-                                            Err(_) => {}
                                         }
                                     }
                                 }
@@ -1575,8 +1630,23 @@ impl App {
     }
 
     fn send_to_ollama_async(&mut self) {
-        let prompt = self.textarea.lines().join("\n").trim().to_string();
-        self.textarea = TextArea::default();
+        self.send_to_ollama_async_with(None);
+    }
+
+    fn send_to_ollama_async_with(&mut self, override_prompt: Option<String>) {
+        let prompt = if let Some(ref p) = override_prompt {
+            p.clone()
+        } else {
+            let p = self.textarea.lines().join("\n").trim().to_string();
+            self.textarea = TextArea::default();
+            p
+        };
+
+        // Reset continuation tracking on fresh user input (not auto-continuations)
+        if !prompt.is_empty() && override_prompt.is_none() {
+            self.continuation_count = 0;
+            self.pending_continuation = false;
+        }
 
         if let Some(result) = self.handle_slash_command(&prompt) {
             if !result.is_empty() {
@@ -1586,7 +1656,9 @@ impl App {
             return;
         }
 
-        self.messages.push(ChatMessage::User(prompt));
+        if !prompt.is_empty() {
+            self.messages.push(ChatMessage::User(prompt));
+        }
         self.tool_round_count = 0;
         self.tool_call_count = 0;
         self.is_loading = true;
@@ -1710,6 +1782,7 @@ impl App {
                         "model": cloud.api_model,
                         "messages": api_messages,
                         "stream": true,
+                        "max_tokens": cloud.max_output_tokens,
                     });
                     body["tools"] = serde_json::json!(get_tool_definitions());
                     body["temperature"] = serde_json::json!(temperature);
@@ -1788,108 +1861,109 @@ impl App {
                                         if line.is_empty() {
                                             continue;
                                         }
-                                        match serde_json::from_str::<serde_json::Value>(&line) {
-                                            Ok(json) => {
-                                                if is_cloud {
-                                                    if let Some(reasoning) = json["choices"][0]["delta"]["reasoning_content"].as_str() {
-                                                        if !reasoning.is_empty() {
-                                                            let _ = tx.send(StreamChunk::Thinking(reasoning.to_string()));
-                                                        }
+                                        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&line) {
+                                            if is_cloud {
+                                                if let Some(reasoning) = json["choices"][0]["delta"]["reasoning_content"].as_str()
+                                                    && !reasoning.is_empty() {
+                                                        let _ = tx.send(StreamChunk::Thinking(reasoning.to_string()));
                                                     }
-                                                    if let Some(delta) = json["choices"][0]["delta"]["content"].as_str() {
-                                                        if !delta.is_empty() {
-                                                            let _ = tx.send(StreamChunk::Text(delta.to_string()));
-                                                        }
+                                                if let Some(delta) = json["choices"][0]["delta"]["content"].as_str()
+                                                    && !delta.is_empty() {
+                                                        let _ = tx.send(StreamChunk::Text(delta.to_string()));
                                                     }
-                                                    if let Some(tc_array) = json["choices"][0]["delta"]["tool_calls"].as_array() {
-                                                        for tc in tc_array {
-                                                            let idx = tc["index"].as_u64().unwrap_or(0) as u32;
-                                                            let entry = tool_call_map.entry(idx).or_insert_with(|| {
-                                                                let mut base = serde_json::json!({
-                                                                    "index": idx,
-                                                                    "type": "function",
-                                                                    "function": {"name": "", "arguments": ""}
-                                                                });
-                                                                if let Some(id) = tc["id"].as_str() {
-                                                                    base["id"] = serde_json::json!(id);
-                                                                }
-                                                                base
+                                                if let Some(tc_array) = json["choices"][0]["delta"]["tool_calls"].as_array() {
+                                                    for tc in tc_array {
+                                                        let idx = tc["index"].as_u64().unwrap_or(0) as u32;
+                                                        let entry = tool_call_map.entry(idx).or_insert_with(|| {
+                                                            let mut base = serde_json::json!({
+                                                                "index": idx,
+                                                                "type": "function",
+                                                                "function": {"name": "", "arguments": ""}
                                                             });
                                                             if let Some(id) = tc["id"].as_str() {
-                                                                entry["id"] = serde_json::json!(id);
+                                                                base["id"] = serde_json::json!(id);
                                                             }
-                                                            if let Some(name) = tc["function"]["name"].as_str() {
-                                                                if !name.is_empty() {
-                                                                    entry["function"]["name"] = serde_json::json!(name);
-                                                                }
-                                                            }
-                                                            if let Some(args) = tc["function"]["arguments"].as_str() {
-                                                                let existing = entry["function"]["arguments"].as_str().unwrap_or("").to_string();
-                                                                entry["function"]["arguments"] = serde_json::json!(format!("{}{}", existing, args));
-                                                            }
+                                                            base
+                                                        });
+                                                        if let Some(id) = tc["id"].as_str() {
+                                                            entry["id"] = serde_json::json!(id);
                                                         }
-                                                    }
-                                                    let finish = json["choices"][0]["finish_reason"].as_str();
-                                                    if finish == Some("stop") || finish == Some("tool_calls") {
-                                                         let stats = parse_usage_stats(&json);
-                                                        log_to_file(is_logging, &log_file, &session_id, "STREAM_END", &format!("{} finish_reason={}", api_url, finish.unwrap_or("?")));
-                                                        if !tool_call_map.is_empty() {
-                                                            let mut calls: Vec<serde_json::Value> = tool_call_map.into_values().collect();
-                                                            calls.sort_by_key(|tc| tc["index"].as_u64().unwrap_or(0));
-                                                            let _ = tx.send(StreamChunk::ToolCalls(calls));
-                                                        } else {
-                                                            let _ = tx.send(StreamChunk::Done(stats));
-                                                        }
-                                                        return;
-                                                    }
-                                                } else {
-                                                    if let Some(thinking) = json["message"]["thinking"].as_str() {
-                                                        if !thinking.is_empty() {
-                                                            let _ = tx.send(StreamChunk::Thinking(thinking.to_string()));
-                                                        }
-                                                    }
-                                                    if let Some(content) = json["message"]["content"].as_str() {
-                                                        if !content.is_empty() {
-                                                            let _ = tx.send(StreamChunk::Text(content.to_string()));
-                                                        }
-                                                    }
-                                                    if let Some(tool_calls) = json["message"]["tool_calls"].as_array() {
-                                                        for tc in tool_calls {
-                                                            let idx = tc["index"].as_u64().unwrap_or(0) as u32;
-                                                            let entry = tool_call_map.entry(idx).or_insert_with(|| {
-                                                                serde_json::json!({
-                                                                    "index": idx,
-                                                                    "type": "function",
-                                                                    "function": {"name": "", "arguments": ""}
-                                                                })
-                                                            });
-                                                            if let Some(name) = tc["function"]["name"].as_str() {
+                                                        if let Some(name) = tc["function"]["name"].as_str()
+                                                            && !name.is_empty() {
                                                                 entry["function"]["name"] = serde_json::json!(name);
                                                             }
-                                                            if let Some(id) = tc["id"].as_str() {
-                                                                entry["id"] = serde_json::json!(id);
-                                                            }
-                                                            if let Some(args) = tc["function"]["arguments"].as_str() {
-                                                                entry["function"]["arguments"] = serde_json::json!(args);
-                                                            } else {
-                                                                entry["function"]["arguments"] = serde_json::json!(tc["function"]["arguments"].to_string());
-                                                            }
+                                                        if let Some(args) = tc["function"]["arguments"].as_str() {
+                                                            let existing = entry["function"]["arguments"].as_str().unwrap_or("").to_string();
+                                                            entry["function"]["arguments"] = serde_json::json!(format!("{}{}", existing, args));
                                                         }
-                                                    }
-                                                    if json["done"].as_bool() == Some(true) {
-                                                        log_to_file(is_logging, &log_file, &session_id, "STREAM_END", &format!("{} done=true tokens={}", api_url, json["eval_count"].as_u64().unwrap_or(0)));
-                                                        if !tool_call_map.is_empty() {
-                                                            let calls: Vec<serde_json::Value> = tool_call_map.into_values().collect();
-                                                            let _ = tx.send(StreamChunk::ToolCalls(calls));
-                                                        } else {
-                                                            let stats = parse_token_stats(&json);
-                                                            let _ = tx.send(StreamChunk::Done(stats));
-                                                        }
-                                                        return;
                                                     }
                                                 }
+                                                let finish = json["choices"][0]["finish_reason"].as_str();
+                                                if finish == Some("stop") || finish == Some("tool_calls") {
+                                                     let stats = parse_usage_stats(&json);
+                                                    log_to_file(is_logging, &log_file, &session_id, "STREAM_END", &format!("{} finish_reason={}", api_url, finish.unwrap_or("?")));
+                                                    if !tool_call_map.is_empty() {
+                                                        let mut calls: Vec<serde_json::Value> = tool_call_map.into_values().collect();
+                                                        calls.sort_by_key(|tc| tc["index"].as_u64().unwrap_or(0));
+                                                        let _ = tx.send(StreamChunk::ToolCalls(calls));
+                                                    } else {
+                                                        let _ = tx.send(StreamChunk::Done(stats));
+                                                    }
+                                                    return;
+                                                }
+                                                if finish == Some("length") || finish == Some("max_tokens") {
+                                                    let stats = parse_usage_stats(&json);
+                                                    log_to_file(is_logging, &log_file, &session_id, "STREAM_TRUNCATED", &format!("{} finish_reason={}", api_url, finish.unwrap_or("?")));
+                                                    let _ = tx.send(StreamChunk::Truncated(format!(
+                                                        "Response truncated (finish_reason={}). Output limit reached.", finish.unwrap_or("?")
+                                                    )));
+                                                    let _ = tx.send(StreamChunk::Done(stats));
+                                                    return;
+                                                }
+                                            } else {
+                                                if let Some(thinking) = json["message"]["thinking"].as_str()
+                                                    && !thinking.is_empty() {
+                                                        let _ = tx.send(StreamChunk::Thinking(thinking.to_string()));
+                                                    }
+                                                if let Some(content) = json["message"]["content"].as_str()
+                                                    && !content.is_empty() {
+                                                        let _ = tx.send(StreamChunk::Text(content.to_string()));
+                                                    }
+                                                if let Some(tool_calls) = json["message"]["tool_calls"].as_array() {
+                                                    for tc in tool_calls {
+                                                        let idx = tc["index"].as_u64().unwrap_or(0) as u32;
+                                                        let entry = tool_call_map.entry(idx).or_insert_with(|| {
+                                                            serde_json::json!({
+                                                                "index": idx,
+                                                                "type": "function",
+                                                                "function": {"name": "", "arguments": ""}
+                                                            })
+                                                        });
+                                                        if let Some(name) = tc["function"]["name"].as_str() {
+                                                            entry["function"]["name"] = serde_json::json!(name);
+                                                        }
+                                                        if let Some(id) = tc["id"].as_str() {
+                                                            entry["id"] = serde_json::json!(id);
+                                                        }
+                                                        if let Some(args) = tc["function"]["arguments"].as_str() {
+                                                            entry["function"]["arguments"] = serde_json::json!(args);
+                                                        } else {
+                                                            entry["function"]["arguments"] = serde_json::json!(tc["function"]["arguments"].to_string());
+                                                        }
+                                                    }
+                                                }
+                                                if json["done"].as_bool() == Some(true) {
+                                                    log_to_file(is_logging, &log_file, &session_id, "STREAM_END", &format!("{} done=true tokens={}", api_url, json["eval_count"].as_u64().unwrap_or(0)));
+                                                    if !tool_call_map.is_empty() {
+                                                        let calls: Vec<serde_json::Value> = tool_call_map.into_values().collect();
+                                                        let _ = tx.send(StreamChunk::ToolCalls(calls));
+                                                    } else {
+                                                        let stats = parse_token_stats(&json);
+                                                        let _ = tx.send(StreamChunk::Done(stats));
+                                                    }
+                                                    return;
+                                                }
                                             }
-                                            Err(_) => {}
                                         }
                                     }
                                 }
@@ -2200,7 +2274,6 @@ impl App {
         }
         if cancel_btn.is_clicked(rel_x, rel_y) {
             self.show_load_dialog = false;
-            return;
         }
     }
 
@@ -2415,7 +2488,7 @@ impl App {
             let action = self.main_menu.handle_click(col, row);
             match action {
                 MenuAction::None => {
-                    if row == 0 || self.main_menu.is_open() == false {
+                    if row == 0 || !self.main_menu.is_open() {
                         // Menu opened or closed, update input mode
                         if self.main_menu.is_open() {
                             self.input_mode = InputMode::Menu;
@@ -2484,15 +2557,14 @@ impl App {
     pub fn handle_mouse_up(&mut self) {
         if self.selecting {
             self.selecting = false;
-            if let Some(text) = self.selected_text() {
-                if !text.trim().is_empty() {
+            if let Some(text) = self.selected_text()
+                && !text.trim().is_empty() {
                     self.primary_selection.set_text(text.clone());
                     let s = self.selection_start.unwrap_or(0);
                     let e = self.selection_end.unwrap_or(0);
                     let count = if s <= e { e - s + 1 } else { s - e + 1 };
                     self.status_message = format!("Selected {} line(s) copied to X selection", count);
                 }
-            }
         }
         self.scrollbar_drag_end();
     }
@@ -2729,7 +2801,6 @@ impl App {
         }
         if cancel_btn.is_clicked(col, row) {
             self.show_model_dialog = false;
-            return;
         }
     }
 
@@ -2936,31 +3007,26 @@ impl App {
             Some(proxy_val)
         };
         self.ollama_url = self.settings_ollama_url.trim().to_string();
-        if let Ok(v) = self.settings_temperature.trim().parse::<f64>() {
-            if v >= 0.0 && v <= 2.0 {
+        if let Ok(v) = self.settings_temperature.trim().parse::<f64>()
+            && (0.0..=2.0).contains(&v) {
                 self.temperature = v;
             }
-        }
-        if let Ok(v) = self.settings_top_p.trim().parse::<f64>() {
-            if v >= 0.0 && v <= 1.0 {
+        if let Ok(v) = self.settings_top_p.trim().parse::<f64>()
+            && (0.0..=1.0).contains(&v) {
                 self.top_p = v;
             }
-        }
-        if let Ok(v) = self.settings_top_k.trim().parse::<u32>() {
-            if v >= 1 && v <= 100 {
+        if let Ok(v) = self.settings_top_k.trim().parse::<u32>()
+            && (1..=100).contains(&v) {
                 self.top_k = v;
             }
-        }
-        if let Ok(v) = self.settings_max_tool_rounds.trim().parse::<usize>() {
-            if v >= 1 && v <= 100 {
+        if let Ok(v) = self.settings_max_tool_rounds.trim().parse::<usize>()
+            && (1..=100).contains(&v) {
                 self.max_tool_rounds = v;
             }
-        }
-        if let Ok(v) = self.settings_max_retries.trim().parse::<u32>() {
-            if v >= 1 && v <= 50 {
+        if let Ok(v) = self.settings_max_retries.trim().parse::<u32>()
+            && (1..=50).contains(&v) {
                 self.max_retries = v;
             }
-        }
         self.justify = self.settings_justify;
         let _ = self.save_proxy_to_config();
         self.show_settings_dialog = false;
@@ -3029,7 +3095,6 @@ impl App {
             }
             if col >= btn_start_x + save_w + gap && col < btn_start_x + total_btn_w {
                 self.show_settings_dialog = false;
-                return;
             }
         }
     }
@@ -3064,7 +3129,6 @@ impl App {
 
         if ok_btn.is_clicked(col, row) {
             self.show_about = false;
-            return;
         }
     }
 
@@ -3119,7 +3183,6 @@ impl App {
         }
         if no_btn.is_clicked(col, row) {
             self.show_quit_confirm = false;
-            return;
         }
     }
 
@@ -3341,7 +3404,7 @@ impl App {
         }
 
         let list_h = self.file_dialog_entries.len().min(12) as u16;
-        if row >= inner_y + 1 && row < inner_y + 1 + list_h {
+        if row > inner_y && row < inner_y + 1 + list_h {
             let idx = (row - inner_y - 1 + self.file_dialog_scroll as u16) as usize;
             if idx < self.file_dialog_entries.len() {
                 self.file_dialog_selection = idx;
@@ -3376,7 +3439,6 @@ impl App {
         }
         if cancel_btn.is_clicked(col, row) {
             self.show_file_dialog = false;
-            return;
         }
     }
 
@@ -3396,7 +3458,7 @@ impl App {
             "log" => Some(self.slash_log()),
             "maxrounds" => Some(match arg {
                 Some(n) => match n.parse::<usize>() {
-                    Ok(v) if v >= 1 && v <= 100 => {
+                    Ok(v) if (1..=100).contains(&v) => {
                         self.max_tool_rounds = v;
                         format!("Max tool rounds set to {}", v)
                     }
@@ -3407,7 +3469,7 @@ impl App {
             }),
             "temp" => Some(match arg {
                 Some(n) => match n.parse::<f64>() {
-                    Ok(v) if v >= 0.0 && v <= 2.0 => {
+                    Ok(v) if (0.0..=2.0).contains(&v) => {
                         self.temperature = v;
                         format!("Temperature set to {}", v)
                     }
@@ -3418,7 +3480,7 @@ impl App {
             }),
             "topp" => Some(match arg {
                 Some(n) => match n.parse::<f64>() {
-                    Ok(v) if v >= 0.0 && v <= 1.0 => {
+                    Ok(v) if (0.0..=1.0).contains(&v) => {
                         self.top_p = v;
                         format!("Top_p set to {}", v)
                     }
@@ -3429,7 +3491,7 @@ impl App {
             }),
             "topk" => Some(match arg {
                 Some(n) => match n.parse::<u32>() {
-                    Ok(v) if v >= 1 && v <= 100 => {
+                    Ok(v) if (1..=100).contains(&v) => {
                         self.top_k = v;
                         format!("Top_k set to {}", v)
                     }
@@ -3705,6 +3767,45 @@ impl App {
     fn log_event(&self, kind: &str, content: &str) {
         log_to_file(self.is_logging, &self.log_file, &self.session_id, kind, content);
     }
+
+    pub fn format_token_stats(&self) -> String {
+        let s = &self.token_stats;
+        let mut parts = Vec::new();
+
+        // Output tokens with max and percentage for cloud models
+        let model = &self.model_name;
+        let max_output = self.cloud_models.iter()
+            .find(|m| m.name == *model)
+            .map(|m| m.max_output_tokens);
+
+        if let Some(max) = max_output {
+            if max > 0 {
+                let pct = s.response_tokens as f64 / max as f64 * 100.0;
+                parts.push(format!("{}/{} ({:.0}%)", s.response_tokens, max, pct));
+            }
+        } else {
+            // Ollama or unknown — just show count
+            parts.push(format!("out:{}", s.response_tokens));
+        }
+
+        if s.prompt_tokens > 0 {
+            parts.push(format!("prompt:{}", s.prompt_tokens));
+        }
+        if s.cached_tokens > 0 {
+            parts.push(format!("cached:{}", s.cached_tokens));
+        }
+        if s.reasoning_tokens > 0 {
+            parts.push(format!("reason:{}", s.reasoning_tokens));
+        }
+        if s.tokens_per_sec > 0.0 {
+            parts.push(format!("{:.1} tok/s", s.tokens_per_sec));
+        }
+
+        if parts.is_empty() {
+            return String::new();
+        }
+        format!("Tokens: {}", parts.join(" | "))
+    }
 }
 
 fn rotate_log_file(log_file: &str) {
@@ -3784,8 +3885,8 @@ fn truncate(s: &str, max: usize) -> String {
 
 fn patch_tool_call_ids(msgs: &mut Vec<ChatMessage>) {
     for i in 0..msgs.len() {
-        if let ChatMessage::ToolCall { name, tool_call_id, .. } = &msgs[i] {
-            if tool_call_id.is_none() {
+        if let ChatMessage::ToolCall { name, tool_call_id, .. } = &msgs[i]
+            && tool_call_id.is_none() {
                 let id = format!("call_{}", name);
                 msgs[i] = match msgs[i].clone() {
                     ChatMessage::ToolCall { name, arguments, .. } => ChatMessage::ToolCall {
@@ -3796,9 +3897,8 @@ fn patch_tool_call_ids(msgs: &mut Vec<ChatMessage>) {
                     other => other,
                 };
             }
-        }
-        if let ChatMessage::ToolResult { name, tool_call_id, .. } = &msgs[i] {
-            if tool_call_id.is_none() {
+        if let ChatMessage::ToolResult { name, tool_call_id, .. } = &msgs[i]
+            && tool_call_id.is_none() {
                 let id = format!("call_{}", name);
                 msgs[i] = match msgs[i].clone() {
                     ChatMessage::ToolResult { name, content, .. } => ChatMessage::ToolResult {
@@ -3809,7 +3909,6 @@ fn patch_tool_call_ids(msgs: &mut Vec<ChatMessage>) {
                     other => other,
                 };
             }
-        }
     }
 }
 
@@ -4082,21 +4181,20 @@ fn get_tool_definitions() -> Vec<serde_json::Value> {
 
 fn build_reqwest_client(proxy: &Option<String>) -> reqwest::Client {
     let mut builder = reqwest::Client::builder();
-    if let Some(proxy_url) = proxy {
-        if let Ok(proxy) = reqwest::Proxy::all(proxy_url) {
+    builder = builder.connect_timeout(std::time::Duration::from_secs(30));
+    if let Some(proxy_url) = proxy
+        && let Ok(proxy) = reqwest::Proxy::all(proxy_url) {
             builder = builder.proxy(proxy);
         }
-    }
     builder.build().unwrap_or_else(|_| reqwest::Client::new())
 }
 
 fn build_blocking_client(proxy: &Option<String>) -> reqwest::blocking::Client {
     let mut builder = reqwest::blocking::Client::builder();
-    if let Some(proxy_url) = proxy {
-        if let Ok(proxy) = reqwest::Proxy::all(proxy_url) {
+    if let Some(proxy_url) = proxy
+        && let Ok(proxy) = reqwest::Proxy::all(proxy_url) {
             builder = builder.proxy(proxy);
         }
-    }
     builder.build().unwrap_or_else(|_| reqwest::blocking::Client::new())
 }
 
@@ -4135,8 +4233,7 @@ async fn send_with_retry(
     for attempt in 0..=max_retries {
         let mut req = client
             .request(method.clone(), url)
-            .json(body)
-            .timeout(std::time::Duration::from_secs(300));
+            .json(body);
         if let Some(ref h) = headers {
             req = req.headers(h.clone());
         }
@@ -4413,8 +4510,8 @@ fn grep_regex(pattern: &str, path: &str, include: &str) -> Result<Vec<String>, S
     let mut results = Vec::new();
     if let Ok(entries) = glob::glob(&glob_pattern) {
         for entry in entries.flatten() {
-            if entry.is_file() {
-                if let Ok(content) = std::fs::read_to_string(&entry) {
+            if entry.is_file()
+                && let Ok(content) = std::fs::read_to_string(&entry) {
                     for (line_num, line) in content.lines().enumerate() {
                         if re.is_match(line) {
                             results.push(format!(
@@ -4426,7 +4523,6 @@ fn grep_regex(pattern: &str, path: &str, include: &str) -> Result<Vec<String>, S
                         }
                     }
                 }
-            }
         }
     }
     Ok(results)
@@ -4471,15 +4567,14 @@ fn parse_text_tool_calls(text: &str) -> Vec<serde_json::Value> {
                 let name = name_match.as_str().to_string();
                 let args_str = args_match.as_str().to_string();
 
-                if TOOL_NAMES.contains(&name.as_str()) {
-                    if let Ok(args_json) = serde_json::from_str::<serde_json::Value>(&args_str) {
+                if TOOL_NAMES.contains(&name.as_str())
+                    && let Ok(args_json) = serde_json::from_str::<serde_json::Value>(&args_str) {
                         let tc = serde_json::json!({
                             "name": name,
                             "parameters": args_json,
                         });
                         tool_calls.push(tc);
                     }
-                }
             }
         }
     }

@@ -28,6 +28,7 @@ pub struct CloudModel {
     pub api_url: String,
     pub api_key: String,
     pub api_model: String,
+    pub max_output_tokens: u32,
 }
 
 impl Default for Config {
@@ -150,11 +151,10 @@ impl Config {
         if let Some(v) = values.get("agentic") {
             cfg.agentic = parse_bool(v);
         }
-        if let Some(v) = values.get("timeout_secs") {
-            if let Ok(n) = v.parse::<u64>() {
+        if let Some(v) = values.get("timeout_secs")
+            && let Ok(n) = v.parse::<u64>() {
                 cfg.timeout_secs = n;
             }
-        }
         if let Some(v) = values.get("logging") {
             cfg.logging = parse_bool(v);
         }
@@ -172,48 +172,36 @@ impl Config {
                 cfg.proxy = Some(v.to_string());
             }
         }
-        if let Some(v) = values.get("max_tool_rounds") {
-            if let Ok(n) = v.parse::<usize>() {
-                if n >= 1 && n <= 100 {
+        if let Some(v) = values.get("max_tool_rounds")
+            && let Ok(n) = v.parse::<usize>()
+                && (1..=100).contains(&n) {
                     cfg.max_tool_rounds = n;
                 }
-            }
-        }
-        if let Some(v) = values.get("max_retries") {
-            if let Ok(n) = v.parse::<u32>() {
-                if n >= 1 && n <= 50 {
+        if let Some(v) = values.get("max_retries")
+            && let Ok(n) = v.parse::<u32>()
+                && (1..=50).contains(&n) {
                     cfg.max_retries = n;
                 }
-            }
-        }
-        if let Some(v) = values.get("temperature") {
-            if let Ok(n) = v.parse::<f64>() {
-                if n >= 0.0 && n <= 2.0 {
+        if let Some(v) = values.get("temperature")
+            && let Ok(n) = v.parse::<f64>()
+                && (0.0..=2.0).contains(&n) {
                     cfg.temperature = n;
                 }
-            }
-        }
-        if let Some(v) = values.get("top_p") {
-            if let Ok(n) = v.parse::<f64>() {
-                if n >= 0.0 && n <= 1.0 {
+        if let Some(v) = values.get("top_p")
+            && let Ok(n) = v.parse::<f64>()
+                && (0.0..=1.0).contains(&n) {
                     cfg.top_p = n;
                 }
-            }
-        }
-        if let Some(v) = values.get("top_k") {
-            if let Ok(n) = v.parse::<u32>() {
-                if n >= 1 && n <= 100 {
+        if let Some(v) = values.get("top_k")
+            && let Ok(n) = v.parse::<u32>()
+                && (1..=100).contains(&n) {
                     cfg.top_k = n;
                 }
-            }
-        }
-        if let Some(v) = values.get("terminal_width_pct") {
-            if let Ok(n) = v.parse::<u16>() {
-                if n >= 20 && n <= 80 {
+        if let Some(v) = values.get("terminal_width_pct")
+            && let Ok(n) = v.parse::<u16>()
+                && (20..=80).contains(&n) {
                     cfg.terminal_width_pct = n;
                 }
-            }
-        }
         if let Some(v) = values.get("justify") {
             cfg.justify = parse_bool(v);
         }
@@ -234,7 +222,7 @@ impl Config {
                 }
             }
             if !found {
-                if !lines.last().map_or(true, |l| l.is_empty()) {
+                if !lines.last().is_none_or(|l| l.is_empty()) {
                     lines.push(String::new());
                 }
                 lines.push(format!("system_prompt = {}", prompt));
@@ -311,6 +299,7 @@ fn default_cloud_conf() -> String {
      # Each model has its own section [model_name]\n\
      # Required fields: api_url, api_key\n\
      # Optional: api_model (actual model name sent to API, defaults to section name)\n\
+     # Optional: max_output_tokens (default: 16384)\n\
      \n\
      [mistral-small]\n\
      api_url = https://api.mistral.ai/v1/chat/completions\n\
@@ -330,6 +319,7 @@ fn parse_cloud_models(content: &str) -> Vec<CloudModel> {
     let mut current_url = String::new();
     let mut current_key = String::new();
     let mut current_api_model = String::new();
+    let mut current_max_output_tokens: u32 = 16384;
 
     for line in content.lines() {
         let line = line.trim();
@@ -338,8 +328,8 @@ fn parse_cloud_models(content: &str) -> Vec<CloudModel> {
         }
 
         if line.starts_with('[') && line.ends_with(']') {
-            if let Some(name) = current_name.take() {
-                if !current_url.is_empty() && !current_key.is_empty() {
+            if let Some(name) = current_name.take()
+                && !current_url.is_empty() && !current_key.is_empty() {
                     let api_model = if current_api_model.is_empty() {
                         name.clone()
                     } else {
@@ -350,13 +340,14 @@ fn parse_cloud_models(content: &str) -> Vec<CloudModel> {
                         api_url: current_url.clone(),
                         api_key: current_key.clone(),
                         api_model,
+                        max_output_tokens: current_max_output_tokens,
                     });
                 }
-            }
             current_name = Some(line[1..line.len() - 1].trim().to_string());
             current_url.clear();
             current_key.clear();
             current_api_model.clear();
+            current_max_output_tokens = 16384;
         } else if let Some((key, value)) = line.split_once('=') {
             let key = key.trim().to_lowercase();
             let value = value.trim().to_string();
@@ -364,13 +355,18 @@ fn parse_cloud_models(content: &str) -> Vec<CloudModel> {
                 "api_url" => current_url = value,
                 "api_key" => current_key = value,
                 "api_model" => current_api_model = value,
+                "max_output_tokens" => {
+                    if let Ok(n) = value.parse::<u32>() {
+                        current_max_output_tokens = n;
+                    }
+                }
                 _ => {}
             }
         }
     }
 
-    if let Some(name) = current_name {
-        if !current_url.is_empty() && !current_key.is_empty() {
+    if let Some(name) = current_name
+        && !current_url.is_empty() && !current_key.is_empty() {
             let api_model = if current_api_model.is_empty() {
                 name.clone()
             } else {
@@ -381,9 +377,9 @@ fn parse_cloud_models(content: &str) -> Vec<CloudModel> {
                 api_url: current_url,
                 api_key: current_key,
                 api_model,
+                max_output_tokens: current_max_output_tokens,
             });
         }
-    }
 
     models
 }

@@ -119,8 +119,25 @@ where
                 }
             } else {
                 // During retry: allow scrolling and text selection, block everything else
-                match event::read()? {
-                    Event::Mouse(mouse) => match mouse.kind {
+                if let Event::Mouse(mouse) = event::read()? { match mouse.kind {
+                    MouseEventKind::ScrollUp => app.scroll_up(),
+                    MouseEventKind::ScrollDown => app.scroll_down(),
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        let size = terminal.size()?;
+                        app.handle_click(mouse.column, mouse.row, size.width, size.height);
+                    }
+                    MouseEventKind::Up(MouseButton::Left) => {
+                        app.handle_mouse_up();
+                    }
+                    MouseEventKind::Drag(MouseButton::Left) => {
+                        let size = terminal.size()?;
+                        let input_start = size.height.saturating_sub(6);
+                        app.handle_mouse_drag(mouse.row, input_start);
+                    }
+                    _ => {}
+                } }
+                while event::poll(Duration::ZERO)? {
+                    if let Event::Mouse(mouse) = event::read()? { match mouse.kind {
                         MouseEventKind::ScrollUp => app.scroll_up(),
                         MouseEventKind::ScrollDown => app.scroll_down(),
                         MouseEventKind::Down(MouseButton::Left) => {
@@ -136,30 +153,7 @@ where
                             app.handle_mouse_drag(mouse.row, input_start);
                         }
                         _ => {}
-                    },
-                    _ => {}
-                }
-                while event::poll(Duration::ZERO)? {
-                    match event::read()? {
-                        Event::Mouse(mouse) => match mouse.kind {
-                            MouseEventKind::ScrollUp => app.scroll_up(),
-                            MouseEventKind::ScrollDown => app.scroll_down(),
-                            MouseEventKind::Down(MouseButton::Left) => {
-                                let size = terminal.size()?;
-                                app.handle_click(mouse.column, mouse.row, size.width, size.height);
-                            }
-                            MouseEventKind::Up(MouseButton::Left) => {
-                                app.handle_mouse_up();
-                            }
-                            MouseEventKind::Drag(MouseButton::Left) => {
-                                let size = terminal.size()?;
-                                let input_start = size.height.saturating_sub(6);
-                                app.handle_mouse_drag(mouse.row, input_start);
-                            }
-                            _ => {}
-                        },
-                        _ => {}
-                    }
+                    } }
                 }
             }
         }
@@ -187,7 +181,8 @@ fn ui(f: &mut Frame, app: &mut App) {
     render_keybar(f, app, main_chunks[2]);
 
     let show_terminal = app.terminal_state.visible && app.terminal_state.is_running();
-    let has_status = !app.status_message.is_empty();
+    let has_token_stats = app.token_stats.prompt_tokens > 0 || app.token_stats.response_tokens > 0;
+    let has_status = !app.status_message.is_empty() || has_token_stats;
 
     if show_terminal {
         let content_chunks = Layout::horizontal([
@@ -205,7 +200,7 @@ fn ui(f: &mut Frame, app: &mut App) {
             .split(content_chunks[0]);
             app.output_width = left_chunks[0].width;
             render_output(f, app, left_chunks[0]);
-            render_status_bar(f, &app.status_message, left_chunks[1]);
+            render_status_bar(f, app, left_chunks[1]);
             render_input(f, app, left_chunks[2]);
         } else {
             let left_chunks =
@@ -225,7 +220,7 @@ fn ui(f: &mut Frame, app: &mut App) {
             .split(main_chunks[1]);
             app.output_width = content_chunks[0].width;
             render_output(f, app, content_chunks[0]);
-            render_status_bar(f, &app.status_message, content_chunks[1]);
+            render_status_bar(f, app, content_chunks[1]);
             render_input(f, app, content_chunks[2]);
         } else {
             let content_chunks =
@@ -530,60 +525,9 @@ fn render_output(f: &mut Frame, app: &mut App, area: Rect) {
         Style::default().fg(Color::DarkGray)
     };
 
-    let streaming_part = if app.is_loading {
-        if app.retrying {
-            " [waiting] "
-        } else {
-            " [streaming] "
-        }
-    } else {
-        ""
-    };
-
-    let stats_part = if app.token_stats.prompt_tokens > 0 || app.token_stats.response_tokens > 0 {
-        let cached = if app.token_stats.cached_tokens > 0 {
-            format!(" ({}cached)", app.token_stats.cached_tokens)
-        } else {
-            String::new()
-        };
-        let reasoning = if app.token_stats.reasoning_tokens > 0 {
-            format!(" ({}reasoning)", app.token_stats.reasoning_tokens)
-        } else {
-            String::new()
-        };
-        let speed = if app.token_stats.tokens_per_sec > 0.0 {
-            format!(" {:.1}t/s", app.token_stats.tokens_per_sec)
-        } else {
-            String::new()
-        };
-        let duration = if app.token_stats.total_duration_ms > 0 {
-            format!(" {}ms", app.token_stats.total_duration_ms)
-        } else {
-            String::new()
-        };
-        format!(
-            " | in:{}{} out:{}{}{}{}",
-            app.token_stats.prompt_tokens,
-            cached,
-            app.token_stats.response_tokens,
-            reasoning,
-            speed,
-            duration,
-        )
-    } else {
-        String::new()
-    };
-
-    let tool_count_part = if app.tool_call_count > 0 {
-        format!(" | tools:{} (max {} rounds)", app.tool_call_count, app.max_tool_rounds)
-    } else {
-        String::new()
-    };
-
-    let total_suffix_len = stats_part.chars().count() + streaming_part.chars().count() + tool_count_part.chars().count();
     let available = area.width.saturating_sub(2) as usize;
-    let model_display = if app.model_name.chars().count() + total_suffix_len > available {
-        let model_budget = available.saturating_sub(total_suffix_len).saturating_sub(3);
+    let model_display = if app.model_name.chars().count() > available {
+        let model_budget = available.saturating_sub(3);
         if model_budget > 0 {
             let truncated: String = app.model_name.chars().take(model_budget).collect();
             format!("{}...", truncated)
@@ -594,22 +538,10 @@ fn render_output(f: &mut Frame, app: &mut App, area: Rect) {
         app.model_name.clone()
     };
 
-    let mut bottom_spans = vec![Span::styled(
-        format!(" {}{}{}", model_display, stats_part, tool_count_part),
+    let bottom_title = Line::from(Span::styled(
+        format!(" {} ", model_display),
         Style::default().fg(Color::DarkGray),
-    )];
-
-    if !streaming_part.is_empty() {
-        bottom_spans.push(Span::styled(
-            streaming_part,
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::SLOW_BLINK),
-        ));
-    }
-    bottom_spans.push(Span::raw(" "));
-
-    let bottom_title = Line::from(bottom_spans);
+    ));
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -652,7 +584,7 @@ fn render_output(f: &mut Frame, app: &mut App, area: Rect) {
 fn render_input(f: &mut Frame, app: &App, area: Rect) {
     let (title, border_style) = match (&app.input_mode, &app.focus) {
         (InputMode::Input, Focus::Input) => (
-            " Input (Alt+Enter: send) ".to_string(),
+            " Input ".to_string(),
             Style::default().fg(Color::Green),
         ),
         (_, Focus::Input) => (
@@ -702,11 +634,7 @@ fn render_terminal_panel(f: &mut Frame, app: &App, area: Rect) {
 
     let total_lines = lines.len() as u16;
     let visible_lines = area.height.saturating_sub(2);
-    let scroll_y = if total_lines > visible_lines {
-        total_lines - visible_lines
-    } else {
-        0
-    };
+    let scroll_y = total_lines.saturating_sub(visible_lines);
 
     let paragraph = Paragraph::new(lines)
         .block(block)
@@ -735,14 +663,36 @@ fn render_send_button(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(Line::from(Span::styled(btn_text, btn_style))), btn_area);
 }
 
-fn render_status_bar(f: &mut Frame, status: &str, area: Rect) {
-    let line = Line::from(Span::styled(
-        format!(" {} ", status),
-        Style::default()
-            .fg(Color::Yellow)
-            .bg(Color::DarkGray)
-            .add_modifier(Modifier::BOLD),
-    ));
+fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
+    let activity = app.status_message.trim().to_string();
+    let token_info = app.format_token_stats();
+
+    let mut spans: Vec<Span> = Vec::new();
+
+    if !activity.is_empty() {
+        let style = if app.is_loading || app.retrying {
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+        };
+        spans.push(Span::styled(format!(" {} ", activity), style));
+    }
+
+    if !token_info.is_empty() {
+        if !spans.is_empty() {
+            spans.push(Span::styled(" | ", Style::default().fg(Color::DarkGray)));
+        }
+        spans.push(Span::styled(
+            format!(" {} ", token_info),
+            Style::default().fg(Color::Cyan),
+        ));
+    }
+
+    if spans.is_empty() {
+        return;
+    }
+
+    let line = Line::from(spans);
     let bar = Paragraph::new(line).style(Style::default().bg(Color::DarkGray));
     f.render_widget(bar, area);
 }
@@ -1457,7 +1407,7 @@ fn render_settings_dialog(f: &mut Frame, app: &App, area: Rect) {
 
 fn flush_line(lines: &mut Vec<Line<'static>>, spans: &mut Vec<Span<'static>>) {
     if !spans.is_empty() {
-        let collected: Vec<Span> = spans.drain(..).collect();
+        let collected: Vec<Span> = std::mem::take(spans);
         lines.push(Line::from(collected));
     }
 }
@@ -1773,7 +1723,7 @@ fn wrap_and_justify_lines(lines: &[Line<'static>], width: usize, justify: bool) 
                 if justify {
                     justify_paragraph_into(&mut result, &para, width);
                 } else {
-                    result.extend(para.drain(..));
+                    result.append(&mut para);
                 }
                 para.clear();
             }
@@ -1913,8 +1863,8 @@ fn highlight_code(code: &str, lang: Option<&str>) -> Vec<Line<'static>> {
     static SS: OnceLock<SyntaxSet> = OnceLock::new();
     static TS: OnceLock<ThemeSet> = OnceLock::new();
 
-    let ss = SS.get_or_init(|| SyntaxSet::load_defaults_newlines());
-    let ts = TS.get_or_init(|| ThemeSet::load_defaults());
+    let ss = SS.get_or_init(SyntaxSet::load_defaults_newlines);
+    let ts = TS.get_or_init(ThemeSet::load_defaults);
 
     let syntax = lang
         .and_then(|l| ss.find_syntax_by_token(l))
@@ -1926,7 +1876,7 @@ fn highlight_code(code: &str, lang: Option<&str>) -> Vec<Line<'static>> {
     let mut result: Vec<Line<'static>> = Vec::new();
 
     for line in code.lines() {
-        let ranges = h.highlight_line(line, &ss).unwrap_or_default();
+        let ranges = h.highlight_line(line, ss).unwrap_or_default();
         let mut spans: Vec<Span<'static>> = Vec::new();
         for (style, text) in ranges {
             let fg = Color::Rgb(

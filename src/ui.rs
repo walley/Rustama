@@ -492,8 +492,8 @@ impl FileActionDialog {
             y_cursor += h;
         }
 
-        if let Some(idx) = button_idx {
-            if let Some(DialogItem::Buttons(btns)) = self.items.get(idx) {
+        if let Some(idx) = button_idx
+            && let Some(DialogItem::Buttons(btns)) = self.items.get(idx) {
                 let total_btn_width: u16 = btns.iter()
                     .map(|b| b.label.len() as u16 + 4)
                     .sum::<u16>()
@@ -516,7 +516,6 @@ impl FileActionDialog {
                 f.render_widget(Paragraph::new(Line::from(spans)), btn_area);
                 item_areas.push((idx, btn_area));
             }
-        }
 
         DialogAreas { popup, inner, item_areas }
     }
@@ -593,9 +592,9 @@ impl FileActionDialog {
             y_cursor += h;
         }
 
-        if let Some(idx) = button_item_idx {
-            if let Some(DialogItem::Buttons(btns)) = self.items.get(idx) {
-                if row == btn_bottom_y {
+        if let Some(idx) = button_item_idx
+            && let Some(DialogItem::Buttons(btns)) = self.items.get(idx)
+                && row == btn_bottom_y {
                     let total_btn_width: u16 = btns.iter()
                         .map(|b| b.label.len() as u16 + 4)
                         .sum::<u16>()
@@ -613,8 +612,6 @@ impl FileActionDialog {
                         x_cursor += btn_w;
                     }
                 }
-            }
-        }
 
         DialogHit::None
     }
@@ -688,7 +685,7 @@ impl MainMenu {
     pub fn is_separator(&self, index: usize) -> bool {
         self.item_names()
             .get(index)
-            .map_or(false, |name| *name == "\u{2500}")
+            .is_some_and(|name| *name == "\u{2500}")
     }
 
     fn x_offset_for(menu: ActiveMenu) -> u16 {
@@ -831,8 +828,8 @@ impl MainMenu {
         if self.is_open() {
             let x_offset = Self::x_offset_for(self.active);
             let item_count = self.max_items() as u16;
-            if row >= 2 && row < 2 + item_count {
-                if col >= x_offset && col < x_offset + 20 {
+            if row >= 2 && row < 2 + item_count
+                && col >= x_offset && col < x_offset + 20 {
                     let idx = (row - 2) as usize;
                     if !self.is_separator(idx) {
                         self.selection = idx;
@@ -842,7 +839,6 @@ impl MainMenu {
                     }
                     return MenuAction::None;
                 }
-            }
             self.close();
             return MenuAction::None;
         }
