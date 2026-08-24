@@ -1187,11 +1187,12 @@ impl App {
                         self.pending_tool_calls = tool_calls;
                         self.is_loading = false;
                         // The finish chunk carried usage (sent as Stats): commit it.
+                        // Token info is rendered in the status bar's own token slot,
+                        // never in the message slot.
                         if self.last_stats.prompt_tokens > 0 || self.last_stats.response_tokens > 0
                         {
                             self.token_stats = self.last_stats.clone();
                         }
-                        self.status_message = self.format_token_stats();
                         self.response_rx = None;
                         self.tool_round_count += 1;
                         if self.tool_round_count >= self.max_tool_rounds {
@@ -1219,7 +1220,8 @@ impl App {
                         if self.pending_continuation {
                             self.pending_continuation = false;
                             self.is_loading = false;
-                            self.status_message = self.format_token_stats();
+                            // Token info belongs to the status bar's token slot only.
+                            self.status_message.clear();
                             self.response_rx = None;
                             if self.agentic_mode && self.continuation_count < 3 {
                                 self.continuation_count += 1;
@@ -1284,7 +1286,8 @@ impl App {
                                 self.streaming_thinking.clear();
                                 self.streaming_text.clear();
                                 self.is_loading = false;
-                                self.status_message = self.format_token_stats();
+                                // Token info belongs to the status bar's token slot only.
+                                self.status_message.clear();
                                 self.response_rx = None;
                                 self.tool_round_count += 1;
                                 if self.tool_round_count >= self.max_tool_rounds {
@@ -1307,7 +1310,8 @@ impl App {
                             ));
                         }
                         self.is_loading = false;
-                        self.status_message = self.format_token_stats();
+                        // Token info belongs to the status bar's token slot only.
+                        self.status_message.clear();
                         self.response_rx = None;
                         self.set_auto_scroll();
                         break;
