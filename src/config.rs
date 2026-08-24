@@ -66,10 +66,24 @@ impl Config {
                 let cfg = Self::parse(&content);
                 let dflt = Config::default();
                 let missing: Vec<(&str, String)> = vec![
-                    ("logging", if dflt.logging { "true".to_string() } else { "false".to_string() }),
+                    (
+                        "logging",
+                        if dflt.logging {
+                            "true".to_string()
+                        } else {
+                            "false".to_string()
+                        },
+                    ),
                     ("logfile", dflt.logfile.clone()),
                     ("system_prompt", dflt.system_prompt.clone()),
-                    ("justify", if dflt.justify { "true".to_string() } else { "false".to_string() }),
+                    (
+                        "justify",
+                        if dflt.justify {
+                            "true".to_string()
+                        } else {
+                            "false".to_string()
+                        },
+                    ),
                 ];
 
                 let mut updated = content.clone();
@@ -129,9 +143,20 @@ impl Config {
               top_k = {}\n\n\
               # Justify paragraphs in output (true/false, default: false)\n\
               justify = {}\n",
-            self.ollama_url, self.model, self.save_path, self.agentic, self.timeout_secs,
-            self.logging, self.logfile, self.system_prompt, self.max_tool_rounds, self.max_retries,
-            self.temperature, self.top_p, self.top_k, self.justify,
+            self.ollama_url,
+            self.model,
+            self.save_path,
+            self.agentic,
+            self.timeout_secs,
+            self.logging,
+            self.logfile,
+            self.system_prompt,
+            self.max_tool_rounds,
+            self.max_retries,
+            self.temperature,
+            self.top_p,
+            self.top_k,
+            self.justify,
         )
     }
 
@@ -152,9 +177,10 @@ impl Config {
             cfg.agentic = parse_bool(v);
         }
         if let Some(v) = values.get("timeout_secs")
-            && let Ok(n) = v.parse::<u64>() {
-                cfg.timeout_secs = n;
-            }
+            && let Ok(n) = v.parse::<u64>()
+        {
+            cfg.timeout_secs = n;
+        }
         if let Some(v) = values.get("logging") {
             cfg.logging = parse_bool(v);
         }
@@ -166,7 +192,11 @@ impl Config {
         }
         if let Some(v) = values.get("proxy") {
             let v = v.trim();
-            if v.is_empty() || v.eq_ignore_ascii_case("off") || v.eq_ignore_ascii_case("none") || v.eq_ignore_ascii_case("false") {
+            if v.is_empty()
+                || v.eq_ignore_ascii_case("off")
+                || v.eq_ignore_ascii_case("none")
+                || v.eq_ignore_ascii_case("false")
+            {
                 cfg.proxy = None;
             } else {
                 cfg.proxy = Some(v.to_string());
@@ -174,34 +204,40 @@ impl Config {
         }
         if let Some(v) = values.get("max_tool_rounds")
             && let Ok(n) = v.parse::<usize>()
-                && (1..=100).contains(&n) {
-                    cfg.max_tool_rounds = n;
-                }
+            && (1..=100).contains(&n)
+        {
+            cfg.max_tool_rounds = n;
+        }
         if let Some(v) = values.get("max_retries")
             && let Ok(n) = v.parse::<u32>()
-                && (1..=50).contains(&n) {
-                    cfg.max_retries = n;
-                }
+            && (1..=50).contains(&n)
+        {
+            cfg.max_retries = n;
+        }
         if let Some(v) = values.get("temperature")
             && let Ok(n) = v.parse::<f64>()
-                && (0.0..=2.0).contains(&n) {
-                    cfg.temperature = n;
-                }
+            && (0.0..=2.0).contains(&n)
+        {
+            cfg.temperature = n;
+        }
         if let Some(v) = values.get("top_p")
             && let Ok(n) = v.parse::<f64>()
-                && (0.0..=1.0).contains(&n) {
-                    cfg.top_p = n;
-                }
+            && (0.0..=1.0).contains(&n)
+        {
+            cfg.top_p = n;
+        }
         if let Some(v) = values.get("top_k")
             && let Ok(n) = v.parse::<u32>()
-                && (1..=100).contains(&n) {
-                    cfg.top_k = n;
-                }
+            && (1..=100).contains(&n)
+        {
+            cfg.top_k = n;
+        }
         if let Some(v) = values.get("terminal_width_pct")
             && let Ok(n) = v.parse::<u16>()
-                && (20..=80).contains(&n) {
-                    cfg.terminal_width_pct = n;
-                }
+            && (20..=80).contains(&n)
+        {
+            cfg.terminal_width_pct = n;
+        }
         if let Some(v) = values.get("justify") {
             cfg.justify = parse_bool(v);
         }
@@ -336,20 +372,21 @@ fn parse_cloud_models(content: &str) -> Vec<CloudModel> {
             if let Some(name) = current_name.take()
                 && !current_url.is_empty()
                 && !current_key.is_empty()
-                && !is_placeholder_key(&current_key) {
-                    let api_model = if current_api_model.is_empty() {
-                        name.clone()
-                    } else {
-                        current_api_model.clone()
-                    };
-                    models.push(CloudModel {
-                        name,
-                        api_url: current_url.clone(),
-                        api_key: current_key.clone(),
-                        api_model,
-                        max_output_tokens: current_max_output_tokens,
-                    });
-                }
+                && !is_placeholder_key(&current_key)
+            {
+                let api_model = if current_api_model.is_empty() {
+                    name.clone()
+                } else {
+                    current_api_model.clone()
+                };
+                models.push(CloudModel {
+                    name,
+                    api_url: current_url.clone(),
+                    api_key: current_key.clone(),
+                    api_model,
+                    max_output_tokens: current_max_output_tokens,
+                });
+            }
             current_name = Some(line[1..line.len() - 1].trim().to_string());
             current_url.clear();
             current_key.clear();
@@ -375,20 +412,21 @@ fn parse_cloud_models(content: &str) -> Vec<CloudModel> {
     if let Some(name) = current_name
         && !current_url.is_empty()
         && !current_key.is_empty()
-        && !is_placeholder_key(&current_key) {
-            let api_model = if current_api_model.is_empty() {
-                name.clone()
-            } else {
-                current_api_model
-            };
-            models.push(CloudModel {
-                name,
-                api_url: current_url,
-                api_key: current_key,
-                api_model,
-                max_output_tokens: current_max_output_tokens,
-            });
-        }
+        && !is_placeholder_key(&current_key)
+    {
+        let api_model = if current_api_model.is_empty() {
+            name.clone()
+        } else {
+            current_api_model
+        };
+        models.push(CloudModel {
+            name,
+            api_url: current_url,
+            api_key: current_key,
+            api_model,
+            max_output_tokens: current_max_output_tokens,
+        });
+    }
 
     models
 }
@@ -412,9 +450,7 @@ fn find_conf_file() -> Option<PathBuf> {
 }
 
 fn dirs_home() -> Option<PathBuf> {
-    std::env::var("HOME")
-        .map(PathBuf::from)
-        .ok()
+    std::env::var("HOME").map(PathBuf::from).ok()
 }
 
 fn parse_bool(s: &str) -> bool {

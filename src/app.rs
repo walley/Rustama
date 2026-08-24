@@ -1,18 +1,21 @@
-use crate::ui::{ActiveMenu, Button, DialogDropdownState, DialogHit, FileActionDialog, MainMenu, MenuAction, Theme};
-use ratatui::layout::Rect;
-use serde::{Deserialize, Serialize};
+use crate::ui::{
+    ActiveMenu, Button, DialogDropdownState, DialogHit, FileActionDialog, MainMenu, MenuAction,
+    Theme,
+};
+use arboard::Clipboard;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui::layout::Rect;
 use ratatui::style::Color;
 use ratatui::text::Line;
 use ratatui_textarea::TextArea;
-use arboard::Clipboard;
+use serde::{Deserialize, Serialize};
+use std::io::Read;
 use std::path::PathBuf;
 use std::process::{Child, Stdio};
-use std::io::Read;
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
 
-use crate::config::{Config, CloudModel, load_cloud_models};
+use crate::config::{CloudModel, Config, load_cloud_models};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum InputMode {
@@ -241,11 +244,11 @@ pub struct TerminalState {
 /// Shell reserved words / builtins that must not be prefixed with `stdbuf`.
 const SHELL_KEYWORDS: &[&str] = &[
     "if", "then", "elif", "else", "fi", "for", "while", "until", "do", "done", "case", "esac",
-    "in", "function", "select", "time", "coproc", "!", "{", "}", "(", ")", "[[", "]]",
-    "cd", "echo", "export", "pwd", "set", "unset", "shift", "read", "printf", "return",
-    "exit", "eval", "exec", "source", "alias", "unalias", "declare", "typeset", "local",
-    "readonly", "trap", "wait", "jobs", "bg", "fg", "kill", "history", "let", "pushd",
-    "popd", "dirs", "umask", "ulimit", "test", "true", "false", "break", "continue",
+    "in", "function", "select", "time", "coproc", "!", "{", "}", "(", ")", "[[", "]]", "cd",
+    "echo", "export", "pwd", "set", "unset", "shift", "read", "printf", "return", "exit", "eval",
+    "exec", "source", "alias", "unalias", "declare", "typeset", "local", "readonly", "trap",
+    "wait", "jobs", "bg", "fg", "kill", "history", "let", "pushd", "popd", "dirs", "umask",
+    "ulimit", "test", "true", "false", "break", "continue",
 ];
 
 /// Line-buffers the spawned command's output so long-running scripts (builds,
@@ -295,9 +298,10 @@ impl TerminalState {
         // Check if child process has exited
         let mut child = self.child.lock().unwrap();
         if let Some(ref mut c) = *child
-            && let Ok(Some(_)) = c.try_wait() {
-                return false;
-            }
+            && let Ok(Some(_)) = c.try_wait()
+        {
+            return false;
+        }
         true
     }
 
@@ -645,7 +649,14 @@ impl App {
             cached_width: 0,
             terminal_height: 24,
             output_width: 0,
-            session_id: format!("{:016x}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos() & 0xffff_ffff_ffff_ffff),
+            session_id: format!(
+                "{:016x}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+                    & 0xffff_ffff_ffff_ffff
+            ),
             session_name: String::new(),
             terminal_state: TerminalState {
                 width_pct: cfg.terminal_width_pct,
@@ -664,7 +675,13 @@ impl App {
             last_stats: TokenStats::default(),
         };
         app.session_name = app.session_id.clone();
-        log_to_file(app.is_logging, &app.log_file, &app.session_id, "START", "Program started");
+        log_to_file(
+            app.is_logging,
+            &app.log_file,
+            &app.session_id,
+            "START",
+            "Program started",
+        );
         app.fetch_models_async();
         app
     }
@@ -693,9 +710,7 @@ impl App {
                 self.open_quit_confirm();
                 return;
             }
-            KeyCode::Char('t' | 'T')
-                if key.modifiers.contains(KeyModifiers::CONTROL) =>
-            {
+            KeyCode::Char('t' | 'T') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 if self.terminal_state.is_running() {
                     self.terminal_state.visible = !self.terminal_state.visible;
                 } else {
@@ -713,7 +728,8 @@ impl App {
                 }
                 if self.terminal_state.width_pct > 20 {
                     self.terminal_state.width_pct -= 5;
-                    self.status_message = format!("Terminal width: {}%", self.terminal_state.width_pct);
+                    self.status_message =
+                        format!("Terminal width: {}%", self.terminal_state.width_pct);
                 }
                 return;
             }
@@ -726,7 +742,8 @@ impl App {
                 }
                 if self.terminal_state.width_pct < 80 {
                     self.terminal_state.width_pct += 5;
-                    self.status_message = format!("Terminal width: {}%", self.terminal_state.width_pct);
+                    self.status_message =
+                        format!("Terminal width: {}%", self.terminal_state.width_pct);
                 }
                 return;
             }
@@ -784,7 +801,9 @@ impl App {
                 if let Some(text) = self.selected_text() {
                     if let Some(ref mut cb) = self.clipboard {
                         match cb.set_text(text.trim_end().to_string()) {
-                            Ok(_) => self.status_message = "Copied selection to clipboard".to_string(),
+                            Ok(_) => {
+                                self.status_message = "Copied selection to clipboard".to_string()
+                            }
                             Err(e) => self.status_message = format!("Clipboard write: {}", e),
                         }
                     } else {
@@ -810,8 +829,7 @@ impl App {
     fn handle_input_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Enter => {
-                if key.modifiers == KeyModifiers::ALT
-                {
+                if key.modifiers == KeyModifiers::ALT {
                     self.textarea.input(key);
                 } else if key.modifiers == KeyModifiers::CONTROL {
                     if !self.textarea.lines().join("").trim().is_empty() && !self.is_loading {
@@ -895,7 +913,9 @@ impl App {
             .cloned()
             .collect();
         for m in &self.cloud_models {
-            if m.name.to_lowercase().starts_with(&partial.to_lowercase()) && !matches.contains(&m.name) {
+            if m.name.to_lowercase().starts_with(&partial.to_lowercase())
+                && !matches.contains(&m.name)
+            {
                 matches.push(m.name.clone());
             }
         }
@@ -977,22 +997,33 @@ impl App {
     fn execute_terminal_tool(&mut self, name: &str, args_json: &str) -> Option<String> {
         match name {
             "terminal_open" => {
-                let args: serde_json::Value = serde_json::from_str(args_json).unwrap_or(serde_json::json!({}));
+                let args: serde_json::Value =
+                    serde_json::from_str(args_json).unwrap_or(serde_json::json!({}));
                 let command = args["command"].as_str().unwrap_or("");
                 let result = self.terminal_state.open(command);
-                let cursor = self.terminal_state.buffer.lock().unwrap().total_bytes_written;
-                Some(serde_json::json!({
-                    "status": result,
-                    "cursor": cursor,
-                }).to_string())
+                let cursor = self
+                    .terminal_state
+                    .buffer
+                    .lock()
+                    .unwrap()
+                    .total_bytes_written;
+                Some(
+                    serde_json::json!({
+                        "status": result,
+                        "cursor": cursor,
+                    })
+                    .to_string(),
+                )
             }
             "terminal_send" => {
-                let args: serde_json::Value = serde_json::from_str(args_json).unwrap_or(serde_json::json!({}));
+                let args: serde_json::Value =
+                    serde_json::from_str(args_json).unwrap_or(serde_json::json!({}));
                 let input = args["input"].as_str().unwrap_or("");
                 Some(self.terminal_state.send_input(input))
             }
             "terminal_read" => {
-                let args: serde_json::Value = serde_json::from_str(args_json).unwrap_or(serde_json::json!({}));
+                let args: serde_json::Value =
+                    serde_json::from_str(args_json).unwrap_or(serde_json::json!({}));
                 let cursor = args["cursor"].as_u64();
                 let result = self.terminal_state.read_buffer_incremental(cursor);
                 Some(result.to_string())
@@ -1123,8 +1154,12 @@ impl App {
                                 consecutive_unknown = 0;
                             }
 
-                            let tool_call_id = Some(tc["id"].as_str().map(|s| s.to_string())
-                                .unwrap_or_else(|| format!("call_{}", &name)));
+                            let tool_call_id = Some(
+                                tc["id"]
+                                    .as_str()
+                                    .map(|s| s.to_string())
+                                    .unwrap_or_else(|| format!("call_{}", &name)),
+                            );
 
                             self.messages.push(ChatMessage::ToolCall {
                                 name: name.clone(),
@@ -1132,12 +1167,16 @@ impl App {
                                 tool_call_id: tool_call_id.clone(),
                             });
 
-                            let result = self.execute_terminal_tool(&name, &args)
+                            let result = self
+                                .execute_terminal_tool(&name, &args)
                                 .unwrap_or_else(|| execute_tool_call(&name, &args, &self.proxy));
                             self.tool_call_count += 1;
                             self.tool_call_log
                                 .push((name.clone(), args.clone(), result.clone()));
-                            self.log_event("TOOL_CALL", &format!("{}({}) -> {}", name, args, truncate(&result, 500)));
+                            self.log_event(
+                                "TOOL_CALL",
+                                &format!("{}({}) -> {}", name, args, truncate(&result, 500)),
+                            );
 
                             self.messages.push(ChatMessage::ToolResult {
                                 name,
@@ -1148,16 +1187,18 @@ impl App {
                         self.pending_tool_calls = tool_calls;
                         self.is_loading = false;
                         // The finish chunk carried usage (sent as Stats): commit it.
-                        if self.last_stats.prompt_tokens > 0 || self.last_stats.response_tokens > 0 {
+                        if self.last_stats.prompt_tokens > 0 || self.last_stats.response_tokens > 0
+                        {
                             self.token_stats = self.last_stats.clone();
                         }
                         self.status_message = self.format_token_stats();
                         self.response_rx = None;
                         self.tool_round_count += 1;
                         if self.tool_round_count >= self.max_tool_rounds {
-                            self.messages.push(ChatMessage::App(
-                                format!("Reached max tool rounds ({}/{} rounds, {} tool calls). Stopping.", self.tool_round_count, self.max_tool_rounds, self.tool_call_count),
-                            ));
+                            self.messages.push(ChatMessage::App(format!(
+                                "Reached max tool rounds ({}/{} rounds, {} tool calls). Stopping.",
+                                self.tool_round_count, self.max_tool_rounds, self.tool_call_count
+                            )));
                             self.set_auto_scroll();
                             break;
                         }
@@ -1215,11 +1256,25 @@ impl App {
                                         arguments: args.clone(),
                                         tool_call_id: Some(tc_id.clone()),
                                     });
-                             let result = self.execute_terminal_tool(&name, &args)
-                                .unwrap_or_else(|| execute_tool_call(&name, &args, &self.proxy));
-                            self.tool_call_count += 1;
-                                    self.tool_call_log.push((name.clone(), args.clone(), result.clone()));
-                                    self.log_event("TOOL_CALL", &format!("{}({}) -> {}", name, args, truncate(&result, 500)));
+                                    let result =
+                                        self.execute_terminal_tool(&name, &args).unwrap_or_else(
+                                            || execute_tool_call(&name, &args, &self.proxy),
+                                        );
+                                    self.tool_call_count += 1;
+                                    self.tool_call_log.push((
+                                        name.clone(),
+                                        args.clone(),
+                                        result.clone(),
+                                    ));
+                                    self.log_event(
+                                        "TOOL_CALL",
+                                        &format!(
+                                            "{}({}) -> {}",
+                                            name,
+                                            args,
+                                            truncate(&result, 500)
+                                        ),
+                                    );
                                     self.messages.push(ChatMessage::ToolResult {
                                         name,
                                         content: result,
@@ -1243,13 +1298,13 @@ impl App {
                                 break;
                             }
                             self.log_event("ASSISTANT", &text);
-                            self.messages
-                                .push(ChatMessage::Assistant(text));
+                            self.messages.push(ChatMessage::Assistant(text));
                             self.streaming_thinking.clear();
                             self.streaming_text.clear();
                         } else {
-                            self.messages
-                                .push(ChatMessage::App("Error: Empty response from model".to_string()));
+                            self.messages.push(ChatMessage::App(
+                                "Error: Empty response from model".to_string(),
+                            ));
                         }
                         self.is_loading = false;
                         self.status_message = self.format_token_stats();
@@ -1259,7 +1314,8 @@ impl App {
                     }
                     Ok(StreamChunk::Error(msg)) => {
                         self.retrying = false;
-                        let had_content = !self.streaming_thinking.is_empty() || !self.streaming_text.is_empty();
+                        let had_content =
+                            !self.streaming_thinking.is_empty() || !self.streaming_text.is_empty();
                         if !self.streaming_thinking.is_empty() {
                             self.messages
                                 .push(ChatMessage::Thinking(self.streaming_thinking.clone()));
@@ -1285,7 +1341,8 @@ impl App {
                     }
                     Ok(StreamChunk::RetryPaused(msg)) => {
                         self.retrying = false;
-                        let had_content = !self.streaming_thinking.is_empty() || !self.streaming_text.is_empty();
+                        let had_content =
+                            !self.streaming_thinking.is_empty() || !self.streaming_text.is_empty();
                         if !self.streaming_thinking.is_empty() {
                             self.messages
                                 .push(ChatMessage::Thinking(self.streaming_thinking.clone()));
@@ -1383,7 +1440,11 @@ impl App {
                         "content": format!("Here is the content of `{}`:\n\n{}", name, content)
                     }));
                 }
-                ChatMessage::ToolCall { name, arguments, tool_call_id } => {
+                ChatMessage::ToolCall {
+                    name,
+                    arguments,
+                    tool_call_id,
+                } => {
                     let args_value: serde_json::Value = if is_cloud {
                         serde_json::json!(arguments)
                     } else {
@@ -1407,7 +1468,11 @@ impl App {
                         "tool_calls": [tc],
                     }));
                 }
-                ChatMessage::ToolResult { name, content, tool_call_id } => {
+                ChatMessage::ToolResult {
+                    name,
+                    content,
+                    tool_call_id,
+                } => {
                     let mut msg = serde_json::json!({
                         "role": "tool",
                         "content": content,
@@ -1432,15 +1497,33 @@ impl App {
         let temperature = self.temperature;
         let top_p = self.top_p;
         let top_k = self.top_k;
-        let proxy = if cloud_model.is_some() { self.proxy.clone() } else { None };
+        let proxy = if cloud_model.is_some() {
+            self.proxy.clone()
+        } else {
+            None
+        };
         let max_retries = self.max_retries;
         let agentic = self.agentic_mode;
 
-        self.log_event("PROMPT", &serde_json::to_string_pretty(&api_messages).unwrap_or_default());
+        self.log_event(
+            "PROMPT",
+            &serde_json::to_string_pretty(&api_messages).unwrap_or_default(),
+        );
 
         let rx = stream_chat_request(
-            api_messages, agentic, model, url, cloud_model, is_logging,
-            log_file, session_id, temperature, top_p, top_k, proxy, max_retries,
+            api_messages,
+            agentic,
+            model,
+            url,
+            cloud_model,
+            is_logging,
+            log_file,
+            session_id,
+            temperature,
+            top_p,
+            top_k,
+            proxy,
+            max_retries,
         );
         self.response_rx = Some(rx);
     }
@@ -1526,7 +1609,11 @@ impl App {
                         "content": format!("Here is the content of `{}`:\n\n{}", name, content)
                     }));
                 }
-                ChatMessage::ToolCall { name, arguments, tool_call_id } => {
+                ChatMessage::ToolCall {
+                    name,
+                    arguments,
+                    tool_call_id,
+                } => {
                     let args_value: serde_json::Value = if is_cloud {
                         serde_json::json!(arguments)
                     } else {
@@ -1550,7 +1637,11 @@ impl App {
                         "tool_calls": [tc],
                     }));
                 }
-                ChatMessage::ToolResult { name, content, tool_call_id } => {
+                ChatMessage::ToolResult {
+                    name,
+                    content,
+                    tool_call_id,
+                } => {
                     let mut msg = serde_json::json!({
                         "role": "tool",
                         "content": content,
@@ -1576,14 +1667,32 @@ impl App {
         let temperature = self.temperature;
         let top_p = self.top_p;
         let top_k = self.top_k;
-        let proxy = if cloud_model.is_some() { self.proxy.clone() } else { None };
+        let proxy = if cloud_model.is_some() {
+            self.proxy.clone()
+        } else {
+            None
+        };
         let max_retries = self.max_retries;
 
-        self.log_event("PROMPT", &serde_json::to_string_pretty(&api_messages).unwrap_or_default());
+        self.log_event(
+            "PROMPT",
+            &serde_json::to_string_pretty(&api_messages).unwrap_or_default(),
+        );
 
         let rx = stream_chat_request(
-            api_messages, agentic, model, url, cloud_model, is_logging,
-            log_file, session_id, temperature, top_p, top_k, proxy, max_retries,
+            api_messages,
+            agentic,
+            model,
+            url,
+            cloud_model,
+            is_logging,
+            log_file,
+            session_id,
+            temperature,
+            top_p,
+            top_k,
+            proxy,
+            max_retries,
         );
         self.response_rx = Some(rx);
     }
@@ -1594,39 +1703,86 @@ impl App {
         for msg in &self.messages {
             match msg {
                 ChatMessage::User(t) => {
-                    if is_md { content.push_str(&format!("**User:** {}\n\n", t)); }
-                    else { content.push_str(&format!("User: {}\n\n", t)); }
+                    if is_md {
+                        content.push_str(&format!("**User:** {}\n\n", t));
+                    } else {
+                        content.push_str(&format!("User: {}\n\n", t));
+                    }
                 }
                 ChatMessage::Assistant(t) => {
-                    if is_md { content.push_str(&format!("**Assistant:** {}\n\n", t)); }
-                    else { content.push_str(&format!("Assistant: {}\n\n", t)); }
+                    if is_md {
+                        content.push_str(&format!("**Assistant:** {}\n\n", t));
+                    } else {
+                        content.push_str(&format!("Assistant: {}\n\n", t));
+                    }
                 }
                 ChatMessage::System(t) => {
-                    if is_md { content.push_str(&format!("_{}_\n\n", t)); }
-                    else { content.push_str(&format!("System: {}\n\n", t)); }
+                    if is_md {
+                        content.push_str(&format!("_{}_\n\n", t));
+                    } else {
+                        content.push_str(&format!("System: {}\n\n", t));
+                    }
                 }
-                ChatMessage::App(t) => { content.push_str(&format!("{}\n\n", t)); }
+                ChatMessage::App(t) => {
+                    content.push_str(&format!("{}\n\n", t));
+                }
                 ChatMessage::Thinking(t) => {
-                    if is_md { content.push_str(&format!("_Thinking:_ {}\n\n", t)); }
-                    else { content.push_str(&format!("Thinking: {}\n\n", t)); }
+                    if is_md {
+                        content.push_str(&format!("_Thinking:_ {}\n\n", t));
+                    } else {
+                        content.push_str(&format!("Thinking: {}\n\n", t));
+                    }
                 }
-                ChatMessage::FileContent { name, content: file_content } => {
-                    if is_md { content.push_str(&format!("**File:** `{}`\n\n{}\n\n", name, file_content)); }
-                    else { content.push_str(&format!("File: {}\n{}\n\n", name, file_content)); }
+                ChatMessage::FileContent {
+                    name,
+                    content: file_content,
+                } => {
+                    if is_md {
+                        content.push_str(&format!("**File:** `{}`\n\n{}\n\n", name, file_content));
+                    } else {
+                        content.push_str(&format!("File: {}\n{}\n\n", name, file_content));
+                    }
                 }
-                ChatMessage::ToolCall { name, arguments, .. } => {
-                    if is_md { content.push_str(&format!("**Tool Call:** `{}`\n```\n{}\n```\n\n", name, arguments)); }
-                    else { content.push_str(&format!("Tool Call: {}\n{}\n\n", name, arguments)); }
+                ChatMessage::ToolCall {
+                    name, arguments, ..
+                } => {
+                    if is_md {
+                        content.push_str(&format!(
+                            "**Tool Call:** `{}`\n```\n{}\n```\n\n",
+                            name, arguments
+                        ));
+                    } else {
+                        content.push_str(&format!("Tool Call: {}\n{}\n\n", name, arguments));
+                    }
                 }
-                ChatMessage::ToolResult { name, content: result, .. } => {
-                    if is_md { content.push_str(&format!("**Tool Result:** `{}`\n```\n{}\n```\n\n", name, result)); }
-                    else { content.push_str(&format!("Tool Result: {}\n{}\n\n", name, result)); }
+                ChatMessage::ToolResult {
+                    name,
+                    content: result,
+                    ..
+                } => {
+                    if is_md {
+                        content.push_str(&format!(
+                            "**Tool Result:** `{}`\n```\n{}\n```\n\n",
+                            name, result
+                        ));
+                    } else {
+                        content.push_str(&format!("Tool Result: {}\n{}\n\n", name, result));
+                    }
                 }
             }
         }
         if !self.streaming_text.is_empty() {
-            if is_md { content.push_str(&format!("**Assistant:** {} _(streaming in progress)_\n\n", self.streaming_text)); }
-            else { content.push_str(&format!("Assistant: {} (streaming in progress)\n\n", self.streaming_text)); }
+            if is_md {
+                content.push_str(&format!(
+                    "**Assistant:** {} _(streaming in progress)_\n\n",
+                    self.streaming_text
+                ));
+            } else {
+                content.push_str(&format!(
+                    "Assistant: {} (streaming in progress)\n\n",
+                    self.streaming_text
+                ));
+            }
         }
         match std::fs::write(&self.save_path, &content) {
             Ok(()) => self.status_message = format!("Exported to {}", self.save_path),
@@ -1720,7 +1876,8 @@ impl App {
     pub fn load_session(&mut self, sess_id: &str) -> Result<(), String> {
         let sessions_dir = dirs_home().join(".config/rustama");
         let path = sessions_dir.join(format!("{}.session.rustama", sess_id));
-        let json = std::fs::read_to_string(&path).map_err(|e| format!("Session not found: {}", e))?;
+        let json =
+            std::fs::read_to_string(&path).map_err(|e| format!("Session not found: {}", e))?;
         let data: serde_json::Value = serde_json::from_str(&json).map_err(|e| e.to_string())?;
         let mut msgs: Vec<ChatMessage> = serde_json::from_value(data["messages"].clone())
             .map_err(|e| format!("Invalid session data: {}", e))?;
@@ -1805,9 +1962,7 @@ impl App {
             KeyCode::End => self.load_dialog_cursor = self.load_dialog_path.chars().count(),
             KeyCode::Char(c) => {
                 let mut chars: Vec<char> = self.load_dialog_path.chars().collect();
-                let idx = self
-                    .load_dialog_cursor
-                    .min(chars.len());
+                let idx = self.load_dialog_cursor.min(chars.len());
                 chars.insert(idx, c);
                 self.load_dialog_path = chars.into_iter().collect();
                 self.load_dialog_cursor += 1;
@@ -1815,7 +1970,10 @@ impl App {
             KeyCode::Backspace => {
                 if self.load_dialog_cursor > 0 {
                     let mut chars: Vec<char> = self.load_dialog_path.chars().collect();
-                    let idx = self.load_dialog_cursor.saturating_sub(1).min(chars.len().saturating_sub(1));
+                    let idx = self
+                        .load_dialog_cursor
+                        .saturating_sub(1)
+                        .min(chars.len().saturating_sub(1));
                     if idx < chars.len() {
                         chars.remove(idx);
                         self.load_dialog_path = chars.into_iter().collect();
@@ -1858,14 +2016,7 @@ impl App {
 
         let btn_y = dialog_h - 2;
         let load_btn = Button::new("Load", 10, btn_y, true, Color::Green, Color::Green);
-        let cancel_btn = Button::new(
-            "Cancel",
-            22,
-            btn_y,
-            true,
-            Color::Red,
-            Color::Red,
-        );
+        let cancel_btn = Button::new("Cancel", 22, btn_y, true, Color::Red, Color::Red);
 
         if load_btn.is_clicked(rel_x, rel_y) {
             self.execute_load_session();
@@ -1992,25 +2143,48 @@ impl App {
     }
 
     fn handle_save_dialog_click(&mut self, col: u16, row: u16, width: u16, height: u16) {
-        let area = Rect { x: 0, y: 0, width, height };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        };
 
         let dlg = match self.save_dialog_mode {
             SaveDialogMode::SaveSession => {
                 let mut d = FileActionDialog::new("Save Session");
-                d.add_text_input("Session file:", &self.save_dialog_path, self.save_dialog_cursor, self.save_dialog_focus == SaveDialogFocus::Path);
+                d.add_text_input(
+                    "Session file:",
+                    &self.save_dialog_path,
+                    self.save_dialog_cursor,
+                    self.save_dialog_focus == SaveDialogFocus::Path,
+                );
                 d.add_button("Cancel", self.save_dialog_focus == SaveDialogFocus::Cancel);
                 d.add_button("Save", self.save_dialog_focus == SaveDialogFocus::Save);
                 d
             }
             SaveDialogMode::ExportChat => {
                 let mut d = FileActionDialog::new("Export As");
-                d.add_text_input("File path:", &self.save_dialog_path, self.save_dialog_cursor, self.save_dialog_focus == SaveDialogFocus::Path);
+                d.add_text_input(
+                    "File path:",
+                    &self.save_dialog_path,
+                    self.save_dialog_cursor,
+                    self.save_dialog_focus == SaveDialogFocus::Path,
+                );
                 let fmt_state = DialogDropdownState {
                     focused: self.save_dialog_focus == SaveDialogFocus::Format,
                     expanded: self.show_format_dropdown,
-                    selected: if self.export_format == ExportFormat::Markdown { 0 } else { 1 },
+                    selected: if self.export_format == ExportFormat::Markdown {
+                        0
+                    } else {
+                        1
+                    },
                 };
-                d.add_dropdown("Format", vec!["Markdown".to_string(), "Plain Text".to_string()], fmt_state);
+                d.add_dropdown(
+                    "Format",
+                    vec!["Markdown".to_string(), "Plain Text".to_string()],
+                    fmt_state,
+                );
                 d.add_button("Cancel", self.save_dialog_focus == SaveDialogFocus::Cancel);
                 d.add_button("Export", self.save_dialog_focus == SaveDialogFocus::Save);
                 d
@@ -2157,13 +2331,14 @@ impl App {
         if self.selecting {
             self.selecting = false;
             if let Some(text) = self.selected_text()
-                && !text.trim().is_empty() {
-                    self.primary_selection.set_text(text.clone());
-                    let s = self.selection_start.unwrap_or(0);
-                    let e = self.selection_end.unwrap_or(0);
-                    let count = if s <= e { e - s + 1 } else { s - e + 1 };
-                    self.status_message = format!("Selected {} line(s) copied to X selection", count);
-                }
+                && !text.trim().is_empty()
+            {
+                self.primary_selection.set_text(text.clone());
+                let s = self.selection_start.unwrap_or(0);
+                let e = self.selection_end.unwrap_or(0);
+                let count = if s <= e { e - s + 1 } else { s - e + 1 };
+                self.status_message = format!("Selected {} line(s) copied to X selection", count);
+            }
         }
         self.scrollbar_drag_end();
     }
@@ -2171,7 +2346,11 @@ impl App {
     fn selected_text(&self) -> Option<String> {
         let start = self.selection_start?;
         let end = self.selection_end?;
-        let (start, end) = if start <= end { (start, end) } else { (end, start) };
+        let (start, end) = if start <= end {
+            (start, end)
+        } else {
+            (end, start)
+        };
         if start >= self.cached_wrapped.len() {
             return None;
         }
@@ -2270,7 +2449,10 @@ impl App {
                 Ok(Ok(models)) => {
                     self.available_models = models;
                     // Pre-select the current model if it's in the list
-                    if let Some(idx) = self.available_models.iter().position(|m| m == &self.model_name)
+                    if let Some(idx) = self
+                        .available_models
+                        .iter()
+                        .position(|m| m == &self.model_name)
                     {
                         self.model_dialog_selection = idx;
                     }
@@ -2315,8 +2497,7 @@ impl App {
                 if self.model_dialog_focus == ModelDialogFocus::List
                     && !self.available_models.is_empty()
                 {
-                    self.model_dialog_selection =
-                        self.model_dialog_selection.saturating_sub(1);
+                    self.model_dialog_selection = self.model_dialog_selection.saturating_sub(1);
                 }
             }
             KeyCode::Down => {
@@ -2419,7 +2600,13 @@ impl App {
     fn handle_settings_dialog_key(&mut self, key: KeyEvent) {
         let is_text_field = matches!(
             self.settings_focus,
-                    SettingsFocus::Proxy | SettingsFocus::OllamaUrl | SettingsFocus::Temperature | SettingsFocus::TopP | SettingsFocus::TopK | SettingsFocus::MaxToolRounds | SettingsFocus::MaxRetries
+            SettingsFocus::Proxy
+                | SettingsFocus::OllamaUrl
+                | SettingsFocus::Temperature
+                | SettingsFocus::TopP
+                | SettingsFocus::TopK
+                | SettingsFocus::MaxToolRounds
+                | SettingsFocus::MaxRetries
         );
         let is_toggle = self.settings_focus == SettingsFocus::Justify;
 
@@ -2607,25 +2794,30 @@ impl App {
         };
         self.ollama_url = self.settings_ollama_url.trim().to_string();
         if let Ok(v) = self.settings_temperature.trim().parse::<f64>()
-            && (0.0..=2.0).contains(&v) {
-                self.temperature = v;
-            }
+            && (0.0..=2.0).contains(&v)
+        {
+            self.temperature = v;
+        }
         if let Ok(v) = self.settings_top_p.trim().parse::<f64>()
-            && (0.0..=1.0).contains(&v) {
-                self.top_p = v;
-            }
+            && (0.0..=1.0).contains(&v)
+        {
+            self.top_p = v;
+        }
         if let Ok(v) = self.settings_top_k.trim().parse::<u32>()
-            && (1..=100).contains(&v) {
-                self.top_k = v;
-            }
+            && (1..=100).contains(&v)
+        {
+            self.top_k = v;
+        }
         if let Ok(v) = self.settings_max_tool_rounds.trim().parse::<usize>()
-            && (1..=100).contains(&v) {
-                self.max_tool_rounds = v;
-            }
+            && (1..=100).contains(&v)
+        {
+            self.max_tool_rounds = v;
+        }
         if let Ok(v) = self.settings_max_retries.trim().parse::<u32>()
-            && (1..=50).contains(&v) {
-                self.max_retries = v;
-            }
+            && (1..=50).contains(&v)
+        {
+            self.max_retries = v;
+        }
         self.justify = self.settings_justify;
         let _ = self.save_proxy_to_config();
         self.show_settings_dialog = false;
@@ -2789,7 +2981,10 @@ impl App {
                     continue;
                 }
                 let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
-                if self.file_dialog_mode == FileDialogMode::LoadSession && !is_dir && !name.ends_with(".session.rustama") {
+                if self.file_dialog_mode == FileDialogMode::LoadSession
+                    && !is_dir
+                    && !name.ends_with(".session.rustama")
+                {
                     continue;
                 }
                 if is_dir {
@@ -2823,7 +3018,11 @@ impl App {
     }
 
     fn open_selected_file(&mut self) {
-        if let Some((name, is_dir)) = self.file_dialog_entries.get(self.file_dialog_selection).cloned() {
+        if let Some((name, is_dir)) = self
+            .file_dialog_entries
+            .get(self.file_dialog_selection)
+            .cloned()
+        {
             if is_dir {
                 self.navigate_into(&name);
                 return;
@@ -2847,13 +3046,14 @@ impl App {
                         return;
                     }
                 };
-                let mut msgs: Vec<ChatMessage> = match serde_json::from_value(data["messages"].clone()) {
-                    Ok(m) => m,
-                    Err(e) => {
-                        self.status_message = format!("Invalid session data: {}", e);
-                        return;
-                    }
-                };
+                let mut msgs: Vec<ChatMessage> =
+                    match serde_json::from_value(data["messages"].clone()) {
+                        Ok(m) => m,
+                        Err(e) => {
+                            self.status_message = format!("Invalid session data: {}", e);
+                            return;
+                        }
+                    };
                 patch_tool_call_ids(&mut msgs);
                 self.messages = msgs;
                 self.streaming_text.clear();
@@ -2916,8 +3116,7 @@ impl App {
                 if self.file_dialog_focus == FileDialogFocus::List
                     && !self.file_dialog_entries.is_empty()
                 {
-                    self.file_dialog_selection =
-                        self.file_dialog_selection.saturating_sub(1);
+                    self.file_dialog_selection = self.file_dialog_selection.saturating_sub(1);
                     self.adjust_scroll();
                 }
             }
@@ -2933,12 +3132,14 @@ impl App {
             KeyCode::Enter => match self.file_dialog_focus {
                 FileDialogFocus::List => {
                     if !self.file_dialog_entries.is_empty() {
-                        let is_dir = self.file_dialog_entries
+                        let is_dir = self
+                            .file_dialog_entries
                             .get(self.file_dialog_selection)
                             .map(|(_, d)| *d)
                             .unwrap_or(false);
                         if is_dir {
-                            let name = self.file_dialog_entries
+                            let name = self
+                                .file_dialog_entries
                                 .get(self.file_dialog_selection)
                                 .map(|(n, _)| n.clone())
                                 .unwrap_or_default();
@@ -2970,7 +3171,11 @@ impl App {
     /// always describe the same layout.
     pub fn build_file_action_dialog(&self, area: Rect) -> FileActionDialog {
         let is_load_session = self.file_dialog_mode == FileDialogMode::LoadSession;
-        let title = if is_load_session { "Load Session" } else { "Load File" };
+        let title = if is_load_session {
+            "Load Session"
+        } else {
+            "Load File"
+        };
         let mut d = FileActionDialog::new(title);
 
         // Show the current directory, truncated from the left if too long.
@@ -3049,7 +3254,10 @@ impl App {
                     Ok(_) => "Value must be between 1 and 100".to_string(),
                     Err(_) => "Usage: /maxrounds <number>".to_string(),
                 },
-                None => format!("Current max tool rounds: {} (usage: /maxrounds <number>)", self.max_tool_rounds),
+                None => format!(
+                    "Current max tool rounds: {} (usage: /maxrounds <number>)",
+                    self.max_tool_rounds
+                ),
             }),
             "temp" => Some(match arg {
                 Some(n) => match n.parse::<f64>() {
@@ -3060,7 +3268,10 @@ impl App {
                     Ok(_) => "Value must be between 0.0 and 2.0".to_string(),
                     Err(_) => "Usage: /temp <number>".to_string(),
                 },
-                None => format!("Current temperature: {} (usage: /temp <number>)", self.temperature),
+                None => format!(
+                    "Current temperature: {} (usage: /temp <number>)",
+                    self.temperature
+                ),
             }),
             "topp" => Some(match arg {
                 Some(n) => match n.parse::<f64>() {
@@ -3096,7 +3307,9 @@ impl App {
                     format!("Proxy set to {}", url)
                 }
                 None => match &self.proxy {
-                    Some(url) => format!("Current proxy: {} (usage: /proxy <url> or /proxy off)", url),
+                    Some(url) => {
+                        format!("Current proxy: {} (usage: /proxy <url> or /proxy off)", url)
+                    }
                     None => "No proxy set (usage: /proxy <url> or /proxy off)".to_string(),
                 },
             }),
@@ -3112,30 +3325,42 @@ impl App {
                     let new_name = rename_arg[7..].trim();
                     if new_name.is_empty() {
                         "Usage: /session rename <name>".to_string()
-                    } else if new_name.contains('/') || new_name.contains('\\') || new_name.contains("..") {
+                    } else if new_name.contains('/')
+                        || new_name.contains('\\')
+                        || new_name.contains("..")
+                    {
                         "Invalid session name: no path separators or '..' allowed".to_string()
                     } else {
                         self.session_name = new_name.to_string();
                         format!("Session renamed to {}", new_name)
                     }
                 }
-                Some(load_arg) => {
-                    match self.load_session(load_arg) {
-                        Ok(()) => format!("Loaded session {}", load_arg),
-                        Err(e) => format!("Load failed: {}", e),
-                    }
-                }
-                _ => "Usage: /session save | /session rename <name> | /session load <name>".to_string(),
+                Some(load_arg) => match self.load_session(load_arg) {
+                    Ok(()) => format!("Loaded session {}", load_arg),
+                    Err(e) => format!("Load failed: {}", e),
+                },
+                _ => "Usage: /session save | /session rename <name> | /session load <name>"
+                    .to_string(),
             }),
             "justify" => {
                 self.justify = !self.justify;
-                Some(if self.justify { "Justify: ON" } else { "Justify: OFF" }.to_string())
+                Some(
+                    if self.justify {
+                        "Justify: ON"
+                    } else {
+                        "Justify: OFF"
+                    }
+                    .to_string(),
+                )
             }
             "quit" | "q" | "exit" => {
                 self.open_quit_confirm();
                 Some(String::new())
             }
-            _ => Some(format!("Unknown command: /{}. Type /help for available commands.", cmd)),
+            _ => Some(format!(
+                "Unknown command: /{}. Type /help for available commands.",
+                cmd
+            )),
         }
     }
 
@@ -3182,7 +3407,8 @@ impl App {
                     self.model_name = name.to_string();
                     format!("Model set to: {} (cloud)", name)
                 } else {
-                    let mut all: Vec<&str> = self.available_models.iter().map(|s| s.as_str()).collect();
+                    let mut all: Vec<&str> =
+                        self.available_models.iter().map(|s| s.as_str()).collect();
                     for m in &self.cloud_models {
                         all.push(&m.name);
                     }
@@ -3208,9 +3434,16 @@ impl App {
                         .available_models
                         .iter()
                         .position(|m| m == &self.model_name)
-                        .or_else(|| self.cloud_models.iter().position(|m| m.name == self.model_name))
+                        .or_else(|| {
+                            self.cloud_models
+                                .iter()
+                                .position(|m| m.name == self.model_name)
+                        })
                         .unwrap_or(0);
-                    format!("Current model: {}. Select a new one in the dialog.", self.model_name)
+                    format!(
+                        "Current model: {}. Select a new one in the dialog.",
+                        self.model_name
+                    )
                 }
             }
         }
@@ -3313,7 +3546,11 @@ impl App {
             if self.agentic_mode { "ON" } else { "OFF" },
             model_count,
             tool_calls,
-            if self.system_prompt.is_empty() { "(none)".to_string() } else { format!("{} chars", self.system_prompt.len()) },
+            if self.system_prompt.is_empty() {
+                "(none)".to_string()
+            } else {
+                format!("{} chars", self.system_prompt.len())
+            },
             self.temperature,
             self.top_p,
             self.top_k,
@@ -3349,7 +3586,13 @@ impl App {
     }
 
     fn log_event(&self, kind: &str, content: &str) {
-        log_to_file(self.is_logging, &self.log_file, &self.session_id, kind, content);
+        log_to_file(
+            self.is_logging,
+            &self.log_file,
+            &self.session_id,
+            kind,
+            content,
+        );
     }
 
     pub fn format_token_stats(&self) -> String {
@@ -3358,7 +3601,9 @@ impl App {
 
         // Output tokens with max and percentage for cloud models
         let model = &self.model_name;
-        let max_output = self.cloud_models.iter()
+        let max_output = self
+            .cloud_models
+            .iter()
             .find(|m| m.name == *model)
             .map(|m| m.max_output_tokens);
 
@@ -3408,18 +3653,20 @@ fn rotate_log_file(log_file: &str) {
     }
 }
 
-pub(crate) fn log_to_file(is_logging: bool, log_file: &str, session_id: &str, kind: &str, content: &str) {
+pub(crate) fn log_to_file(
+    is_logging: bool,
+    log_file: &str,
+    session_id: &str,
+    kind: &str,
+    content: &str,
+) {
     if !is_logging {
         return;
     }
     use std::fs::OpenOptions;
     use std::io::Write;
     let ts = chrono_now();
-    let mut file = match OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log_file)
-    {
+    let mut file = match OpenOptions::new().create(true).append(true).open(log_file) {
         Ok(f) => f,
         Err(_) => return,
     };
@@ -3455,11 +3702,15 @@ fn usage_from_json(json: &serde_json::Value) -> Option<&serde_json::Value> {
     if !json["usage"].is_null() {
         return Some(&json["usage"]);
     }
-    json["choices"]
-        .as_array()
-        .and_then(|choices| choices.iter().find_map(|c| {
-            if c["usage"].is_null() { None } else { Some(&c["usage"]) }
-        }))
+    json["choices"].as_array().and_then(|choices| {
+        choices.iter().find_map(|c| {
+            if c["usage"].is_null() {
+                None
+            } else {
+                Some(&c["usage"])
+            }
+        })
+    })
 }
 
 fn parse_usage_stats(json: &serde_json::Value) -> TokenStats {
@@ -3470,8 +3721,12 @@ fn parse_usage_stats(json: &serde_json::Value) -> TokenStats {
     TokenStats {
         prompt_tokens: usage["prompt_tokens"].as_u64().unwrap_or(0),
         response_tokens: usage["completion_tokens"].as_u64().unwrap_or(0),
-        cached_tokens: usage["prompt_tokens_details"]["cached_tokens"].as_u64().unwrap_or(0),
-        reasoning_tokens: usage["completion_tokens_details"]["reasoning_tokens"].as_u64().unwrap_or(0),
+        cached_tokens: usage["prompt_tokens_details"]["cached_tokens"]
+            .as_u64()
+            .unwrap_or(0),
+        reasoning_tokens: usage["completion_tokens_details"]["reasoning_tokens"]
+            .as_u64()
+            .unwrap_or(0),
         total_duration_ms: 0,
         tokens_per_sec: 0.0,
     }
@@ -3556,30 +3811,38 @@ fn truncate(s: &str, max: usize) -> String {
 
 fn patch_tool_call_ids(msgs: &mut Vec<ChatMessage>) {
     for i in 0..msgs.len() {
-        if let ChatMessage::ToolCall { name, tool_call_id, .. } = &msgs[i]
-            && tool_call_id.is_none() {
-                let id = format!("call_{}", name);
-                msgs[i] = match msgs[i].clone() {
-                    ChatMessage::ToolCall { name, arguments, .. } => ChatMessage::ToolCall {
-                        name,
-                        arguments,
-                        tool_call_id: Some(id),
-                    },
-                    other => other,
-                };
-            }
-        if let ChatMessage::ToolResult { name, tool_call_id, .. } = &msgs[i]
-            && tool_call_id.is_none() {
-                let id = format!("call_{}", name);
-                msgs[i] = match msgs[i].clone() {
-                    ChatMessage::ToolResult { name, content, .. } => ChatMessage::ToolResult {
-                        name,
-                        content,
-                        tool_call_id: Some(id),
-                    },
-                    other => other,
-                };
-            }
+        if let ChatMessage::ToolCall {
+            name, tool_call_id, ..
+        } = &msgs[i]
+            && tool_call_id.is_none()
+        {
+            let id = format!("call_{}", name);
+            msgs[i] = match msgs[i].clone() {
+                ChatMessage::ToolCall {
+                    name, arguments, ..
+                } => ChatMessage::ToolCall {
+                    name,
+                    arguments,
+                    tool_call_id: Some(id),
+                },
+                other => other,
+            };
+        }
+        if let ChatMessage::ToolResult {
+            name, tool_call_id, ..
+        } = &msgs[i]
+            && tool_call_id.is_none()
+        {
+            let id = format!("call_{}", name);
+            msgs[i] = match msgs[i].clone() {
+                ChatMessage::ToolResult { name, content, .. } => ChatMessage::ToolResult {
+                    name,
+                    content,
+                    tool_call_id: Some(id),
+                },
+                other => other,
+            };
+        }
     }
 }
 
@@ -3854,19 +4117,23 @@ fn build_reqwest_client(proxy: &Option<String>) -> reqwest::Client {
     let mut builder = reqwest::Client::builder();
     builder = builder.connect_timeout(std::time::Duration::from_secs(30));
     if let Some(proxy_url) = proxy
-        && let Ok(proxy) = reqwest::Proxy::all(proxy_url) {
-            builder = builder.proxy(proxy);
-        }
+        && let Ok(proxy) = reqwest::Proxy::all(proxy_url)
+    {
+        builder = builder.proxy(proxy);
+    }
     builder.build().unwrap_or_else(|_| reqwest::Client::new())
 }
 
 fn build_blocking_client(proxy: &Option<String>) -> reqwest::blocking::Client {
     let mut builder = reqwest::blocking::Client::builder();
     if let Some(proxy_url) = proxy
-        && let Ok(proxy) = reqwest::Proxy::all(proxy_url) {
-            builder = builder.proxy(proxy);
-        }
-    builder.build().unwrap_or_else(|_| reqwest::blocking::Client::new())
+        && let Ok(proxy) = reqwest::Proxy::all(proxy_url)
+    {
+        builder = builder.proxy(proxy);
+    }
+    builder
+        .build()
+        .unwrap_or_else(|_| reqwest::blocking::Client::new())
 }
 
 fn retry_countdown(
@@ -3881,9 +4148,28 @@ fn retry_countdown(
     session_id: &str,
 ) {
     let ra_str = retry_after.map_or("none".to_string(), |v| format!("{}s", v));
-    log_to_file(is_logging, log_file, session_id, "RETRY", &format!("{}, retry-after: {}, waiting: {}s (attempt {}/{})", label, ra_str, delay_secs, attempt + 1, max_retries));
+    log_to_file(
+        is_logging,
+        log_file,
+        session_id,
+        "RETRY",
+        &format!(
+            "{}, retry-after: {}, waiting: {}s (attempt {}/{})",
+            label,
+            ra_str,
+            delay_secs,
+            attempt + 1,
+            max_retries
+        ),
+    );
     for sec in 1..=delay_secs {
-        let _ = tx.send(StreamChunk::StatusTick(format!("⏳ {}/{}s (attempt {}/{})", sec, delay_secs, attempt + 1, max_retries)));
+        let _ = tx.send(StreamChunk::StatusTick(format!(
+            "⏳ {}/{}s (attempt {}/{})",
+            sec,
+            delay_secs,
+            attempt + 1,
+            max_retries
+        )));
         std::thread::sleep(std::time::Duration::from_secs(1));
     }
 }
@@ -3902,15 +4188,14 @@ async fn send_with_retry(
 ) -> Result<reqwest::Response, reqwest::Error> {
     let mut last_err = None;
     for attempt in 0..=max_retries {
-        let mut req = client
-            .request(method.clone(), url)
-            .json(body);
+        let mut req = client.request(method.clone(), url).json(body);
         if let Some(ref h) = headers {
             req = req.headers(h.clone());
         }
         match req.send().await {
             Ok(resp) if resp.status().as_u16() == 429 && attempt < max_retries => {
-                let retry_after = resp.headers()
+                let retry_after = resp
+                    .headers()
                     .get("retry-after")
                     .and_then(|v| v.to_str().ok())
                     .and_then(|s| s.parse::<u64>().ok());
@@ -3922,22 +4207,60 @@ async fn send_with_retry(
                 };
                 let delay_secs = retry_after.map_or(delay_secs, |ra| delay_secs.max(ra));
                 let _ = resp.text().await;
-                retry_countdown("Rate limited (429)", delay_secs, retry_after, attempt, max_retries, tx, is_logging, log_file, session_id);
+                retry_countdown(
+                    "Rate limited (429)",
+                    delay_secs,
+                    retry_after,
+                    attempt,
+                    max_retries,
+                    tx,
+                    is_logging,
+                    log_file,
+                    session_id,
+                );
                 continue;
             }
             Ok(resp) if resp.status().is_server_error() && attempt < max_retries => {
                 let status = resp.status();
-                let delay_secs = if attempt == 0 { 10 } else { 2u64.pow(attempt) + 1 };
+                let delay_secs = if attempt == 0 {
+                    10
+                } else {
+                    2u64.pow(attempt) + 1
+                };
                 let _ = resp.text().await;
-                retry_countdown(&format!("Server error ({})", status), delay_secs, None, attempt, max_retries, tx, is_logging, log_file, session_id);
+                retry_countdown(
+                    &format!("Server error ({})", status),
+                    delay_secs,
+                    None,
+                    attempt,
+                    max_retries,
+                    tx,
+                    is_logging,
+                    log_file,
+                    session_id,
+                );
                 continue;
             }
             Ok(resp) => return Ok(resp),
             Err(e) => {
                 last_err = Some(e);
                 if attempt < max_retries {
-                    let delay_secs = if attempt == 0 { 10 } else { 2u64.pow(attempt) + 1 };
-                    retry_countdown("Request error", delay_secs, None, attempt, max_retries, tx, is_logging, log_file, session_id);
+                    let delay_secs = if attempt == 0 {
+                        10
+                    } else {
+                        2u64.pow(attempt) + 1
+                    };
+                    retry_countdown(
+                        "Request error",
+                        delay_secs,
+                        None,
+                        attempt,
+                        max_retries,
+                        tx,
+                        is_logging,
+                        log_file,
+                        session_id,
+                    );
                     continue;
                 }
             }
@@ -4009,12 +4332,20 @@ fn execute_tool_call(name: &str, args_json: &str, proxy: &Option<String>) -> Str
                             Ok(Some(status)) => {
                                 let mut stdout = String::new();
                                 let mut stderr = String::new();
-                                if let Some(ref mut out) = child.stdout { let _ = out.read_to_string(&mut stdout); }
-                                if let Some(ref mut err) = child.stderr { let _ = err.read_to_string(&mut stderr); }
+                                if let Some(ref mut out) = child.stdout {
+                                    let _ = out.read_to_string(&mut stdout);
+                                }
+                                if let Some(ref mut err) = child.stderr {
+                                    let _ = err.read_to_string(&mut stderr);
+                                }
                                 let mut result = String::new();
-                                if !stdout.is_empty() { result.push_str(&stdout); }
+                                if !stdout.is_empty() {
+                                    result.push_str(&stdout);
+                                }
                                 if !stderr.is_empty() {
-                                    if !result.is_empty() { result.push('\n'); }
+                                    if !result.is_empty() {
+                                        result.push('\n');
+                                    }
                                     result.push_str(&stderr);
                                 }
                                 if result.is_empty() {
@@ -4046,11 +4377,7 @@ fn execute_tool_call(name: &str, args_json: &str, proxy: &Option<String>) -> Str
                         .map(|e| {
                             let name = e.file_name().to_string_lossy().to_string();
                             let is_dir = e.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
-                            if is_dir {
-                                format!("{}/", name)
-                            } else {
-                                name
-                            }
+                            if is_dir { format!("{}/", name) } else { name }
                         })
                         .collect();
                     files.sort();
@@ -4109,7 +4436,11 @@ fn execute_tool_call(name: &str, args_json: &str, proxy: &Option<String>) -> Str
                             match resp.text() {
                                 Ok(text) => {
                                     if text.len() > 50000 {
-                                        format!("{}...[truncated, total {} bytes]", &text[..50000], text.len())
+                                        format!(
+                                            "{}...[truncated, total {} bytes]",
+                                            &text[..50000],
+                                            text.len()
+                                        )
                                     } else {
                                         text
                                     }
@@ -4133,43 +4464,62 @@ fn execute_tool_call(name: &str, args_json: &str, proxy: &Option<String>) -> Str
                 );
                 let client = build_blocking_client(proxy);
                 match client.get(&*search_url).send() {
-                    Ok(resp) => {
-                        match resp.text() {
-                            Ok(html) => {
-                                let mut results = Vec::new();
-                                for line in html.lines() {
-                                    if line.contains("result__snippet") || line.contains("result__a") {
-                                        let cleaned = line
-                                            .replace("<a rel=\"nofollow\" class=\"result__a\" href=\"", "")
-                                            .replace("<a class=\"result__snippet\" href=\"", "")
-                                            .replace("</a>", "")
-                                            .replace("<span class=\"result__snippet\">", "")
-                                            .replace("</span>", "")
-                                            .replace("<b>", "")
-                                            .replace("</b>", "")
-                                            .trim()
-                                            .to_string();
-                                        if !cleaned.is_empty() && cleaned.len() > 5 {
-                                            results.push(cleaned);
-                                        }
+                    Ok(resp) => match resp.text() {
+                        Ok(html) => {
+                            let mut results = Vec::new();
+                            for line in html.lines() {
+                                if line.contains("result__snippet") || line.contains("result__a") {
+                                    let cleaned = line
+                                        .replace(
+                                            "<a rel=\"nofollow\" class=\"result__a\" href=\"",
+                                            "",
+                                        )
+                                        .replace("<a class=\"result__snippet\" href=\"", "")
+                                        .replace("</a>", "")
+                                        .replace("<span class=\"result__snippet\">", "")
+                                        .replace("</span>", "")
+                                        .replace("<b>", "")
+                                        .replace("</b>", "")
+                                        .trim()
+                                        .to_string();
+                                    if !cleaned.is_empty() && cleaned.len() > 5 {
+                                        results.push(cleaned);
                                     }
                                 }
-                                if results.is_empty() {
-                                    "No results found".to_string()
-                                } else {
-                                    results.join("\n")
-                                }
                             }
-                            Err(e) => format!("Error reading search results: {}", e),
+                            if results.is_empty() {
+                                "No results found".to_string()
+                            } else {
+                                results.join("\n")
+                            }
                         }
-                    }
+                        Err(e) => format!("Error reading search results: {}", e),
+                    },
                     Err(e) => format!("Error performing search: {}", e),
                 }
             }
         }
         _ => {
-            let tools: Vec<&str> = vec!["read_file", "write_file", "edit_file", "bash", "list_files", "search_files", "search_content", "fetch_url", "web_search", "terminal_open", "terminal_send", "terminal_read", "terminal_close"];
-            format!("Unknown tool: '{}'. Available tools: {}", name, tools.join(", "))
+            let tools: Vec<&str> = vec![
+                "read_file",
+                "write_file",
+                "edit_file",
+                "bash",
+                "list_files",
+                "search_files",
+                "search_content",
+                "fetch_url",
+                "web_search",
+                "terminal_open",
+                "terminal_send",
+                "terminal_read",
+                "terminal_close",
+            ];
+            format!(
+                "Unknown tool: '{}'. Available tools: {}",
+                name,
+                tools.join(", ")
+            )
         }
     }
 }
@@ -4182,31 +4532,49 @@ fn grep_regex(pattern: &str, path: &str, include: &str) -> Result<Vec<String>, S
     if let Ok(entries) = glob::glob(&glob_pattern) {
         for entry in entries.flatten() {
             if entry.is_file()
-                && let Ok(content) = std::fs::read_to_string(&entry) {
-                    for (line_num, line) in content.lines().enumerate() {
-                        if re.is_match(line) {
-                            results.push(format!(
-                                "{}:{}: {}",
-                                entry.display(),
-                                line_num + 1,
-                                line
-                            ));
-                        }
+                && let Ok(content) = std::fs::read_to_string(&entry)
+            {
+                for (line_num, line) in content.lines().enumerate() {
+                    if re.is_match(line) {
+                        results.push(format!("{}:{}: {}", entry.display(), line_num + 1, line));
                     }
                 }
+            }
         }
     }
     Ok(results)
 }
 
-const TOOL_NAMES: &[&str] = &["read_file", "write_file", "edit_file", "bash", "list_files", "search_files", "search_content", "fetch_url", "web_search", "terminal_open", "terminal_send", "terminal_read", "terminal_close"];
+const TOOL_NAMES: &[&str] = &[
+    "read_file",
+    "write_file",
+    "edit_file",
+    "bash",
+    "list_files",
+    "search_files",
+    "search_content",
+    "fetch_url",
+    "web_search",
+    "terminal_open",
+    "terminal_send",
+    "terminal_read",
+    "terminal_close",
+];
 
 fn parse_text_tool_calls(text: &str) -> Vec<serde_json::Value> {
     let mut tool_calls = Vec::new();
 
     let patterns = [
-        (r#"\{"name"\s*:\s*"(\w+)"\s*,\s*"parameters"\s*:\s*(\{[^}]*\})\}"#, "name", "parameters"),
-        (r#"\{"name"\s*:\s*"(\w+)"\s*,\s*"arguments"\s*:\s*(\{[^}]*\})\}"#, "name", "arguments"),
+        (
+            r#"\{"name"\s*:\s*"(\w+)"\s*,\s*"parameters"\s*:\s*(\{[^}]*\})\}"#,
+            "name",
+            "parameters",
+        ),
+        (
+            r#"\{"name"\s*:\s*"(\w+)"\s*,\s*"arguments"\s*:\s*(\{[^}]*\})\}"#,
+            "name",
+            "arguments",
+        ),
     ];
 
     for (regex_pattern, _name_key, _args_key) in &patterns {
@@ -4220,7 +4588,8 @@ fn parse_text_tool_calls(text: &str) -> Vec<serde_json::Value> {
                         let mut tc = serde_json::json!({
                             "name": name,
                         });
-                        tc["parameters"] = serde_json::from_str(&args_str).unwrap_or(serde_json::json!({}));
+                        tc["parameters"] =
+                            serde_json::from_str(&args_str).unwrap_or(serde_json::json!({}));
                         tool_calls.push(tc);
                     }
                 }
@@ -4239,13 +4608,14 @@ fn parse_text_tool_calls(text: &str) -> Vec<serde_json::Value> {
                 let args_str = args_match.as_str().to_string();
 
                 if TOOL_NAMES.contains(&name.as_str())
-                    && let Ok(args_json) = serde_json::from_str::<serde_json::Value>(&args_str) {
-                        let tc = serde_json::json!({
-                            "name": name,
-                            "parameters": args_json,
-                        });
-                        tool_calls.push(tc);
-                    }
+                    && let Ok(args_json) = serde_json::from_str::<serde_json::Value>(&args_str)
+                {
+                    let tc = serde_json::json!({
+                        "name": name,
+                        "parameters": args_json,
+                    });
+                    tool_calls.push(tc);
+                }
             }
         }
     }
@@ -4254,20 +4624,26 @@ fn parse_text_tool_calls(text: &str) -> Vec<serde_json::Value> {
 }
 #[cfg(test)]
 mod tests {
-    use super::{terminal_command, retry_countdown, send_with_retry, StreamChunk};
+    use super::{StreamChunk, retry_countdown, send_with_retry, terminal_command};
 
     #[test]
     fn wraps_simple_command() {
         assert_eq!(terminal_command("python3 -q"), "stdbuf -oL -eL python3 -q");
         assert_eq!(terminal_command("ls -la"), "stdbuf -oL -eL ls -la");
-        assert_eq!(terminal_command("cmake --build ."), "stdbuf -oL -eL cmake --build .");
+        assert_eq!(
+            terminal_command("cmake --build ."),
+            "stdbuf -oL -eL cmake --build ."
+        );
     }
 
     #[test]
     fn leaves_shell_composites_alone() {
         assert_eq!(terminal_command("cd /tmp && make"), "cd /tmp && make");
         assert_eq!(terminal_command("echo hi"), "echo hi");
-        assert_eq!(terminal_command("for i in 1 2; do echo $i; done"), "for i in 1 2; do echo $i; done");
+        assert_eq!(
+            terminal_command("for i in 1 2; do echo $i; done"),
+            "for i in 1 2; do echo $i; done"
+        );
         assert_eq!(terminal_command("ls | grep foo"), "ls | grep foo");
         assert_eq!(terminal_command("cat < file"), "cat < file");
         assert_eq!(terminal_command("FOO=1 bar"), "stdbuf -oL -eL FOO=1 bar");
@@ -4280,8 +4656,19 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         retry_countdown("Test error", 3, Some(5), 0, 3, &tx, false, "", "");
         drop(tx);
-        let msgs: Vec<String> = rx.iter().filter_map(|m| match m { StreamChunk::StatusTick(s) => Some(s), _ => None }).collect();
-        assert_eq!(msgs.len(), 3, "should have 3 ticks for 3s delay: {:?}", msgs);
+        let msgs: Vec<String> = rx
+            .iter()
+            .filter_map(|m| match m {
+                StreamChunk::StatusTick(s) => Some(s),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            msgs.len(),
+            3,
+            "should have 3 ticks for 3s delay: {:?}",
+            msgs
+        );
         assert!(msgs[0].contains("1/3s (attempt 1/3)"), "got: {}", msgs[0]);
         assert!(msgs[1].contains("2/3s (attempt 1/3)"), "got: {}", msgs[1]);
         assert!(msgs[2].contains("3/3s (attempt 1/3)"), "got: {}", msgs[2]);
@@ -4293,8 +4680,18 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         retry_countdown("Rate limited (429)", 2, None, 1, 3, &tx, false, "", "");
         drop(tx);
-        let msgs: Vec<String> = rx.iter().filter_map(|m| match m { StreamChunk::StatusTick(s) => Some(s), _ => None }).collect();
-        assert!(msgs.iter().any(|m| m.contains("attempt 2/3")), "should show correct attempt: {:?}", msgs);
+        let msgs: Vec<String> = rx
+            .iter()
+            .filter_map(|m| match m {
+                StreamChunk::StatusTick(s) => Some(s),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            msgs.iter().any(|m| m.contains("attempt 2/3")),
+            "should show correct attempt: {:?}",
+            msgs
+        );
     }
 
     #[test]
@@ -4314,7 +4711,8 @@ mod tests {
                     let body = r#"{"error": {"message": "quota exceeded"}}"#;
                     let resp = format!(
                         "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nRetry-After: 1\r\nContent-Length: {}\r\n\r\n{}",
-                        body.len(), body
+                        body.len(),
+                        body
                     );
                     stream.write_all(resp.as_bytes()).unwrap();
                 } else {
@@ -4333,12 +4731,38 @@ mod tests {
             let (tx, rx) = std::sync::mpsc::channel();
             let body = serde_json::json!({"model": "test"});
             let url = format!("http://{}/api/chat", addr);
-            let result = send_with_retry(&client, reqwest::Method::POST, &url, None, &body, 2, &tx, false, "", "test").await;
+            let result = send_with_retry(
+                &client,
+                reqwest::Method::POST,
+                &url,
+                None,
+                &body,
+                2,
+                &tx,
+                false,
+                "",
+                "test",
+            )
+            .await;
             drop(tx);
-            let msgs: Vec<String> = rx.iter().filter_map(|m| match m { StreamChunk::Status(s) | StreamChunk::StatusTick(s) => Some(s), _ => None }).collect();
+            let msgs: Vec<String> = rx
+                .iter()
+                .filter_map(|m| match m {
+                    StreamChunk::Status(s) | StreamChunk::StatusTick(s) => Some(s),
+                    _ => None,
+                })
+                .collect();
             assert!(result.is_err(), "should fail after retries + server error");
-            assert!(msgs.iter().any(|m| m.contains("attempt 1/2")), "should show attempt count: {:?}", msgs);
-            assert!(msgs.iter().any(|m| m.contains("attempt 2/2")), "should show second attempt: {:?}", msgs);
+            assert!(
+                msgs.iter().any(|m| m.contains("attempt 1/2")),
+                "should show attempt count: {:?}",
+                msgs
+            );
+            assert!(
+                msgs.iter().any(|m| m.contains("attempt 2/2")),
+                "should show second attempt: {:?}",
+                msgs
+            );
         });
     }
 
@@ -4416,7 +4840,10 @@ mod tests {
         let result = b.read_incremental(Some(100));
         assert_eq!(result["output"].as_str().unwrap(), "");
         assert_eq!(result["cursor"].as_u64().unwrap(), 3);
-        assert!(result["error"].as_str().is_some(), "should have error for out-of-range cursor");
+        assert!(
+            result["error"].as_str().is_some(),
+            "should have error for out-of-range cursor"
+        );
     }
 
     #[test]
@@ -4479,17 +4906,26 @@ mod tests {
         use super::TerminalState;
         let mut ts = TerminalState::new();
         let result = ts.open("echo CAPTURE_MARKER_42");
-        assert!(result.contains("Terminal opened"), "open should succeed: {}", result);
+        assert!(
+            result.contains("Terminal opened"),
+            "open should succeed: {}",
+            result
+        );
 
         // Wait for the command to finish (echo is fast, but give it time)
         std::thread::sleep(std::time::Duration::from_millis(500));
 
         let r = ts.read_buffer_incremental(None);
         let output = r["output"].as_str().unwrap();
-        assert!(output.contains("CAPTURE_MARKER_42"),
-            "terminal_open command output should be in buffer, got: {}", output);
-        assert!(r["cursor"].as_u64().unwrap() > 0,
-            "cursor should have advanced past the output");
+        assert!(
+            output.contains("CAPTURE_MARKER_42"),
+            "terminal_open command output should be in buffer, got: {}",
+            output
+        );
+        assert!(
+            r["cursor"].as_u64().unwrap() > 0,
+            "cursor should have advanced past the output"
+        );
 
         // Read again with cursor — should get empty (nothing new)
         let cursor = r["cursor"].as_u64().unwrap();
@@ -4511,8 +4947,11 @@ mod tests {
         let r1 = ts.read_buffer_incremental(None);
         let cursor_before = r1["cursor"].as_u64().unwrap();
         assert!(cursor_before > 0, "should have output from open command");
-        assert!(r1["output"].as_str().unwrap().contains("BEFORE_SEND"),
-            "open command output: {}", r1["output"].as_str().unwrap());
+        assert!(
+            r1["output"].as_str().unwrap().contains("BEFORE_SEND"),
+            "open command output: {}",
+            r1["output"].as_str().unwrap()
+        );
 
         // Send more input — same process, same buffer, cursor must remain valid
         let send_result = ts.send_input("echo AFTER_SEND");
@@ -4523,19 +4962,34 @@ mod tests {
         // Incremental read from old cursor — must return only new bytes
         let r2 = ts.read_buffer_incremental(Some(cursor_before));
         let new_output = r2["output"].as_str().unwrap();
-        assert!(new_output.contains("AFTER_SEND"),
-            "incremental read after send should contain AFTER_SEND, got: {}", new_output);
+        assert!(
+            new_output.contains("AFTER_SEND"),
+            "incremental read after send should contain AFTER_SEND, got: {}",
+            new_output
+        );
 
         // Cursor must have advanced — never reset to 0
         let cursor_after = r2["cursor"].as_u64().unwrap();
-        assert!(cursor_after > cursor_before,
-            "cursor must advance: {} <= {}", cursor_after, cursor_before);
+        assert!(
+            cursor_after > cursor_before,
+            "cursor must advance: {} <= {}",
+            cursor_after,
+            cursor_before
+        );
 
         // Full snapshot must contain both outputs
         let r3 = ts.read_buffer_incremental(None);
         let full = r3["output"].as_str().unwrap();
-        assert!(full.contains("BEFORE_SEND"), "full snapshot missing open output: {}", full);
-        assert!(full.contains("AFTER_SEND"), "full snapshot missing send output: {}", full);
+        assert!(
+            full.contains("BEFORE_SEND"),
+            "full snapshot missing open output: {}",
+            full
+        );
+        assert!(
+            full.contains("AFTER_SEND"),
+            "full snapshot missing send output: {}",
+            full
+        );
 
         ts.close();
     }
@@ -4568,233 +5022,233 @@ fn stream_chat_request(
 ) -> mpsc::Receiver<StreamChunk> {
     let (tx, rx) = mpsc::channel();
 
-std::thread::spawn(move || {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
 
-    rt.block_on(async {
-        let client = build_reqwest_client(&proxy);
+        rt.block_on(async {
+            let client = build_reqwest_client(&proxy);
 
-        let (api_url, headers, body) = if let Some(ref cloud) = cloud_model {
-            let mut body = serde_json::json!({
-                "model": cloud.api_model,
-                "messages": api_messages,
-                "stream": true,
-                "max_tokens": cloud.max_output_tokens,
-            });
-            body["tools"] = serde_json::json!(get_tool_definitions());
-            body["temperature"] = serde_json::json!(temperature);
-            body["top_p"] = serde_json::json!(top_p);
-            let mut headers = reqwest::header::HeaderMap::new();
-            headers.insert(
-                "Authorization",
-                reqwest::header::HeaderValue::from_str(&format!("Bearer {}", cloud.api_key)).unwrap(),
-            );
-            headers.insert(
-                "Content-Type",
-                reqwest::header::HeaderValue::from_static("application/json"),
-            );
-            (cloud.api_url.clone(), Some(headers), body)
-        } else {
-            let mut body = serde_json::json!({
-                "model": model,
-                "messages": api_messages,
-                "stream": true,
-            });
-            if agentic {
+            let (api_url, headers, body) = if let Some(ref cloud) = cloud_model {
+                let mut body = serde_json::json!({
+                    "model": cloud.api_model,
+                    "messages": api_messages,
+                    "stream": true,
+                    "max_tokens": cloud.max_output_tokens,
+                });
                 body["tools"] = serde_json::json!(get_tool_definitions());
-            }
-            let mut options = serde_json::json!({});
-            options["temperature"] = serde_json::json!(temperature);
-            options["top_p"] = serde_json::json!(top_p);
-            if top_k > 0 {
-                options["top_k"] = serde_json::json!(top_k);
-            }
-            body["options"] = options;
-            (format!("{}/api/chat", url), None, body)
-        };
-
-        log_to_file(is_logging, &log_file, &session_id, "REQUEST", &format!("{} {}", api_url, serde_json::to_string(&body).unwrap_or_default()));
-
-        let result = send_with_retry(&client, reqwest::Method::POST, &api_url, headers, &body, max_retries, &tx, is_logging, &log_file, &session_id).await;
-
-        let is_cloud = cloud_model.is_some();
-        match result {
-            Ok(mut resp) => {
-                if !resp.status().is_success() {
-                    let status = resp.status();
-                    let body = resp.text().await.unwrap_or_default();
-                    let msg = format!("HTTP {}: {}", status, truncate(&body, 200));
-                    log_to_file(is_logging, &log_file, &session_id, "HTTP_ERROR", &msg);
-                    if status.as_u16() == 429 {
-                        let _ = tx.send(StreamChunk::RetryPaused(format!("Max retries ({}) reached. Request paused.", max_retries)));
-                    } else {
-                        let _ = tx.send(StreamChunk::Error(msg));
-                    }
-                    return;
+                body["temperature"] = serde_json::json!(temperature);
+                body["top_p"] = serde_json::json!(top_p);
+                let mut headers = reqwest::header::HeaderMap::new();
+                headers.insert(
+                    "Authorization",
+                    reqwest::header::HeaderValue::from_str(&format!("Bearer {}", cloud.api_key)).unwrap(),
+                );
+                headers.insert(
+                    "Content-Type",
+                    reqwest::header::HeaderValue::from_static("application/json"),
+                );
+                (cloud.api_url.clone(), Some(headers), body)
+            } else {
+                let mut body = serde_json::json!({
+                    "model": model,
+                    "messages": api_messages,
+                    "stream": true,
+                });
+                if agentic {
+                    body["tools"] = serde_json::json!(get_tool_definitions());
                 }
-                let mut buffer = String::new();
-                let mut tool_call_map: std::collections::HashMap<u32, serde_json::Value> = std::collections::HashMap::new();
-                loop {
-                    match resp.chunk().await {
-                        Ok(Some(chunk)) => {
-                            buffer.push_str(&String::from_utf8_lossy(&chunk));
-                            while let Some(pos) = buffer.find('\n') {
-                                let raw = buffer[..pos].trim().to_string();
-                                buffer = buffer[pos + 1..].to_string();
-                                if raw.is_empty() {
-                                    continue;
-                                }
-                                let line = if is_cloud {
-                                    raw.strip_prefix("data: ").unwrap_or(&raw).trim().to_string()
-                                } else {
-                                    raw
-                                };
-                                log_to_file(is_logging, &log_file, &session_id, "RESPONSE", &line);
-                                if line == "[DONE]" {
-                                    log_to_file(is_logging, &log_file, &session_id, "STREAM_END", "DONE sentinel");
-                                    let _ = tx.send(StreamChunk::Done(TokenStats::default()));
-                                    return;
-                                }
-                                if line.is_empty() {
-                                    continue;
-                                }
-                                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&line) {
-                                    if is_cloud {
-                                        // Usage can ride on any chunk (nested under
-                                        // choices[i] or top-level); forward it whenever present.
-                                        if usage_from_json(&json).is_some() {
-                                            let _ = tx.send(StreamChunk::Stats(parse_usage_stats(&json)));
-                                        }
-                                        if let Some(reasoning) = json["choices"][0]["delta"]["reasoning_content"].as_str()
-                                            && !reasoning.is_empty() {
-                                                let _ = tx.send(StreamChunk::Thinking(reasoning.to_string()));
+                let mut options = serde_json::json!({});
+                options["temperature"] = serde_json::json!(temperature);
+                options["top_p"] = serde_json::json!(top_p);
+                if top_k > 0 {
+                    options["top_k"] = serde_json::json!(top_k);
+                }
+                body["options"] = options;
+                (format!("{}/api/chat", url), None, body)
+            };
+
+            log_to_file(is_logging, &log_file, &session_id, "REQUEST", &format!("{} {}", api_url, serde_json::to_string(&body).unwrap_or_default()));
+
+            let result = send_with_retry(&client, reqwest::Method::POST, &api_url, headers, &body, max_retries, &tx, is_logging, &log_file, &session_id).await;
+
+            let is_cloud = cloud_model.is_some();
+            match result {
+                Ok(mut resp) => {
+                    if !resp.status().is_success() {
+                        let status = resp.status();
+                        let body = resp.text().await.unwrap_or_default();
+                        let msg = format!("HTTP {}: {}", status, truncate(&body, 200));
+                        log_to_file(is_logging, &log_file, &session_id, "HTTP_ERROR", &msg);
+                        if status.as_u16() == 429 {
+                            let _ = tx.send(StreamChunk::RetryPaused(format!("Max retries ({}) reached. Request paused.", max_retries)));
+                        } else {
+                            let _ = tx.send(StreamChunk::Error(msg));
+                        }
+                        return;
+                    }
+                    let mut buffer = String::new();
+                    let mut tool_call_map: std::collections::HashMap<u32, serde_json::Value> = std::collections::HashMap::new();
+                    loop {
+                        match resp.chunk().await {
+                            Ok(Some(chunk)) => {
+                                buffer.push_str(&String::from_utf8_lossy(&chunk));
+                                while let Some(pos) = buffer.find('\n') {
+                                    let raw = buffer[..pos].trim().to_string();
+                                    buffer = buffer[pos + 1..].to_string();
+                                    if raw.is_empty() {
+                                        continue;
+                                    }
+                                    let line = if is_cloud {
+                                        raw.strip_prefix("data: ").unwrap_or(&raw).trim().to_string()
+                                    } else {
+                                        raw
+                                    };
+                                    log_to_file(is_logging, &log_file, &session_id, "RESPONSE", &line);
+                                    if line == "[DONE]" {
+                                        log_to_file(is_logging, &log_file, &session_id, "STREAM_END", "DONE sentinel");
+                                        let _ = tx.send(StreamChunk::Done(TokenStats::default()));
+                                        return;
+                                    }
+                                    if line.is_empty() {
+                                        continue;
+                                    }
+                                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&line) {
+                                        if is_cloud {
+                                            // Usage can ride on any chunk (nested under
+                                            // choices[i] or top-level); forward it whenever present.
+                                            if usage_from_json(&json).is_some() {
+                                                let _ = tx.send(StreamChunk::Stats(parse_usage_stats(&json)));
                                             }
-                                        if let Some(delta) = json["choices"][0]["delta"]["content"].as_str()
-                                            && !delta.is_empty() {
-                                                let _ = tx.send(StreamChunk::Text(delta.to_string()));
-                                            }
-                                        if let Some(tc_array) = json["choices"][0]["delta"]["tool_calls"].as_array() {
-                                            for tc in tc_array {
-                                                let idx = tc["index"].as_u64().unwrap_or(0) as u32;
-                                                let entry = tool_call_map.entry(idx).or_insert_with(|| {
-                                                    let mut base = serde_json::json!({
-                                                        "index": idx,
-                                                        "type": "function",
-                                                        "function": {"name": "", "arguments": ""}
+                                            if let Some(reasoning) = json["choices"][0]["delta"]["reasoning_content"].as_str()
+                                                && !reasoning.is_empty() {
+                                                    let _ = tx.send(StreamChunk::Thinking(reasoning.to_string()));
+                                                }
+                                            if let Some(delta) = json["choices"][0]["delta"]["content"].as_str()
+                                                && !delta.is_empty() {
+                                                    let _ = tx.send(StreamChunk::Text(delta.to_string()));
+                                                }
+                                            if let Some(tc_array) = json["choices"][0]["delta"]["tool_calls"].as_array() {
+                                                for tc in tc_array {
+                                                    let idx = tc["index"].as_u64().unwrap_or(0) as u32;
+                                                    let entry = tool_call_map.entry(idx).or_insert_with(|| {
+                                                        let mut base = serde_json::json!({
+                                                            "index": idx,
+                                                            "type": "function",
+                                                            "function": {"name": "", "arguments": ""}
+                                                        });
+                                                        if let Some(id) = tc["id"].as_str() {
+                                                            base["id"] = serde_json::json!(id);
+                                                        }
+                                                        base
                                                     });
                                                     if let Some(id) = tc["id"].as_str() {
-                                                        base["id"] = serde_json::json!(id);
+                                                        entry["id"] = serde_json::json!(id);
                                                     }
-                                                    base
-                                                });
-                                                if let Some(id) = tc["id"].as_str() {
-                                                    entry["id"] = serde_json::json!(id);
+                                                    if let Some(name) = tc["function"]["name"].as_str()
+                                                        && !name.is_empty() {
+                                                            entry["function"]["name"] = serde_json::json!(name);
+                                                        }
+                                                    if let Some(args) = tc["function"]["arguments"].as_str() {
+                                                        let existing = entry["function"]["arguments"].as_str().unwrap_or("").to_string();
+                                                        entry["function"]["arguments"] = serde_json::json!(format!("{}{}", existing, args));
+                                                    }
                                                 }
-                                                if let Some(name) = tc["function"]["name"].as_str()
-                                                    && !name.is_empty() {
+                                            }
+                                            let finish = json["choices"][0]["finish_reason"].as_str();
+                                            if finish == Some("stop") || finish == Some("tool_calls") {
+                                                 let stats = parse_usage_stats(&json);
+                                                log_to_file(is_logging, &log_file, &session_id, "STREAM_END", &format!("{} finish_reason={}", api_url, finish.unwrap_or("?")));
+                                                if !tool_call_map.is_empty() {
+                                                    if stats.prompt_tokens > 0 || stats.response_tokens > 0 {
+                                                        let _ = tx.send(StreamChunk::Stats(stats));
+                                                    }
+                                                    let mut calls: Vec<serde_json::Value> = tool_call_map.into_values().collect();
+                                                    calls.sort_by_key(|tc| tc["index"].as_u64().unwrap_or(0));
+                                                    let _ = tx.send(StreamChunk::ToolCalls(calls));
+                                                } else {
+                                                    let _ = tx.send(StreamChunk::Done(stats));
+                                                }
+                                                return;
+                                            }
+                                            if finish == Some("length") || finish == Some("max_tokens") {
+                                                let stats = parse_usage_stats(&json);
+                                                log_to_file(is_logging, &log_file, &session_id, "STREAM_TRUNCATED", &format!("{} finish_reason={}", api_url, finish.unwrap_or("?")));
+                                                let _ = tx.send(StreamChunk::Truncated(format!(
+                                                    "Response truncated (finish_reason={}). Output limit reached.", finish.unwrap_or("?")
+                                                )));
+                                                let _ = tx.send(StreamChunk::Done(stats));
+                                                return;
+                                            }
+                                        } else {
+                                            if let Some(thinking) = json["message"]["thinking"].as_str()
+                                                && !thinking.is_empty() {
+                                                    let _ = tx.send(StreamChunk::Thinking(thinking.to_string()));
+                                                }
+                                            if let Some(content) = json["message"]["content"].as_str()
+                                                && !content.is_empty() {
+                                                    let _ = tx.send(StreamChunk::Text(content.to_string()));
+                                                }
+                                            if let Some(tool_calls) = json["message"]["tool_calls"].as_array() {
+                                                for tc in tool_calls {
+                                                    let idx = tc["index"].as_u64().unwrap_or(0) as u32;
+                                                    let entry = tool_call_map.entry(idx).or_insert_with(|| {
+                                                        serde_json::json!({
+                                                            "index": idx,
+                                                            "type": "function",
+                                                            "function": {"name": "", "arguments": ""}
+                                                        })
+                                                    });
+                                                    if let Some(name) = tc["function"]["name"].as_str() {
                                                         entry["function"]["name"] = serde_json::json!(name);
                                                     }
-                                                if let Some(args) = tc["function"]["arguments"].as_str() {
-                                                    let existing = entry["function"]["arguments"].as_str().unwrap_or("").to_string();
-                                                    entry["function"]["arguments"] = serde_json::json!(format!("{}{}", existing, args));
+                                                    if let Some(id) = tc["id"].as_str() {
+                                                        entry["id"] = serde_json::json!(id);
+                                                    }
+                                                    if let Some(args) = tc["function"]["arguments"].as_str() {
+                                                        entry["function"]["arguments"] = serde_json::json!(args);
+                                                    } else {
+                                                        entry["function"]["arguments"] = serde_json::json!(tc["function"]["arguments"].to_string());
+                                                    }
                                                 }
                                             }
-                                        }
-                                        let finish = json["choices"][0]["finish_reason"].as_str();
-                                        if finish == Some("stop") || finish == Some("tool_calls") {
-                                             let stats = parse_usage_stats(&json);
-                                            log_to_file(is_logging, &log_file, &session_id, "STREAM_END", &format!("{} finish_reason={}", api_url, finish.unwrap_or("?")));
-                                            if !tool_call_map.is_empty() {
-                                                if stats.prompt_tokens > 0 || stats.response_tokens > 0 {
-                                                    let _ = tx.send(StreamChunk::Stats(stats));
-                                                }
-                                                let mut calls: Vec<serde_json::Value> = tool_call_map.into_values().collect();
-                                                calls.sort_by_key(|tc| tc["index"].as_u64().unwrap_or(0));
-                                                let _ = tx.send(StreamChunk::ToolCalls(calls));
-                                            } else {
-                                                let _ = tx.send(StreamChunk::Done(stats));
-                                            }
-                                            return;
-                                        }
-                                        if finish == Some("length") || finish == Some("max_tokens") {
-                                            let stats = parse_usage_stats(&json);
-                                            log_to_file(is_logging, &log_file, &session_id, "STREAM_TRUNCATED", &format!("{} finish_reason={}", api_url, finish.unwrap_or("?")));
-                                            let _ = tx.send(StreamChunk::Truncated(format!(
-                                                "Response truncated (finish_reason={}). Output limit reached.", finish.unwrap_or("?")
-                                            )));
-                                            let _ = tx.send(StreamChunk::Done(stats));
-                                            return;
-                                        }
-                                    } else {
-                                        if let Some(thinking) = json["message"]["thinking"].as_str()
-                                            && !thinking.is_empty() {
-                                                let _ = tx.send(StreamChunk::Thinking(thinking.to_string()));
-                                            }
-                                        if let Some(content) = json["message"]["content"].as_str()
-                                            && !content.is_empty() {
-                                                let _ = tx.send(StreamChunk::Text(content.to_string()));
-                                            }
-                                        if let Some(tool_calls) = json["message"]["tool_calls"].as_array() {
-                                            for tc in tool_calls {
-                                                let idx = tc["index"].as_u64().unwrap_or(0) as u32;
-                                                let entry = tool_call_map.entry(idx).or_insert_with(|| {
-                                                    serde_json::json!({
-                                                        "index": idx,
-                                                        "type": "function",
-                                                        "function": {"name": "", "arguments": ""}
-                                                    })
-                                                });
-                                                if let Some(name) = tc["function"]["name"].as_str() {
-                                                    entry["function"]["name"] = serde_json::json!(name);
-                                                }
-                                                if let Some(id) = tc["id"].as_str() {
-                                                    entry["id"] = serde_json::json!(id);
-                                                }
-                                                if let Some(args) = tc["function"]["arguments"].as_str() {
-                                                    entry["function"]["arguments"] = serde_json::json!(args);
+                                            if json["done"].as_bool() == Some(true) {
+                                                log_to_file(is_logging, &log_file, &session_id, "STREAM_END", &format!("{} done=true tokens={}", api_url, json["eval_count"].as_u64().unwrap_or(0)));
+                                                if !tool_call_map.is_empty() {
+                                                    let calls: Vec<serde_json::Value> = tool_call_map.into_values().collect();
+                                                    let _ = tx.send(StreamChunk::ToolCalls(calls));
                                                 } else {
-                                                    entry["function"]["arguments"] = serde_json::json!(tc["function"]["arguments"].to_string());
+                                                    let stats = parse_token_stats(&json);
+                                                    let _ = tx.send(StreamChunk::Done(stats));
                                                 }
+                                                return;
                                             }
-                                        }
-                                        if json["done"].as_bool() == Some(true) {
-                                            log_to_file(is_logging, &log_file, &session_id, "STREAM_END", &format!("{} done=true tokens={}", api_url, json["eval_count"].as_u64().unwrap_or(0)));
-                                            if !tool_call_map.is_empty() {
-                                                let calls: Vec<serde_json::Value> = tool_call_map.into_values().collect();
-                                                let _ = tx.send(StreamChunk::ToolCalls(calls));
-                                            } else {
-                                                let stats = parse_token_stats(&json);
-                                                let _ = tx.send(StreamChunk::Done(stats));
-                                            }
-                                            return;
                                         }
                                     }
                                 }
                             }
-                        }
-                        Ok(None) => {
-                            log_to_file(is_logging, &log_file, &session_id, "STREAM_END", "stream closed");
-                            let _ = tx.send(StreamChunk::Done(TokenStats::default()));
-                            return;
-                        }
-                        Err(e) => {
-                            log_to_file(is_logging, &log_file, &session_id, "STREAM_ERROR", &format!("{} | buffer: {:?}", e, buffer));
-                            let _ = tx.send(StreamChunk::Error(format!("Stream error: {} | last bytes: {:?}", e, truncate(&buffer, 200))));
-                            return;
+                            Ok(None) => {
+                                log_to_file(is_logging, &log_file, &session_id, "STREAM_END", "stream closed");
+                                let _ = tx.send(StreamChunk::Done(TokenStats::default()));
+                                return;
+                            }
+                            Err(e) => {
+                                log_to_file(is_logging, &log_file, &session_id, "STREAM_ERROR", &format!("{} | buffer: {:?}", e, buffer));
+                                let _ = tx.send(StreamChunk::Error(format!("Stream error: {} | last bytes: {:?}", e, truncate(&buffer, 200))));
+                                return;
+                            }
                         }
                     }
                 }
+                Err(e) => {
+                    log_to_file(is_logging, &log_file, &session_id, "CONNECT_ERROR", &e.to_string());
+                    let _ = tx.send(StreamChunk::Error(format!("Failed to connect: {}", e)));
+                }
             }
-            Err(e) => {
-                log_to_file(is_logging, &log_file, &session_id, "CONNECT_ERROR", &e.to_string());
-                let _ = tx.send(StreamChunk::Error(format!("Failed to connect: {}", e)));
-            }
-        }
+        });
     });
-});
 
     rx
 }
