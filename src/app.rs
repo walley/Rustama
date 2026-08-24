@@ -552,6 +552,10 @@ pub struct App {
     pub retry_paused_message: String,
     pub pending_continuation: bool,
     pub continuation_count: u32,
+    /// Automatic "continue" nudges sent this turn because the model stopped
+    /// with `finish_reason="stop"` right after an unfinished-looking text
+    /// (see `needs_continuation`). Reset on fresh user input.
+    pub auto_continue_count: u32,
     /// Token usage received mid-stream (via `StreamChunk::Stats`) that has not
     /// been committed to `token_stats` yet.
     last_stats: TokenStats,
@@ -672,6 +676,7 @@ impl App {
             retry_paused_message: String::new(),
             pending_continuation: false,
             continuation_count: 0,
+            auto_continue_count: 0,
             last_stats: TokenStats::default(),
         };
         app.session_name = app.session_id.clone();
@@ -1301,9 +1306,41 @@ impl App {
                                 break;
                             }
                             self.log_event("ASSISTANT", &text);
+                            // Kimi-K3 sometimes sends finish_reason="stop" right after a
+                            // transitional sentence ("Let me run the full suite:") instead
+                            // of the tool call it announced. The loop only continues on
+                            // tool calls, so the run stalled until the user typed
+                            // "continue" — detect the unfinished-looking text and send it
+                            // automatically.
+                            let unfinished = self.agentic_mode && needs_continuation(&text);
+                            let wants_more =
+                                unfinished && self.auto_continue_count < MAX_AUTO_CONTINUES;
                             self.messages.push(ChatMessage::Assistant(text));
                             self.streaming_thinking.clear();
                             self.streaming_text.clear();
+                            if wants_more {
+                                self.auto_continue_count += 1;
+                                self.log_event(
+                                    "AUTO_CONTINUE",
+                                    &format!(
+                                        "attempt {}/{}",
+                                        self.auto_continue_count, MAX_AUTO_CONTINUES
+                                    ),
+                                );
+                                self.messages.push(ChatMessage::App(format!(
+                                    "Model stopped mid-thought — auto-sending \"continue\" ({}/{})...",
+                                    self.auto_continue_count, MAX_AUTO_CONTINUES
+                                )));
+                                self.set_auto_scroll();
+                                self.send_to_ollama_async_with(Some("continue".to_string()));
+                                break;
+                            }
+                            if unfinished {
+                                self.messages.push(ChatMessage::App(format!(
+                                    "Auto-continue limit ({}) reached — type \"continue\" to keep going.",
+                                    MAX_AUTO_CONTINUES
+                                )));
+                            }
                         } else {
                             self.messages.push(ChatMessage::App(
                                 "Error: Empty response from model".to_string(),
@@ -1549,6 +1586,7 @@ impl App {
         if !prompt.is_empty() && override_prompt.is_none() {
             self.continuation_count = 0;
             self.pending_continuation = false;
+            self.auto_continue_count = 0;
         }
 
         if let Some(result) = self.handle_slash_command(&prompt) {
@@ -2368,22 +2406,12 @@ impl App {
         Some(out)
     }
 
+    /// Maps a mouse row on the scrollbar track to a scroll offset. Thin
+    /// wrapper over [`scrollbar_scroll_offset`] — see it for the geometry.
     fn scrollbar_click_to(&mut self, row: u16, input_start: u16) {
         self.auto_scroll = false;
-        let output_height = input_start.saturating_sub(1) as f64;
-        let total_lines = self.cached_wrapped.len() as f64;
-        let visible_height = self.terminal_height.saturating_sub(4) as f64;
-        let max_scroll = (total_lines - visible_height).max(0.0);
-        if output_height <= 0.0 || max_scroll <= 0.0 {
-            return;
-        }
-        if row <= 1 {
-            self.scroll_offset = self.scroll_offset.saturating_sub(1);
-        } else if row as f64 >= output_height {
-            self.scroll_offset = (self.scroll_offset + 1).min(max_scroll as u16);
-        } else {
-            let ratio = (row as f64 - 1.0) / output_height;
-            self.scroll_offset = (ratio * max_scroll).round() as u16;
+        if let Some(offset) = scrollbar_scroll_offset(row, input_start, self.cached_wrapped.len()) {
+            self.scroll_offset = offset;
         }
     }
 
@@ -3801,6 +3829,80 @@ mod usage_tests {
     }
 }
 
+#[cfg(test)]
+mod scrollbar_tests {
+    use super::scrollbar_scroll_offset;
+
+    // Terminal 40 rows tall -> input_start = 34, output area rows 1..=33,
+    // visible content height = 31. 131 total lines -> max_scroll = 100.
+    const INPUT_START: u16 = 34;
+    const TOTAL: usize = 131;
+    const MAX: u16 = 100;
+
+    #[test]
+    fn top_row_reaches_absolute_top() {
+        // Regression: the top row used to only nudge one line up.
+        assert_eq!(scrollbar_scroll_offset(1, INPUT_START, TOTAL), Some(0));
+    }
+
+    #[test]
+    fn bottom_row_reaches_absolute_bottom() {
+        // Regression: the bottom row used to only nudge one line down.
+        assert_eq!(scrollbar_scroll_offset(33, INPUT_START, TOTAL), Some(MAX));
+    }
+
+    #[test]
+    fn dragging_past_edges_clamps() {
+        assert_eq!(scrollbar_scroll_offset(0, INPUT_START, TOTAL), Some(0));
+        assert_eq!(scrollbar_scroll_offset(39, INPUT_START, TOTAL), Some(MAX));
+        assert_eq!(scrollbar_scroll_offset(u16::MAX, INPUT_START, TOTAL), Some(MAX));
+    }
+
+    #[test]
+    fn middle_maps_linearly() {
+        // Row 17 of track 1..=33 is exactly halfway -> half of max_scroll.
+        assert_eq!(scrollbar_scroll_offset(17, INPUT_START, TOTAL), Some(50));
+    }
+
+    #[test]
+    fn no_overflow_means_no_scroll() {
+        // 20 lines fit into 31 visible rows — nothing to scroll.
+        assert_eq!(scrollbar_scroll_offset(10, INPUT_START, 20), None);
+    }
+
+    #[test]
+    fn degenerate_track_is_safe() {
+        assert_eq!(scrollbar_scroll_offset(1, 2, TOTAL), None);
+        assert_eq!(scrollbar_scroll_offset(1, 0, TOTAL), None);
+    }
+}
+
+/// Maps a mouse row on the output scrollbar track to a scroll offset.
+///
+/// The geometry mirrors `render_output` (main.rs): the output area spans rows
+/// `1 ..= input_start - 1`, so its height is `input_start - 1` and the visible
+/// content height is that minus the 2 border rows. The track occupies the full
+/// area height, so the click row maps linearly onto `0 ..= max_scroll`.
+///
+/// The row is clamped into the track range first, so dragging to (or past)
+/// the very top/bottom row pins to the first/last position — the previous
+/// implementation treated the edge rows as "nudge by one line" zones, which
+/// made the ends of the history unreachable by dragging.
+///
+/// Returns `None` when scrolling is impossible (no overflow / no track).
+fn scrollbar_scroll_offset(row: u16, input_start: u16, total_lines: usize) -> Option<u16> {
+    let area_height = input_start.saturating_sub(1);
+    let visible_height = area_height.saturating_sub(2) as usize;
+    let max_scroll = total_lines.saturating_sub(visible_height);
+    if area_height < 2 || max_scroll == 0 {
+        return None;
+    }
+
+    let track_row = row.clamp(1, area_height);
+    let ratio = (track_row - 1) as f64 / (area_height - 1) as f64;
+    Some((ratio * max_scroll as f64).round() as u16)
+}
+
 fn chrono_now() -> String {
     chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
 }
@@ -4626,6 +4728,100 @@ fn parse_text_tool_calls(text: &str) -> Vec<serde_json::Value> {
 
     tool_calls
 }
+
+/// Upper bound on automatic "continue" nudges per user turn (see
+/// [`needs_continuation`]). Bounds token waste when the model keeps
+/// stopping without making progress; the user can always type "continue"
+/// by hand to reset the budget.
+const MAX_AUTO_CONTINUES: u32 = 10;
+
+/// Heuristic: does this assistant text look like the model stopped right
+/// before the tool call it announced?
+///
+/// Cloud models (Kimi-K3 in particular) occasionally emit
+/// `finish_reason="stop"` immediately after a transitional preamble —
+/// "All 3 tests pass. Let me run the full suite:" — with no `tool_calls`
+/// delta. The agentic loop only continues on tool calls, so the run
+/// stalled until the user typed "continue" by hand. When this returns
+/// true we send that "continue" automatically.
+///
+/// Right-edge signals, checked after trimming whitespace and trailing
+/// markdown emphasis/backticks:
+///   * `:` or `,` — the classic pre-tool preamble ending ("...regressed:")
+///   * an action phrase ("let me", "i'll", "going to", ...)
+fn needs_continuation(text: &str) -> bool {
+    let t = text.trim_end();
+    if t.is_empty() {
+        return false;
+    }
+    // Strip markdown decoration that often trails a preamble ("**X:**", "`X`:").
+    let t = t.trim_end_matches(['*', '_', '`']).trim_end();
+    if t.ends_with(':') || t.ends_with(',') {
+        return true;
+    }
+    let lower = t.to_lowercase();
+    const PHRASES: &[&str] = &[
+        "let me",
+        "let's",
+        "i'll",
+        "i will",
+        "i need to",
+        "i want to",
+        "going to",
+        "i should",
+        "let me check",
+        "checking",
+        "i'm",
+    ];
+    PHRASES.iter().any(|p| lower.ends_with(p))
+}
+
+#[cfg(test)]
+mod continuation_tests {
+    use super::needs_continuation;
+
+    #[test]
+    fn trailing_colon_needs_continuation() {
+        // The exact shapes observed in rustama.log.test before the user had
+        // to type "continue" by hand.
+        assert!(needs_continuation(
+            "All 3 new tests pass. Let me run the full suite to make sure nothing regressed:"
+        ));
+        assert!(needs_continuation(
+            "Let me see how the scrollbar is actually rendered, and how `handle_click`/`handle_mouse_drag` get called:"
+        ));
+        assert!(needs_continuation(
+            "...worth confirming I haven't broken any shared assumption):"
+        ));
+        assert!(needs_continuation("Applying all four:"));
+    }
+
+    #[test]
+    fn colon_with_trailing_decoration() {
+        assert!(needs_continuation("Let me check X:  \n"));
+        assert!(needs_continuation("**Let me check X:**"));
+        assert!(needs_continuation("`cargo test`:"));
+    }
+
+    #[test]
+    fn action_phrase_endings() {
+        assert!(needs_continuation("Build clean. Let me"));
+        assert!(needs_continuation("Now I'll"));
+        assert!(needs_continuation("First I'm going to"));
+        assert!(needs_continuation("First,"));
+    }
+
+    #[test]
+    fn finished_answers_do_not_continue() {
+        assert!(!needs_continuation("The drag bug is fixed."));
+        assert!(!needs_continuation("All **45 tests pass** (39 + 6 new)."));
+        assert!(!needs_continuation("Done — summary above."));
+        assert!(!needs_continuation(""));
+        assert!(!needs_continuation("   \n "));
+        assert!(!needs_continuation("```rust\nfn main() {}\n```"));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{StreamChunk, retry_countdown, send_with_retry, terminal_command};
