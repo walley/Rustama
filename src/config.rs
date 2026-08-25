@@ -15,11 +15,147 @@ pub struct Config {
     pub proxy: Option<String>,
     pub max_tool_rounds: usize,
     pub max_retries: u32,
+    pub terminal_width_pct: u16,
+    pub justify: bool,
+}
+
+/// Per-model sampling / generation parameters.
+///
+/// Used both for cloud models (parsed from the model's section in
+/// `cloud_models.conf`) and for Ollama models (parsed from the model's
+/// section in `model_params.conf`, falling back to that file's `[default]`
+/// section). Values not recognized by a given backend are simply not sent.
+#[derive(Debug, Clone)]
+pub struct ModelParams {
     pub temperature: f64,
     pub top_p: f64,
     pub top_k: u32,
-    pub terminal_width_pct: u16,
-    pub justify: bool,
+    pub frequency_penalty: f64,
+    pub presence_penalty: f64,
+    /// Cloud: `max_tokens`. Ollama: `num_predict`. `None` = provider default.
+    pub max_output_tokens: Option<u32>,
+    /// low/medium/high, or on/off to toggle thinking without a level.
+    /// Cloud: sent as `reasoning_effort` (levels only). Ollama: maps to the
+    /// top-level `think` field (bool or level string).
+    pub reasoning_effort: Option<String>,
+    pub seed: Option<u32>,
+}
+
+impl Default for ModelParams {
+    fn default() -> Self {
+        ModelParams {
+            temperature: 1.0,
+            top_p: 0.9,
+            top_k: 40,
+            frequency_penalty: 0.0,
+            presence_penalty: 0.0,
+            max_output_tokens: None,
+            reasoning_effort: None,
+            seed: None,
+        }
+    }
+}
+
+impl ModelParams {
+    /// Applies one `key = value` config line. Returns true if the key was
+    /// recognized (even if the value turned out invalid and was ignored).
+    pub fn apply_key(&mut self, key: &str, value: &str) -> bool {
+        match key {
+            "temperature" => {
+                if let Ok(n) = value.parse::<f64>()
+                    && (0.0..=2.0).contains(&n)
+                {
+                    self.temperature = n;
+                }
+            }
+            "top_p" => {
+                if let Ok(n) = value.parse::<f64>()
+                    && (0.0..=1.0).contains(&n)
+                {
+                    self.top_p = n;
+                }
+            }
+            "top_k" => {
+                if let Ok(n) = value.parse::<u32>()
+                    && (1..=100).contains(&n)
+                {
+                    self.top_k = n;
+                }
+            }
+            "frequency_penalty" => {
+                if let Ok(n) = value.parse::<f64>()
+                    && (-2.0..=2.0).contains(&n)
+                {
+                    self.frequency_penalty = n;
+                }
+            }
+            "presence_penalty" => {
+                if let Ok(n) = value.parse::<f64>()
+                    && (-2.0..=2.0).contains(&n)
+                {
+                    self.presence_penalty = n;
+                }
+            }
+            "max_output_tokens" | "max_tokens" => {
+                let v = value.trim();
+                if v.is_empty() || v.eq_ignore_ascii_case("off") || v.eq_ignore_ascii_case("none") {
+                    self.max_output_tokens = None;
+                } else if let Ok(n) = v.parse::<u32>()
+                    && n > 0
+                {
+                    self.max_output_tokens = Some(n);
+                }
+            }
+            "reasoning_effort" | "effort" => {
+                let v = value.trim().to_lowercase();
+                if v.is_empty() || v == "none" {
+                    self.reasoning_effort = None;
+                } else if matches!(
+                    v.as_str(),
+                    "low" | "medium" | "high" | "on" | "off" | "true" | "false"
+                ) {
+                    self.reasoning_effort = Some(v);
+                }
+            }
+            "seed" => {
+                let v = value.trim();
+                if v.is_empty() || v.eq_ignore_ascii_case("off") || v.eq_ignore_ascii_case("none") {
+                    self.seed = None;
+                } else if let Ok(n) = v.parse::<u32>() {
+                    self.seed = Some(n);
+                }
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    /// Key/value pairs as written back to config files.
+    pub fn to_conf_entries(&self) -> Vec<(String, String)> {
+        let mut out = vec![
+            ("temperature".to_string(), format!("{}", self.temperature)),
+            ("top_p".to_string(), format!("{}", self.top_p)),
+            ("top_k".to_string(), format!("{}", self.top_k)),
+            (
+                "frequency_penalty".to_string(),
+                format!("{}", self.frequency_penalty),
+            ),
+            (
+                "presence_penalty".to_string(),
+                format!("{}", self.presence_penalty),
+            ),
+        ];
+        if let Some(n) = self.max_output_tokens {
+            out.push(("max_output_tokens".to_string(), n.to_string()));
+        }
+        if let Some(ref e) = self.reasoning_effort {
+            out.push(("reasoning_effort".to_string(), e.clone()));
+        }
+        if let Some(n) = self.seed {
+            out.push(("seed".to_string(), n.to_string()));
+        }
+        out
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -28,7 +164,7 @@ pub struct CloudModel {
     pub api_url: String,
     pub api_key: String,
     pub api_model: String,
-    pub max_output_tokens: u32,
+    pub params: ModelParams,
 }
 
 impl Default for Config {
@@ -45,9 +181,6 @@ impl Default for Config {
             proxy: None,
             max_tool_rounds: 10,
             max_retries: 10,
-            temperature: 1.0,
-            top_p: 0.9,
-            top_k: 40,
             terminal_width_pct: 40,
             justify: false,
         }
@@ -135,14 +268,12 @@ impl Config {
              max_tool_rounds = {}\n\n\
              # Max API retries on 429/rate-limit errors (1-50, default: 10)\n\
              max_retries = {}\n\n\
-             # Sampling temperature (0.0-2.0, default: 1.0)\n\
-             temperature = {}\n\n\
-             # Top-p sampling (0.0-1.0, default: 0.9)\n\
-             top_p = {}\n\n\
-              # Top-k sampling (1-100, default: 40)\n\
-              top_k = {}\n\n\
-              # Justify paragraphs in output (true/false, default: false)\n\
-              justify = {}\n",
+             # Justify paragraphs in output (true/false, default: false)\n\
+             justify = {}\n\n\
+             # NOTE: model parameters (temperature, top_p, top_k,\n\
+             # frequency_penalty, presence_penalty, max_output_tokens,\n\
+             # reasoning_effort, seed) are per-model now — see\n\
+             # model_params.conf (Ollama models) and cloud_models.conf.\n",
             self.ollama_url,
             self.model,
             self.save_path,
@@ -153,9 +284,6 @@ impl Config {
             self.system_prompt,
             self.max_tool_rounds,
             self.max_retries,
-            self.temperature,
-            self.top_p,
-            self.top_k,
             self.justify,
         )
     }
@@ -214,24 +342,6 @@ impl Config {
         {
             cfg.max_retries = n;
         }
-        if let Some(v) = values.get("temperature")
-            && let Ok(n) = v.parse::<f64>()
-            && (0.0..=2.0).contains(&n)
-        {
-            cfg.temperature = n;
-        }
-        if let Some(v) = values.get("top_p")
-            && let Ok(n) = v.parse::<f64>()
-            && (0.0..=1.0).contains(&n)
-        {
-            cfg.top_p = n;
-        }
-        if let Some(v) = values.get("top_k")
-            && let Ok(n) = v.parse::<u32>()
-            && (1..=100).contains(&n)
-        {
-            cfg.top_k = n;
-        }
         if let Some(v) = values.get("terminal_width_pct")
             && let Ok(n) = v.parse::<u16>()
             && (20..=80).contains(&n)
@@ -268,8 +378,10 @@ impl Config {
         } else {
             let dir = conf_dir().ok_or("Cannot determine config directory")?;
             let conf_path = dir.join("rustama.conf");
-            let mut cfg = Config::default();
-            cfg.system_prompt = prompt.to_string();
+            let cfg = Config {
+                system_prompt: prompt.to_string(),
+                ..Config::default()
+            };
             fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
             fs::write(&conf_path, cfg.default_conf()).map_err(|e| e.to_string())?;
         }
@@ -299,9 +411,6 @@ impl Config {
         }
         lines.push(format!("max_tool_rounds = {}", self.max_tool_rounds));
         lines.push(format!("max_retries = {}", self.max_retries));
-        lines.push(format!("temperature = {}", self.temperature));
-        lines.push(format!("top_p = {}", self.top_p));
-        lines.push(format!("top_k = {}", self.top_k));
         lines.push(format!("terminal_width_pct = {}", self.terminal_width_pct));
         lines.push(format!("justify = {}", self.justify));
         fs::write(&conf_path, lines.join("\n")).map_err(|e| e.to_string())?;
@@ -309,7 +418,11 @@ impl Config {
     }
 }
 
-pub fn load_cloud_models() -> Vec<CloudModel> {
+/// Loads cloud models, using `base` (typically the `[default]` section of
+/// `model_params.conf`) as the fallback for parameters a cloud section does
+/// not set itself — so a global default like `top_p` applies to cloud
+/// models too.
+pub fn load_cloud_models_with_base(base: &ModelParams) -> Vec<CloudModel> {
     let dir = match conf_dir() {
         Some(d) => d,
         None => return Vec::new(),
@@ -327,7 +440,7 @@ pub fn load_cloud_models() -> Vec<CloudModel> {
         Err(_) => return Vec::new(),
     };
 
-    parse_cloud_models(&content)
+    parse_cloud_models(&content, base)
 }
 
 fn default_cloud_conf() -> String {
@@ -336,6 +449,9 @@ fn default_cloud_conf() -> String {
      # Required fields: api_url, api_key\n\
      # Optional: api_model (actual model name sent to API, defaults to section name)\n\
      # Optional: max_output_tokens (default: 16384)\n\
+     # Optional model parameters: temperature (1.0), top_p (0.9), top_k (40),\n\
+     #   frequency_penalty (0.0), presence_penalty (0.0),\n\
+     #   reasoning_effort (low/medium/high/on/off), seed\n\
      \n\
      [mistral-small]\n\
      api_url = https://api.mistral.ai/v1/chat/completions\n\
@@ -354,13 +470,24 @@ fn is_placeholder_key(key: &str) -> bool {
     key.starts_with("YOUR_")
 }
 
-fn parse_cloud_models(content: &str) -> Vec<CloudModel> {
+/// Default max_tokens for cloud models when the section does not say
+/// otherwise (preserves the historical 16384).
+const CLOUD_DEFAULT_MAX_OUTPUT_TOKENS: u32 = 16384;
+
+fn cloud_params_default(base: &ModelParams) -> ModelParams {
+    ModelParams {
+        max_output_tokens: Some(CLOUD_DEFAULT_MAX_OUTPUT_TOKENS),
+        ..base.clone()
+    }
+}
+
+fn parse_cloud_models(content: &str, base: &ModelParams) -> Vec<CloudModel> {
     let mut models = Vec::new();
     let mut current_name: Option<String> = None;
     let mut current_url = String::new();
     let mut current_key = String::new();
     let mut current_api_model = String::new();
-    let mut current_max_output_tokens: u32 = 16384;
+    let mut current_params = cloud_params_default(base);
 
     for line in content.lines() {
         let line = line.trim();
@@ -384,14 +511,14 @@ fn parse_cloud_models(content: &str) -> Vec<CloudModel> {
                     api_url: current_url.clone(),
                     api_key: current_key.clone(),
                     api_model,
-                    max_output_tokens: current_max_output_tokens,
+                    params: current_params.clone(),
                 });
             }
             current_name = Some(line[1..line.len() - 1].trim().to_string());
             current_url.clear();
             current_key.clear();
             current_api_model.clear();
-            current_max_output_tokens = 16384;
+            current_params = cloud_params_default(base);
         } else if let Some((key, value)) = line.split_once('=') {
             let key = key.trim().to_lowercase();
             let value = value.trim().to_string();
@@ -399,12 +526,9 @@ fn parse_cloud_models(content: &str) -> Vec<CloudModel> {
                 "api_url" => current_url = value,
                 "api_key" => current_key = value,
                 "api_model" => current_api_model = value,
-                "max_output_tokens" => {
-                    if let Ok(n) = value.parse::<u32>() {
-                        current_max_output_tokens = n;
-                    }
+                _ => {
+                    current_params.apply_key(&key, &value);
                 }
-                _ => {}
             }
         }
     }
@@ -424,11 +548,221 @@ fn parse_cloud_models(content: &str) -> Vec<CloudModel> {
             api_url: current_url,
             api_key: current_key,
             api_model,
-            max_output_tokens: current_max_output_tokens,
+            params: current_params,
         });
     }
 
     models
+}
+
+/// Per-model parameters for Ollama models, loaded from `model_params.conf`.
+///
+/// The optional `[default]` section provides the base for every model; a
+/// named section starts from those defaults and overrides what it sets.
+#[derive(Debug, Clone)]
+pub struct ModelParamsStore {
+    pub default: ModelParams,
+    pub per_model: HashMap<String, ModelParams>,
+}
+
+impl ModelParamsStore {
+    pub fn params_for(&self, model: &str) -> ModelParams {
+        self.per_model
+            .get(model)
+            .cloned()
+            .unwrap_or_else(|| self.default.clone())
+    }
+}
+
+pub fn load_model_params() -> ModelParamsStore {
+    let Some(dir) = conf_dir() else {
+        return ModelParamsStore {
+            default: ModelParams::default(),
+            per_model: HashMap::new(),
+        };
+    };
+    let conf_path = dir.join("model_params.conf");
+
+    if !conf_path.exists() {
+        let _ = fs::create_dir_all(&dir);
+        let content = default_model_params_conf();
+        let _ = fs::write(&conf_path, &content);
+        return parse_model_params(&content);
+    }
+
+    match fs::read_to_string(&conf_path) {
+        Ok(content) => parse_model_params(&content),
+        Err(_) => ModelParamsStore {
+            default: ModelParams::default(),
+            per_model: HashMap::new(),
+        },
+    }
+}
+
+/// Builds the initial `model_params.conf`. Legacy global sampling keys
+/// (temperature/top_p/top_k) left over in `rustama.conf` are migrated into
+/// the `[default]` section so existing users keep their settings.
+fn default_model_params_conf() -> String {
+    let mut out = String::from(
+        "# Per-model parameters for Ollama models\n\
+         # [default] applies to every model; a named section overrides it.\n\
+         # Keys: temperature, top_p, top_k, frequency_penalty, presence_penalty,\n\
+         #   max_output_tokens, reasoning_effort (low/medium/high/on/off), seed\n\
+         \n\
+         [default]\n",
+    );
+    let mut params = ModelParams::default();
+    if let Some(conf_path) = find_conf_file()
+        && let Ok(content) = fs::read_to_string(&conf_path)
+    {
+        let values = parse_ini(&content);
+        for key in ["temperature", "top_p", "top_k"] {
+            if let Some(v) = values.get(key) {
+                params.apply_key(key, v);
+            }
+        }
+    }
+    for (k, v) in params.to_conf_entries() {
+        out.push_str(&format!("{} = {}\n", k, v));
+    }
+    out.push('\n');
+    out
+}
+
+fn parse_model_params(content: &str) -> ModelParamsStore {
+    // Collect sections in order, preserving raw key/value pairs.
+    let mut sections: Vec<(String, Vec<(String, String)>)> = Vec::new();
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with(';') || line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with('[') && line.ends_with(']') {
+            sections.push((line[1..line.len() - 1].trim().to_string(), Vec::new()));
+        } else if let Some((key, value)) = line.split_once('=')
+            && let Some((_, kvs)) = sections.last_mut()
+        {
+            kvs.push((key.trim().to_lowercase(), value.trim().to_string()));
+        }
+    }
+
+    let mut default = ModelParams::default();
+    if let Some((_, kvs)) = sections.iter().find(|(n, _)| n == "default") {
+        for (k, v) in kvs {
+            default.apply_key(k, v);
+        }
+    }
+
+    let mut per_model = HashMap::new();
+    for (name, kvs) in &sections {
+        if name == "default" {
+            continue;
+        }
+        let mut params = default.clone();
+        for (k, v) in kvs {
+            params.apply_key(k, v);
+        }
+        per_model.insert(name.clone(), params);
+    }
+
+    ModelParamsStore { default, per_model }
+}
+
+/// Persists `params` into the section for `model` — in `cloud_models.conf`
+/// for cloud models, otherwise in `model_params.conf`.
+pub fn save_model_params(model: &str, params: &ModelParams, is_cloud: bool) -> Result<(), String> {
+    let dir = conf_dir().ok_or("Cannot determine config directory")?;
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let path = dir.join(if is_cloud {
+        "cloud_models.conf"
+    } else {
+        "model_params.conf"
+    });
+    let content = fs::read_to_string(&path).unwrap_or_else(|_| {
+        if is_cloud {
+            default_cloud_conf()
+        } else {
+            default_model_params_conf()
+        }
+    });
+    let updated = update_ini_section(&content, model, &params.to_conf_entries());
+    fs::write(&path, updated).map_err(|e| e.to_string())
+}
+
+/// Replaces/adds `entries` inside the `[section]` of an INI-style document,
+/// preserving everything else (comments, other sections, key order).
+/// Existing keys are updated in place; new keys are appended at the end of
+/// the section; a missing section is appended at the end of the file.
+fn update_ini_section(content: &str, section: &str, entries: &[(String, String)]) -> String {
+    let mut lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
+    let mut remaining: Vec<(String, String)> = entries.to_vec();
+
+    let mut in_section = false;
+    let mut section_found = false;
+    let mut insert_at: Option<usize> = None;
+    // Index of the last non-blank line seen inside the target section
+    // (the section header counts, so empty sections insert right after it).
+    let mut last_content: Option<usize> = None;
+
+    for (i, line) in lines.iter_mut().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            if in_section && insert_at.is_none() {
+                // The target section ended right before this header; insert
+                // after its last content line, keeping trailing blank lines
+                // attached to the gap between sections.
+                insert_at = Some(last_content.map(|i| i + 1).unwrap_or(i));
+            }
+            in_section = trimmed[1..trimmed.len() - 1].trim() == section;
+            section_found = section_found || in_section;
+            if in_section {
+                last_content = Some(i);
+            }
+            continue;
+        }
+        if in_section && !trimmed.is_empty() {
+            last_content = Some(i);
+            if !trimmed.starts_with('#')
+                && !trimmed.starts_with(';')
+                && let Some((key, _)) = trimmed.split_once('=')
+            {
+                let key = key.trim().to_lowercase();
+                if let Some(pos) = remaining.iter().position(|(k, _)| k == &key) {
+                    let (_, value) = remaining.remove(pos);
+                    *line = format!("{} = {}", key, value);
+                }
+            }
+        }
+    }
+
+    if in_section && insert_at.is_none() {
+        insert_at = Some(last_content.map(|i| i + 1).unwrap_or(lines.len()));
+    }
+
+    if !section_found {
+        if !lines.last().is_none_or(|l| l.trim().is_empty()) {
+            lines.push(String::new());
+        }
+        lines.push(format!("[{}]", section));
+        for (k, v) in remaining {
+            lines.push(format!("{} = {}", k, v));
+        }
+    } else if !remaining.is_empty() {
+        let at = insert_at.unwrap_or(lines.len());
+        let new_lines: Vec<String> = remaining
+            .iter()
+            .map(|(k, v)| format!("{} = {}", k, v))
+            .collect();
+        let tail: Vec<String> = lines.split_off(at);
+        lines.extend(new_lines);
+        lines.extend(tail);
+    }
+
+    let mut out = lines.join("\n");
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out
 }
 
 fn conf_dir() -> Option<PathBuf> {
@@ -490,7 +824,7 @@ mod tests {
                     [kimi-k3]\n\
                     api_url = https://api.moonshot.ai/v1/chat/completions\n\
                     api_key = YOUR_MOONSHOT_API_KEY\n";
-        assert!(parse_cloud_models(conf).is_empty());
+        assert!(parse_cloud_models(conf, &ModelParams::default()).is_empty());
     }
 
     #[test]
@@ -498,7 +832,7 @@ mod tests {
         let conf = "[mistral-small]\n\
                     api_url = https://api.mistral.ai/v1/chat/completions\n\
                     api_key = abc123realkey\n";
-        let models = parse_cloud_models(conf);
+        let models = parse_cloud_models(conf, &ModelParams::default());
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].name, "mistral-small");
         assert_eq!(models[0].api_key, "abc123realkey");
@@ -514,7 +848,7 @@ mod tests {
                     [real]\n\
                     api_url = https://example.com/v1/chat/completions\n\
                     api_key = sk-live-123\n";
-        let models = parse_cloud_models(conf);
+        let models = parse_cloud_models(conf, &ModelParams::default());
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].name, "real");
     }
@@ -522,12 +856,145 @@ mod tests {
     #[test]
     fn missing_key_is_skipped() {
         let conf = "[nokey]\napi_url = https://example.com\n";
-        assert!(parse_cloud_models(conf).is_empty());
+        assert!(parse_cloud_models(conf, &ModelParams::default()).is_empty());
     }
 
     #[test]
     fn shipped_default_conf_has_no_real_keys() {
         // Regression: the default config must never embed a live credential.
-        assert!(parse_cloud_models(&default_cloud_conf()).is_empty());
+        assert!(parse_cloud_models(&default_cloud_conf(), &ModelParams::default()).is_empty());
+    }
+
+    #[test]
+    fn cloud_section_parses_model_params() {
+        let conf = "[kimi-k3]\n\
+                    api_url = https://api.moonshot.ai/v1/chat/completions\n\
+                    api_key = sk-real\n\
+                    temperature = 0.6\n\
+                    frequency_penalty = 0.5\n\
+                    reasoning_effort = high\n\
+                    max_output_tokens = 8192\n\
+                    seed = 42\n";
+        let models = parse_cloud_models(conf, &ModelParams::default());
+        assert_eq!(models.len(), 1);
+        let p = &models[0].params;
+        assert_eq!(p.temperature, 0.6);
+        assert_eq!(p.frequency_penalty, 0.5);
+        assert_eq!(p.presence_penalty, 0.0);
+        assert_eq!(p.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(p.max_output_tokens, Some(8192));
+        assert_eq!(p.seed, Some(42));
+        // untouched keys keep cloud defaults
+        assert_eq!(p.top_p, 0.9);
+        assert_eq!(p.top_k, 40);
+    }
+
+    #[test]
+    fn cloud_section_defaults_max_output_tokens() {
+        let conf = "[m]\napi_url = https://x\napi_key = sk-real\n";
+        let models = parse_cloud_models(conf, &ModelParams::default());
+        assert_eq!(models[0].params.max_output_tokens, Some(16384));
+    }
+
+    #[test]
+    fn cloud_sections_inherit_default_base() {
+        // The [default] section of model_params.conf is the fallback for
+        // cloud models too; section keys still win; max_output_tokens keeps
+        // its own cloud default.
+        let mut base = ModelParams::default();
+        base.top_p = 0.95;
+        base.frequency_penalty = 0.4;
+        let conf = "[a]\napi_url = https://x\napi_key = sk-real\n\n\
+                    [b]\napi_url = https://y\napi_key = sk-real\ntop_p = 0.5\n";
+        let models = parse_cloud_models(conf, &base);
+        assert_eq!(models[0].params.top_p, 0.95); // inherited from base
+        assert_eq!(models[0].params.frequency_penalty, 0.4);
+        assert_eq!(models[0].params.max_output_tokens, Some(16384));
+        assert_eq!(models[1].params.top_p, 0.5); // section overrides base
+        assert_eq!(models[1].params.frequency_penalty, 0.4);
+    }
+
+    #[test]
+    fn model_params_default_section_applies_to_all() {
+        let conf = "[default]\n\
+                    temperature = 0.7\n\
+                    frequency_penalty = 0.3\n\
+                    \n\
+                    [llama3.2:3b]\n\
+                    temperature = 0.2\n\
+                    reasoning_effort = medium\n";
+        let store = parse_model_params(conf);
+        assert_eq!(store.default.temperature, 0.7);
+        assert_eq!(store.default.frequency_penalty, 0.3);
+        // named section inherits from [default] and overrides
+        let p = store.params_for("llama3.2:3b");
+        assert_eq!(p.temperature, 0.2);
+        assert_eq!(p.frequency_penalty, 0.3);
+        assert_eq!(p.reasoning_effort.as_deref(), Some("medium"));
+        // unknown model falls back to [default]
+        let p = store.params_for("no-such-model");
+        assert_eq!(p.temperature, 0.7);
+    }
+
+    #[test]
+    fn apply_key_validates_ranges_and_values() {
+        let mut p = ModelParams::default();
+        assert!(p.apply_key("temperature", "9.9")); // out of range -> ignored
+        assert_eq!(p.temperature, 1.0);
+        assert!(p.apply_key("frequency_penalty", "-1.5"));
+        assert_eq!(p.frequency_penalty, -1.5);
+        assert!(p.apply_key("reasoning_effort", "HIGH"));
+        assert_eq!(p.reasoning_effort.as_deref(), Some("high"));
+        assert!(p.apply_key("reasoning_effort", "bogus")); // ignored
+        assert_eq!(p.reasoning_effort.as_deref(), Some("high"));
+        assert!(p.apply_key("max_output_tokens", "off"));
+        assert_eq!(p.max_output_tokens, None);
+        assert!(!p.apply_key("not_a_param", "1"));
+    }
+
+    #[test]
+    fn update_ini_section_updates_in_place() {
+        let content = "# header\n\
+                       [a]\n\
+                       temperature = 1.0\n\
+                       # comment\n\
+                       api_key = secret\n\
+                       \n\
+                       [b]\n\
+                       temperature = 2.0\n";
+        let entries = vec![("temperature".to_string(), "0.5".to_string())];
+        let out = update_ini_section(content, "a", &entries);
+        assert!(out.contains("[a]\ntemperature = 0.5\n# comment\napi_key = secret"));
+        // other section untouched
+        assert!(out.contains("[b]\ntemperature = 2.0"));
+    }
+
+    #[test]
+    fn update_ini_section_appends_missing_keys_at_section_end() {
+        let content = "[a]\ntemperature = 1.0\n\n[b]\nx = 1\n";
+        let entries = vec![
+            ("temperature".to_string(), "0.5".to_string()),
+            ("seed".to_string(), "7".to_string()),
+        ];
+        let out = update_ini_section(content, "a", &entries);
+        assert!(out.contains("[a]\ntemperature = 0.5\nseed = 7\n\n[b]\nx = 1\n"));
+    }
+
+    #[test]
+    fn update_ini_section_creates_missing_section() {
+        let content = "[a]\nx = 1\n";
+        let entries = vec![("temperature".to_string(), "0.5".to_string())];
+        let out = update_ini_section(content, "new-model", &entries);
+        assert!(out.contains("[a]\nx = 1\n"));
+        assert!(out.contains("[new-model]\ntemperature = 0.5\n"));
+    }
+
+    #[test]
+    fn update_ini_section_at_file_end() {
+        // Target section is the last one; new keys append at EOF.
+        let content = "[a]\nx = 1\n\n[b]\ny = 2\n";
+        let entries = vec![("seed".to_string(), "3".to_string())];
+        let out = update_ini_section(content, "b", &entries);
+        assert!(out.contains("[b]\ny = 2\nseed = 3\n"));
     }
 }

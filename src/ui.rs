@@ -10,11 +10,8 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Shadow}
 pub struct Theme {
     pub dialog_border: Color,
     pub dialog_bg: Color,
-    pub button_active_bg: Color,
-    pub button_inactive_fg: Color,
     pub list_selected_bg: Color,
     pub list_selected_fg: Color,
-    pub list_selected_indicator_bg: Color,
     pub dir_fg: Color,
     pub file_fg: Color,
     pub path_fg: Color,
@@ -24,15 +21,13 @@ pub struct Theme {
 }
 
 impl Theme {
+    #[cfg(test)]
     pub fn default() -> Self {
         Theme {
             dialog_border: Color::Cyan,
             dialog_bg: Color::DarkGray,
-            button_active_bg: Color::Green,
-            button_inactive_fg: Color::Green,
             list_selected_bg: Color::White,
             list_selected_fg: Color::Black,
-            list_selected_indicator_bg: Color::Cyan,
             dir_fg: Color::Blue,
             file_fg: Color::White,
             path_fg: Color::DarkGray,
@@ -46,11 +41,8 @@ impl Theme {
         Theme {
             dialog_border: Color::Cyan,
             dialog_bg: Color::Rgb(20, 20, 20),
-            button_active_bg: Color::Green,
-            button_inactive_fg: Color::Green,
             list_selected_bg: Color::White,
             list_selected_fg: Color::Black,
-            list_selected_indicator_bg: Color::Cyan,
             dir_fg: Color::LightBlue,
             file_fg: Color::White,
             path_fg: Color::DarkGray,
@@ -101,8 +93,7 @@ impl Button {
     }
 
     pub fn render(&self) -> (String, Style) {
-        let display = if self.hotkey.is_some() {
-            let hotkey = self.hotkey.unwrap();
+        let display = if let Some(hotkey) = self.hotkey {
             let idx = self.name.to_lowercase().chars().position(|c| c == hotkey);
             if let Some(idx) = idx {
                 let before: String = self.name.chars().take(idx).collect();
@@ -126,116 +117,6 @@ impl Button {
         };
 
         (display, style)
-    }
-}
-
-pub struct Dropdown {
-    pub label: String,
-    pub items: Vec<String>,
-    pub selected: usize,
-    pub x: u16,
-    pub y: u16,
-    pub focused: bool,
-    pub expanded: bool,
-}
-
-impl Dropdown {
-    pub fn new(label: &str, items: Vec<String>, x: u16, y: u16) -> Self {
-        Dropdown {
-            label: label.to_string(),
-            items,
-            selected: 0,
-            x,
-            y,
-            focused: false,
-            expanded: false,
-        }
-    }
-
-    pub fn total_height(&self) -> u16 {
-        if self.expanded {
-            1 + self.items.len() as u16
-        } else {
-            1
-        }
-    }
-
-    pub fn render_line(&self, line_offset: u16, theme: &Theme) -> Vec<Line<'static>> {
-        if !self.expanded {
-            if line_offset != 0 {
-                return Vec::new();
-            }
-            let display = if self.items.is_empty() {
-                format!("  {}: []", self.label)
-            } else {
-                format!("  {}: [{} \u{25bc}]", self.label, self.items[self.selected])
-            };
-            let style = if self.focused {
-                Style::default()
-                    .fg(theme.focus_fg)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(theme.accent)
-            };
-            vec![Line::from(Span::styled(display, style))]
-        } else {
-            let mut lines = Vec::new();
-            if line_offset == 0 {
-                let display = if self.items.is_empty() {
-                    format!("  {}: [] \u{25b2}", self.label)
-                } else {
-                    format!("  {}: [{} \u{25b2}]", self.label, self.items[self.selected])
-                };
-                lines.push(Line::from(Span::styled(
-                    display,
-                    Style::default().fg(theme.focus_fg),
-                )));
-            }
-            for (i, item) in self.items.iter().enumerate() {
-                let row = 1 + i as u16;
-                if row < line_offset {
-                    continue;
-                }
-                let prefix = if i == self.selected {
-                    "\u{2022} "
-                } else {
-                    "\u{25cb} "
-                };
-                let display = format!("    {}{}", prefix, item);
-                let style = if i == self.selected {
-                    Style::default()
-                        .fg(theme.focus_fg)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(Color::White)
-                };
-                lines.push(Line::from(Span::styled(display, style)));
-            }
-            lines
-        }
-    }
-
-    pub fn hit_test(&self, col: u16, row: u16) -> Option<usize> {
-        if self.expanded {
-            if col >= self.x + 4
-                && col < self.x + 30
-                && row > self.y
-                && row < self.y + 1 + self.items.len() as u16
-            {
-                let idx = (row - self.y - 1) as usize;
-                if idx < self.items.len() {
-                    return Some(idx);
-                }
-            }
-            if col >= self.x && col < self.x + 30 && row == self.y {
-                return Some(self.selected);
-            }
-        } else {
-            if col >= self.x && col < self.x + 30 && row == self.y {
-                return Some(self.selected);
-            }
-        }
-        None
     }
 }
 
@@ -285,19 +166,12 @@ pub struct DialogButton {
 }
 
 #[derive(Debug, Clone)]
-pub struct DialogAreas {
-    pub popup: Rect,
-    pub inner: Rect,
-    pub item_areas: Vec<(usize, Rect)>,
-}
-
-#[derive(Debug, Clone)]
 pub enum DialogHit {
     Outside,
-    TextInput(usize),
+    TextInput,
     DropdownItem(usize, Option<usize>),
-    Button(usize, usize),
-    FileListItem(usize, usize),
+    Button(usize),
+    FileListItem(usize),
     None,
 }
 
@@ -312,13 +186,6 @@ impl FileActionDialog {
             title: title.to_string(),
             items: Vec::new(),
         }
-    }
-
-    pub fn add_label(&mut self, text: &str) {
-        self.items.push(DialogItem::Label(DialogLabel {
-            text: text.to_string(),
-            fg: None,
-        }));
     }
 
     pub fn add_label_colored(&mut self, text: &str, fg: Color) {
@@ -393,10 +260,6 @@ impl FileActionDialog {
         }
     }
 
-    fn total_content_height(items: &[DialogItem]) -> u16 {
-        items.iter().map(Self::item_height).sum::<u16>()
-    }
-
     /// Popup dimensions shared by `render` and `hit_test` so they always agree.
     pub fn dialog_size(area: Rect) -> (u16, u16) {
         ((area.width * 2 / 3).max(40), (area.height * 2 / 3).max(10))
@@ -430,7 +293,7 @@ impl FileActionDialog {
         (box_h, visible, start)
     }
 
-    pub fn render(&self, f: &mut Frame, area: Rect, theme: &Theme) -> DialogAreas {
+    pub fn render(&self, f: &mut Frame, area: Rect, theme: &Theme) {
         let (dialog_w, dialog_h) = Self::dialog_size(area);
 
         let popup = Rect {
@@ -444,7 +307,6 @@ impl FileActionDialog {
         f.render_widget(Clear, popup);
         f.render_widget(dialog_block(&self.title, theme), popup);
 
-        let mut item_areas = Vec::new();
         let mut y_cursor = inner.y;
 
         let btn_bottom_y = inner.y + inner.height - 2;
@@ -473,7 +335,6 @@ impl FileActionDialog {
                         ))),
                         item_area,
                     );
-                    item_areas.push((idx, item_area));
                 }
                 DialogItem::TextInput(ti) => {
                     let label_area = Rect {
@@ -514,8 +375,6 @@ impl FileActionDialog {
                         f.set_cursor_position(Position::new(cursor_x, input_area.y));
                     }
 
-                    item_areas.push((idx, label_area));
-                    item_areas.push((idx, input_area));
                 }
                 DialogItem::Dropdown {
                     label,
@@ -545,7 +404,6 @@ impl FileActionDialog {
                             Paragraph::new(Line::from(Span::styled(display, style))),
                             item_area,
                         );
-                        item_areas.push((idx, item_area));
                     } else {
                         let header = format!("  {}: [{} \u{25b2}]", label, items[state.selected]);
                         let header_area = Rect {
@@ -561,7 +419,6 @@ impl FileActionDialog {
                             ))),
                             header_area,
                         );
-                        item_areas.push((idx, header_area));
 
                         for (i, item_name) in items.iter().enumerate() {
                             let prefix = if i == state.selected {
@@ -587,7 +444,6 @@ impl FileActionDialog {
                                 Paragraph::new(Line::from(Span::styled(display, style))),
                                 item_area,
                             );
-                            item_areas.push((idx, item_area));
                         }
                     }
                 }
@@ -662,7 +518,6 @@ impl FileActionDialog {
                     list_items.resize_with(visible, || ListItem::new(Line::from(Span::raw(""))));
                     let list = ratatui::widgets::List::new(list_items);
                     f.render_widget(list, list_inner);
-                    item_areas.push((idx, box_area));
                 }
                 DialogItem::Buttons(_) => unreachable!(),
             }
@@ -702,14 +557,8 @@ impl FileActionDialog {
                 height: 1,
             };
             f.render_widget(Paragraph::new(Line::from(spans)), btn_area);
-            item_areas.push((idx, btn_area));
         }
 
-        DialogAreas {
-            popup,
-            inner,
-            item_areas,
-        }
     }
 
     pub fn hit_test(&self, col: u16, row: u16, area: Rect) -> DialogHit {
@@ -752,7 +601,7 @@ impl FileActionDialog {
                 }
                 DialogItem::TextInput(_) => {
                     if row >= y_cursor && row <= y_cursor + 1 {
-                        return DialogHit::TextInput(idx);
+                        return DialogHit::TextInput;
                     }
                 }
                 DialogItem::Dropdown { items, state, .. } => {
@@ -788,7 +637,7 @@ impl FileActionDialog {
                     if row > y_cursor && row <= y_cursor + visible as u16 {
                         let list_idx = start + (row - y_cursor - 1) as usize;
                         if list_idx < entries.len() {
-                            return DialogHit::FileListItem(idx, list_idx);
+                            return DialogHit::FileListItem(list_idx);
                         }
                     }
                 }
@@ -815,7 +664,7 @@ impl FileActionDialog {
                 }
                 let btn_w = btn.label.len() as u16 + 4;
                 if col >= x_cursor && col < x_cursor + btn_w {
-                    return DialogHit::Button(idx, bi);
+                    return DialogHit::Button(bi);
                 }
                 x_cursor += btn_w;
             }
@@ -1595,7 +1444,7 @@ mod tests {
         let mut saw_list_item = false;
         for row in 0..area.height {
             for col in 0..area.width {
-                if let DialogHit::FileListItem(_, idx) = d.hit_test(col, row, area) {
+                if let DialogHit::FileListItem(idx) = d.hit_test(col, row, area) {
                     saw_list_item = true;
                     assert!(idx < entries.len());
                 }

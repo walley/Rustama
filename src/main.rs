@@ -740,11 +740,7 @@ fn render_keybar(f: &mut Frame, app: &App, area: Rect) {
     };
 
     let terminal_hint = if app.terminal_state.is_running() {
-        if app.terminal_state.visible {
-            " Ctrl+T "
-        } else {
-            " Ctrl+T "
-        }
+        " Ctrl+T "
     } else {
         ""
     };
@@ -909,7 +905,7 @@ fn render_model_dialog(f: &mut Frame, app: &App, area: Rect) {
 
 fn render_file_dialog(f: &mut Frame, app: &App, area: Rect) {
     let dlg = app.build_file_action_dialog(area);
-    let _ = dlg.render(f, area, &app.theme);
+    dlg.render(f, area, &app.theme);
 }
 
 fn render_save_dialog(f: &mut Frame, app: &App, area: Rect) {
@@ -956,7 +952,7 @@ fn render_save_dialog(f: &mut Frame, app: &App, area: Rect) {
         }
     };
 
-    let _ = dlg.render(f, area, &app.theme);
+    dlg.render(f, area, &app.theme);
 }
 
 fn render_load_dialog(f: &mut Frame, app: &App, area: Rect) {
@@ -1035,7 +1031,7 @@ fn render_load_dialog(f: &mut Frame, app: &App, area: Rect) {
 
 fn render_settings_dialog(f: &mut Frame, app: &App, area: Rect) {
     let dialog_w: u16 = 60;
-    let dialog_h: u16 = 22;
+    let dialog_h: u16 = 28;
 
     let popup_area = Rect {
         x: (area.width.saturating_sub(dialog_w)) / 2,
@@ -1055,6 +1051,10 @@ fn render_settings_dialog(f: &mut Frame, app: &App, area: Rect) {
         ("Temperature:", SettingsFocus::Temperature),
         ("Top-P:", SettingsFocus::TopP),
         ("Top-K:", SettingsFocus::TopK),
+        ("Freq Penalty:", SettingsFocus::FrequencyPenalty),
+        ("Pres Penalty:", SettingsFocus::PresencePenalty),
+        ("Max Tokens:", SettingsFocus::MaxTokens),
+        ("Effort:", SettingsFocus::ReasoningEffort),
         ("Max Rounds:", SettingsFocus::MaxToolRounds),
         ("Max Retries:", SettingsFocus::MaxRetries),
         ("Justify:", SettingsFocus::Justify),
@@ -1107,6 +1107,10 @@ fn render_settings_dialog(f: &mut Frame, app: &App, area: Rect) {
                 SettingsFocus::Temperature => &app.settings_temperature,
                 SettingsFocus::TopP => &app.settings_top_p,
                 SettingsFocus::TopK => &app.settings_top_k,
+                SettingsFocus::FrequencyPenalty => &app.settings_frequency_penalty,
+                SettingsFocus::PresencePenalty => &app.settings_presence_penalty,
+                SettingsFocus::MaxTokens => &app.settings_max_tokens,
+                SettingsFocus::ReasoningEffort => &app.settings_reasoning_effort,
                 SettingsFocus::MaxToolRounds => &app.settings_max_tool_rounds,
                 SettingsFocus::MaxRetries => &app.settings_max_retries,
                 _ => "",
@@ -1148,7 +1152,7 @@ fn render_settings_dialog(f: &mut Frame, app: &App, area: Rect) {
         }
     }
 
-    let num_fields = 8u16;
+    let num_fields = 12u16;
     let btn_y = inner.y + num_fields * 2 + 1;
     let save_label = "Save";
     let cancel_label = "Cancel";

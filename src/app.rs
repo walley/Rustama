@@ -15,7 +15,10 @@ use std::process::{Child, Stdio};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
 
-use crate::config::{CloudModel, Config, load_cloud_models};
+use crate::config::{
+    CloudModel, Config, ModelParams, ModelParamsStore, load_cloud_models_with_base,
+    load_model_params, save_model_params,
+};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum InputMode {
@@ -64,18 +67,69 @@ pub enum SaveDialogFocus {
     Cancel,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SettingsFocus {
     Proxy,
     OllamaUrl,
     Temperature,
     TopP,
     TopK,
+    FrequencyPenalty,
+    PresencePenalty,
+    MaxTokens,
+    ReasoningEffort,
     MaxToolRounds,
     MaxRetries,
     Justify,
     Save,
     Cancel,
+}
+
+impl SettingsFocus {
+    /// Field order used by Tab/BackTab and Up/Down navigation.
+    const ORDER: [SettingsFocus; 14] = [
+        SettingsFocus::Proxy,
+        SettingsFocus::OllamaUrl,
+        SettingsFocus::Temperature,
+        SettingsFocus::TopP,
+        SettingsFocus::TopK,
+        SettingsFocus::FrequencyPenalty,
+        SettingsFocus::PresencePenalty,
+        SettingsFocus::MaxTokens,
+        SettingsFocus::ReasoningEffort,
+        SettingsFocus::MaxToolRounds,
+        SettingsFocus::MaxRetries,
+        SettingsFocus::Justify,
+        SettingsFocus::Save,
+        SettingsFocus::Cancel,
+    ];
+
+    fn next(self) -> SettingsFocus {
+        let idx = Self::ORDER.iter().position(|f| *f == self).unwrap_or(0);
+        Self::ORDER[(idx + 1) % Self::ORDER.len()]
+    }
+
+    fn prev(self) -> SettingsFocus {
+        let idx = Self::ORDER.iter().position(|f| *f == self).unwrap_or(0);
+        Self::ORDER[(idx + Self::ORDER.len() - 1) % Self::ORDER.len()]
+    }
+
+    fn is_text_field(self) -> bool {
+        matches!(
+            self,
+            SettingsFocus::Proxy
+                | SettingsFocus::OllamaUrl
+                | SettingsFocus::Temperature
+                | SettingsFocus::TopP
+                | SettingsFocus::TopK
+                | SettingsFocus::FrequencyPenalty
+                | SettingsFocus::PresencePenalty
+                | SettingsFocus::MaxTokens
+                | SettingsFocus::ReasoningEffort
+                | SettingsFocus::MaxToolRounds
+                | SettingsFocus::MaxRetries
+        )
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -108,21 +162,6 @@ pub enum ExportFormat {
     PlainText,
 }
 
-impl ExportFormat {
-    pub fn name(&self) -> &'static str {
-        match self {
-            ExportFormat::Markdown => "MD",
-            ExportFormat::PlainText => "PLAIN TEXT",
-        }
-    }
-    pub fn next(&self) -> ExportFormat {
-        match self {
-            ExportFormat::Markdown => ExportFormat::PlainText,
-            ExportFormat::PlainText => ExportFormat::Markdown,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TokenStats {
     pub prompt_tokens: u64,
@@ -140,7 +179,6 @@ pub enum StreamChunk {
     Done(TokenStats),
     Error(String),
     RetryPaused(String),
-    Status(String),
     StatusTick(String),
     ToolCalls(Vec<serde_json::Value>),
     Truncated(String),
@@ -242,6 +280,7 @@ pub struct TerminalState {
 }
 
 /// Shell reserved words / builtins that must not be prefixed with `stdbuf`.
+#[cfg(test)]
 const SHELL_KEYWORDS: &[&str] = &[
     "if", "then", "elif", "else", "fi", "for", "while", "until", "do", "done", "case", "esac",
     "in", "function", "select", "time", "coproc", "!", "{", "}", "(", ")", "[[", "]]", "cd",
@@ -263,6 +302,7 @@ const SHELL_KEYWORDS: &[&str] = &[
 /// PTY support (e.g. the `portable-pty` crate) is required for that, and for
 /// readline programs, top, less, ssh, ... . Should eventually replace this
 /// pipe-based TerminalState implementation.
+#[cfg(test)]
 fn terminal_command(command: &str) -> String {
     let first = command.split_whitespace().next().unwrap_or("");
     let simple = !first.is_empty()
@@ -501,9 +541,10 @@ pub struct App {
     pub tool_call_count: usize,
     pub pending_tool_calls: Vec<serde_json::Value>,
     pub tool_call_log: Vec<(String, String, String)>,
-    pub temperature: f64,
-    pub top_p: f64,
-    pub top_k: u32,
+    /// Effective generation parameters for the currently selected model.
+    pub params: ModelParams,
+    /// Per-model parameters for Ollama models (from `model_params.conf`).
+    pub model_params_store: ModelParamsStore,
     pub show_save_dialog: bool,
     pub save_dialog_path: String,
     pub save_dialog_cursor: usize,
@@ -520,6 +561,10 @@ pub struct App {
     pub settings_temperature: String,
     pub settings_top_p: String,
     pub settings_top_k: String,
+    pub settings_frequency_penalty: String,
+    pub settings_presence_penalty: String,
+    pub settings_max_tokens: String,
+    pub settings_reasoning_effort: String,
     pub settings_max_tool_rounds: String,
     pub settings_max_retries: String,
     pub settings_cursor: usize,
@@ -566,6 +611,9 @@ impl App {
         let textarea = TextArea::default();
         let clipboard = Clipboard::new().ok();
         rotate_log_file(&cfg.logfile);
+        let model_params_store = load_model_params();
+        let cloud_models = load_cloud_models_with_base(&model_params_store.default);
+        let params = params_for_model(&cfg.model, &cloud_models, &model_params_store);
         let mut app = App {
             messages: vec![ChatMessage::App(
                 "Welcome to Rustama. Start typing your message.".to_string(),
@@ -615,9 +663,8 @@ impl App {
             tool_call_count: 0,
             pending_tool_calls: Vec::new(),
             tool_call_log: Vec::new(),
-            temperature: cfg.temperature,
-            top_p: cfg.top_p,
-            top_k: cfg.top_k,
+            params: params.clone(),
+            model_params_store,
             show_save_dialog: false,
             save_dialog_path: cfg.save_path,
             save_dialog_cursor: 0,
@@ -631,9 +678,16 @@ impl App {
             settings_focus: SettingsFocus::Proxy,
             settings_proxy: cfg.proxy.clone().unwrap_or_default(),
             settings_ollama_url: cfg.ollama_url.clone(),
-            settings_temperature: "1.0".to_string(),
-            settings_top_p: "0.9".to_string(),
-            settings_top_k: "40".to_string(),
+            settings_temperature: format!("{}", params.temperature),
+            settings_top_p: format!("{}", params.top_p),
+            settings_top_k: format!("{}", params.top_k),
+            settings_frequency_penalty: format!("{}", params.frequency_penalty),
+            settings_presence_penalty: format!("{}", params.presence_penalty),
+            settings_max_tokens: params
+                .max_output_tokens
+                .map(|n| n.to_string())
+                .unwrap_or_default(),
+            settings_reasoning_effort: params.reasoning_effort.clone().unwrap_or_default(),
             settings_max_tool_rounds: cfg.max_tool_rounds.to_string(),
             settings_max_retries: cfg.max_retries.to_string(),
             settings_cursor: 0,
@@ -641,7 +695,7 @@ impl App {
             is_logging: cfg.logging,
             log_file: cfg.logfile,
             token_stats: TokenStats::default(),
-            cloud_models: load_cloud_models(),
+            cloud_models,
             system_prompt: cfg.system_prompt.clone(),
             export_format: ExportFormat::Markdown,
             theme: Theme::dark(),
@@ -836,14 +890,8 @@ impl App {
             KeyCode::Enter => {
                 if key.modifiers == KeyModifiers::ALT {
                     self.textarea.input(key);
-                } else if key.modifiers == KeyModifiers::CONTROL {
-                    if !self.textarea.lines().join("").trim().is_empty() && !self.is_loading {
-                        self.send_to_ollama_async();
-                    }
-                } else {
-                    if !self.textarea.lines().join("").trim().is_empty() && !self.is_loading {
-                        self.send_to_ollama_async();
-                    }
+                } else if !self.textarea.lines().join("").trim().is_empty() && !self.is_loading {
+                    self.send_to_ollama_async();
                 }
             }
             KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -1086,11 +1134,6 @@ impl App {
                         self.retrying = false;
                         self.auto_scroll = true;
                     }
-                    Ok(StreamChunk::Status(msg)) => {
-                        self.status_message = msg;
-                        self.retrying = false;
-                        self.auto_scroll = true;
-                    }
                     Ok(StreamChunk::StatusTick(msg)) => {
                         self.status_message = msg;
                         self.retrying = true;
@@ -1122,7 +1165,7 @@ impl App {
                         self.pending_tool_calls.clear();
                         // Push visible warning — Done handler will set_auto_scroll
                         self.messages.push(ChatMessage::App(format!(
-                            "⚠ {} Increase max_output_tokens in cloud_models.conf.",
+                            "⚠ {} Increase max_output_tokens in cloud_models.conf or model_params.conf.",
                             msg
                         )));
                     }
@@ -1535,9 +1578,7 @@ impl App {
         let is_logging = self.is_logging;
         let log_file = self.log_file.clone();
         let session_id = self.session_id.clone();
-        let temperature = self.temperature;
-        let top_p = self.top_p;
-        let top_k = self.top_k;
+        let params = self.params.clone();
         let proxy = if cloud_model.is_some() {
             self.proxy.clone()
         } else {
@@ -1560,9 +1601,7 @@ impl App {
             is_logging,
             log_file,
             session_id,
-            temperature,
-            top_p,
-            top_k,
+            params,
             proxy,
             max_retries,
         );
@@ -1706,9 +1745,7 @@ impl App {
         let is_logging = self.is_logging;
         let log_file = self.log_file.clone();
         let session_id = self.session_id.clone();
-        let temperature = self.temperature;
-        let top_p = self.top_p;
-        let top_k = self.top_k;
+        let params = self.params.clone();
         let proxy = if cloud_model.is_some() {
             self.proxy.clone()
         } else {
@@ -1730,9 +1767,7 @@ impl App {
             is_logging,
             log_file,
             session_id,
-            temperature,
-            top_p,
-            top_k,
+            params,
             proxy,
             max_retries,
         );
@@ -1882,23 +1917,27 @@ impl App {
         self.show_save_dialog = false;
     }
 
-    pub fn save_proxy_to_config(&self) -> Result<(), String> {
-        let mut cfg = Config::default();
-        cfg.ollama_url = self.ollama_url.clone();
-        cfg.model = self.model_name.clone();
-        cfg.save_path = self.save_path.clone();
-        cfg.agentic = self.agentic_mode;
-        cfg.logging = self.is_logging;
-        cfg.logfile = self.log_file.clone();
-        cfg.system_prompt = self.system_prompt.clone();
-        cfg.proxy = self.proxy.clone();
-        cfg.max_tool_rounds = self.max_tool_rounds;
-        cfg.max_retries = self.max_retries;
-        cfg.temperature = self.temperature;
-        cfg.top_p = self.top_p;
-        cfg.top_k = self.top_k;
-        cfg.terminal_width_pct = self.terminal_state.width_pct;
-        cfg.save()
+    /// Saves the global config (proxy, urls, retries, ...) and the current
+    /// model's generation parameters to their per-model config section
+    /// (`cloud_models.conf` for cloud models, `model_params.conf` otherwise).
+    pub fn save_config(&self) -> Result<(), String> {
+        let cfg = Config {
+            ollama_url: self.ollama_url.clone(),
+            model: self.model_name.clone(),
+            save_path: self.save_path.clone(),
+            agentic: self.agentic_mode,
+            logging: self.is_logging,
+            logfile: self.log_file.clone(),
+            system_prompt: self.system_prompt.clone(),
+            proxy: self.proxy.clone(),
+            max_tool_rounds: self.max_tool_rounds,
+            max_retries: self.max_retries,
+            terminal_width_pct: self.terminal_state.width_pct,
+            ..Config::default()
+        };
+        cfg.save()?;
+        let is_cloud = self.cloud_models.iter().any(|m| m.name == self.model_name);
+        save_model_params(&self.model_name, &self.params, is_cloud)
     }
 
     pub fn save_session(&self) -> Result<(), String> {
@@ -1929,6 +1968,7 @@ impl App {
         self.session_name = sess_id.to_string();
         if let Some(model) = data["model"].as_str() {
             self.model_name = model.to_string();
+            self.apply_model_params();
         }
         self.status_message = format!("Loaded session {}", sess_id);
         Ok(())
@@ -1977,6 +2017,7 @@ impl App {
         self.streaming_text.clear();
         if let Some(model) = data["model"].as_str() {
             self.model_name = model.to_string();
+            self.apply_model_params();
         }
         if let Some(sid) = data["session_id"].as_str() {
             self.status_message = format!("Loaded session {}", sid);
@@ -2031,41 +2072,6 @@ impl App {
                 }
             }
             _ => {}
-        }
-    }
-
-    fn handle_load_dialog_click(&mut self, col: u16, row: u16, width: u16, height: u16) {
-        let dialog_w: u16 = 60;
-        let dialog_h: u16 = 6;
-        let dialog_x = (width.saturating_sub(dialog_w)) / 2;
-        let dialog_y = (height.saturating_sub(dialog_h)) / 2;
-
-        if col < dialog_x
-            || col >= dialog_x + dialog_w
-            || row < dialog_y
-            || row >= dialog_y + dialog_h
-        {
-            self.show_load_dialog = false;
-            return;
-        }
-
-        let rel_x = col - dialog_x;
-        let rel_y = row - dialog_y;
-
-        if rel_y == 3 {
-            self.load_dialog_path.clear();
-        }
-
-        let btn_y = dialog_h - 2;
-        let load_btn = Button::new("Load", 10, btn_y, true, Color::Green, Color::Green);
-        let cancel_btn = Button::new("Cancel", 22, btn_y, true, Color::Red, Color::Red);
-
-        if load_btn.is_clicked(rel_x, rel_y) {
-            self.execute_load_session();
-            return;
-        }
-        if cancel_btn.is_clicked(rel_x, rel_y) {
-            self.show_load_dialog = false;
         }
     }
 
@@ -2237,7 +2243,7 @@ impl App {
             DialogHit::Outside => {
                 self.show_format_dropdown = false;
             }
-            DialogHit::TextInput(_) => {
+            DialogHit::TextInput => {
                 self.save_dialog_focus = SaveDialogFocus::Path;
             }
             DialogHit::DropdownItem(_idx, item_idx) => {
@@ -2252,7 +2258,7 @@ impl App {
                     self.show_format_dropdown = !self.show_format_dropdown;
                 }
             }
-            DialogHit::Button(_, bi) => {
+            DialogHit::Button(bi) => {
                 let action_idx = 1;
                 if bi == action_idx {
                     self.execute_export();
@@ -2261,7 +2267,7 @@ impl App {
                     self.show_save_dialog = false;
                 }
             }
-            DialogHit::FileListItem(_, _) | DialogHit::None => {}
+            DialogHit::FileListItem(_) | DialogHit::None => {}
         }
     }
 
@@ -2553,9 +2559,16 @@ impl App {
         }
     }
 
+    /// Reloads `self.params` from the per-model configuration after the
+    /// current model changed (model dialog, /model, session load, ...).
+    fn apply_model_params(&mut self) {
+        self.params = params_for_model(&self.model_name, &self.cloud_models, &self.model_params_store);
+    }
+
     fn confirm_model_selection(&mut self) {
         if let Some(model) = self.available_models.get(self.model_dialog_selection) {
             self.model_name = model.clone();
+            self.apply_model_params();
             self.status_message = format!("Model set to: {}", self.model_name);
         }
         self.show_model_dialog = false;
@@ -2622,24 +2635,24 @@ impl App {
         self.settings_cursor = 0;
         self.settings_proxy = self.proxy.clone().unwrap_or_default();
         self.settings_ollama_url = self.ollama_url.clone();
-        self.settings_temperature = format!("{}", self.temperature);
-        self.settings_top_p = format!("{}", self.top_p);
-        self.settings_top_k = format!("{}", self.top_k);
+        self.settings_temperature = format!("{}", self.params.temperature);
+        self.settings_top_p = format!("{}", self.params.top_p);
+        self.settings_top_k = format!("{}", self.params.top_k);
+        self.settings_frequency_penalty = format!("{}", self.params.frequency_penalty);
+        self.settings_presence_penalty = format!("{}", self.params.presence_penalty);
+        self.settings_max_tokens = self
+            .params
+            .max_output_tokens
+            .map(|n| n.to_string())
+            .unwrap_or_default();
+        self.settings_reasoning_effort =
+            self.params.reasoning_effort.clone().unwrap_or_default();
         self.settings_max_tool_rounds = self.max_tool_rounds.to_string();
         self.settings_justify = self.justify;
     }
 
     fn handle_settings_dialog_key(&mut self, key: KeyEvent) {
-        let is_text_field = matches!(
-            self.settings_focus,
-            SettingsFocus::Proxy
-                | SettingsFocus::OllamaUrl
-                | SettingsFocus::Temperature
-                | SettingsFocus::TopP
-                | SettingsFocus::TopK
-                | SettingsFocus::MaxToolRounds
-                | SettingsFocus::MaxRetries
-        );
+        let is_text_field = self.settings_focus.is_text_field();
         let is_toggle = self.settings_focus == SettingsFocus::Justify;
 
         match key.code {
@@ -2648,63 +2661,19 @@ impl App {
             }
             KeyCode::Tab => {
                 self.settings_cursor = 0;
-                self.settings_focus = match self.settings_focus {
-                    SettingsFocus::Proxy => SettingsFocus::OllamaUrl,
-                    SettingsFocus::OllamaUrl => SettingsFocus::Temperature,
-                    SettingsFocus::Temperature => SettingsFocus::TopP,
-                    SettingsFocus::TopP => SettingsFocus::TopK,
-                    SettingsFocus::TopK => SettingsFocus::MaxToolRounds,
-                    SettingsFocus::MaxToolRounds => SettingsFocus::MaxRetries,
-                    SettingsFocus::MaxRetries => SettingsFocus::Justify,
-                    SettingsFocus::Justify => SettingsFocus::Save,
-                    SettingsFocus::Save => SettingsFocus::Cancel,
-                    SettingsFocus::Cancel => SettingsFocus::Proxy,
-                };
+                self.settings_focus = self.settings_focus.next();
             }
             KeyCode::BackTab => {
                 self.settings_cursor = 0;
-                self.settings_focus = match self.settings_focus {
-                    SettingsFocus::Proxy => SettingsFocus::Cancel,
-                    SettingsFocus::OllamaUrl => SettingsFocus::Proxy,
-                    SettingsFocus::Temperature => SettingsFocus::OllamaUrl,
-                    SettingsFocus::TopP => SettingsFocus::Temperature,
-                    SettingsFocus::TopK => SettingsFocus::TopP,
-                    SettingsFocus::MaxToolRounds => SettingsFocus::TopK,
-                    SettingsFocus::MaxRetries => SettingsFocus::MaxToolRounds,
-                    SettingsFocus::Justify => SettingsFocus::MaxRetries,
-                    SettingsFocus::Save => SettingsFocus::Justify,
-                    SettingsFocus::Cancel => SettingsFocus::Save,
-                };
+                self.settings_focus = self.settings_focus.prev();
             }
             KeyCode::Up => {
                 self.settings_cursor = 0;
-                self.settings_focus = match self.settings_focus {
-                    SettingsFocus::Proxy => SettingsFocus::Cancel,
-                    SettingsFocus::OllamaUrl => SettingsFocus::Proxy,
-                    SettingsFocus::Temperature => SettingsFocus::OllamaUrl,
-                    SettingsFocus::TopP => SettingsFocus::Temperature,
-                    SettingsFocus::TopK => SettingsFocus::TopP,
-                    SettingsFocus::MaxToolRounds => SettingsFocus::TopK,
-                    SettingsFocus::MaxRetries => SettingsFocus::MaxToolRounds,
-                    SettingsFocus::Justify => SettingsFocus::MaxRetries,
-                    SettingsFocus::Save => SettingsFocus::Justify,
-                    SettingsFocus::Cancel => SettingsFocus::Save,
-                };
+                self.settings_focus = self.settings_focus.prev();
             }
             KeyCode::Down => {
                 self.settings_cursor = 0;
-                self.settings_focus = match self.settings_focus {
-                    SettingsFocus::Proxy => SettingsFocus::OllamaUrl,
-                    SettingsFocus::OllamaUrl => SettingsFocus::Temperature,
-                    SettingsFocus::Temperature => SettingsFocus::TopP,
-                    SettingsFocus::TopP => SettingsFocus::TopK,
-                    SettingsFocus::TopK => SettingsFocus::MaxToolRounds,
-                    SettingsFocus::MaxToolRounds => SettingsFocus::MaxRetries,
-                    SettingsFocus::MaxRetries => SettingsFocus::Justify,
-                    SettingsFocus::Justify => SettingsFocus::Save,
-                    SettingsFocus::Save => SettingsFocus::Cancel,
-                    SettingsFocus::Cancel => SettingsFocus::Proxy,
-                };
+                self.settings_focus = self.settings_focus.next();
             }
             KeyCode::Left => {
                 if is_text_field {
@@ -2798,6 +2767,10 @@ impl App {
             SettingsFocus::Temperature => &self.settings_temperature,
             SettingsFocus::TopP => &self.settings_top_p,
             SettingsFocus::TopK => &self.settings_top_k,
+            SettingsFocus::FrequencyPenalty => &self.settings_frequency_penalty,
+            SettingsFocus::PresencePenalty => &self.settings_presence_penalty,
+            SettingsFocus::MaxTokens => &self.settings_max_tokens,
+            SettingsFocus::ReasoningEffort => &self.settings_reasoning_effort,
             SettingsFocus::MaxToolRounds => &self.settings_max_tool_rounds,
             SettingsFocus::MaxRetries => &self.settings_max_retries,
             _ => "",
@@ -2811,6 +2784,10 @@ impl App {
             SettingsFocus::Temperature => &mut self.settings_temperature,
             SettingsFocus::TopP => &mut self.settings_top_p,
             SettingsFocus::TopK => &mut self.settings_top_k,
+            SettingsFocus::FrequencyPenalty => &mut self.settings_frequency_penalty,
+            SettingsFocus::PresencePenalty => &mut self.settings_presence_penalty,
+            SettingsFocus::MaxTokens => &mut self.settings_max_tokens,
+            SettingsFocus::ReasoningEffort => &mut self.settings_reasoning_effort,
             SettingsFocus::MaxToolRounds => &mut self.settings_max_tool_rounds,
             SettingsFocus::MaxRetries => &mut self.settings_max_retries,
             _ => unreachable!(),
@@ -2825,21 +2802,18 @@ impl App {
             Some(proxy_val)
         };
         self.ollama_url = self.settings_ollama_url.trim().to_string();
-        if let Ok(v) = self.settings_temperature.trim().parse::<f64>()
-            && (0.0..=2.0).contains(&v)
-        {
-            self.temperature = v;
-        }
-        if let Ok(v) = self.settings_top_p.trim().parse::<f64>()
-            && (0.0..=1.0).contains(&v)
-        {
-            self.top_p = v;
-        }
-        if let Ok(v) = self.settings_top_k.trim().parse::<u32>()
-            && (1..=100).contains(&v)
-        {
-            self.top_k = v;
-        }
+        self.params
+            .apply_key("temperature", self.settings_temperature.trim());
+        self.params.apply_key("top_p", self.settings_top_p.trim());
+        self.params.apply_key("top_k", self.settings_top_k.trim());
+        self.params
+            .apply_key("frequency_penalty", self.settings_frequency_penalty.trim());
+        self.params
+            .apply_key("presence_penalty", self.settings_presence_penalty.trim());
+        self.params
+            .apply_key("max_output_tokens", self.settings_max_tokens.trim());
+        self.params
+            .apply_key("reasoning_effort", self.settings_reasoning_effort.trim());
         if let Ok(v) = self.settings_max_tool_rounds.trim().parse::<usize>()
             && (1..=100).contains(&v)
         {
@@ -2851,14 +2825,14 @@ impl App {
             self.max_retries = v;
         }
         self.justify = self.settings_justify;
-        let _ = self.save_proxy_to_config();
+        let _ = self.save_config();
         self.show_settings_dialog = false;
         self.status_message = "Settings saved".to_string();
     }
 
     fn handle_settings_dialog_click(&mut self, col: u16, row: u16, width: u16, height: u16) {
         let dialog_w: u16 = 60;
-        let dialog_h: u16 = 22;
+        let dialog_h: u16 = 28;
         let dialog_x = (width.saturating_sub(dialog_w)) / 2;
         let dialog_y = (height.saturating_sub(dialog_h)) / 2;
         let inner_x = dialog_x + 2;
@@ -2880,6 +2854,10 @@ impl App {
             (SettingsFocus::Temperature, "Temperature:"),
             (SettingsFocus::TopP, "Top-P:"),
             (SettingsFocus::TopK, "Top-K:"),
+            (SettingsFocus::FrequencyPenalty, "Freq Penalty:"),
+            (SettingsFocus::PresencePenalty, "Pres Penalty:"),
+            (SettingsFocus::MaxTokens, "Max Tokens:"),
+            (SettingsFocus::ReasoningEffort, "Effort:"),
             (SettingsFocus::MaxToolRounds, "Max Rounds:"),
             (SettingsFocus::MaxRetries, "Max Retries:"),
             (SettingsFocus::Justify, "Justify:"),
@@ -2894,13 +2872,13 @@ impl App {
                     self.settings_justify = !self.settings_justify;
                     return;
                 } else if col >= inner_x + 14 && col < inner_x + 14 + max_w + 2 {
-                    self.settings_focus = focus.clone();
+                    self.settings_focus = *focus;
                     return;
                 }
             }
         }
 
-        let num_fields = 8u16;
+        let num_fields = 12u16;
         let btn_y = inner_y + num_fields * 2 + 1;
         let save_label = "Save";
         let cancel_label = "Cancel";
@@ -2988,14 +2966,6 @@ impl App {
             }
             ConfirmHit::None => {}
         }
-    }
-
-    fn open_file_dialog(&mut self) {
-        self.show_file_dialog = true;
-        self.file_dialog_selection = 0;
-        self.file_dialog_scroll = 0;
-        self.file_dialog_focus = FileDialogFocus::List;
-        self.refresh_file_list();
     }
 
     fn refresh_file_list(&mut self) {
@@ -3091,6 +3061,7 @@ impl App {
                 self.streaming_text.clear();
                 if let Some(model) = data["model"].as_str() {
                     self.model_name = model.to_string();
+                    self.apply_model_params();
                 }
                 let display_name = name.strip_suffix(".session.rustama").unwrap_or(&name);
                 self.session_name = display_name.to_string();
@@ -3247,11 +3218,11 @@ impl App {
             DialogHit::Outside => {
                 self.show_file_dialog = false;
             }
-            DialogHit::FileListItem(_, idx) => {
+            DialogHit::FileListItem(idx) => {
                 self.file_dialog_selection = idx;
                 self.file_dialog_focus = FileDialogFocus::List;
             }
-            DialogHit::Button(_, bi) => {
+            DialogHit::Button(bi) => {
                 if bi == 0 {
                     self.show_file_dialog = false;
                 } else {
@@ -3294,7 +3265,7 @@ impl App {
             "temp" => Some(match arg {
                 Some(n) => match n.parse::<f64>() {
                     Ok(v) if (0.0..=2.0).contains(&v) => {
-                        self.temperature = v;
+                        self.params.temperature = v;
                         format!("Temperature set to {}", v)
                     }
                     Ok(_) => "Value must be between 0.0 and 2.0".to_string(),
@@ -3302,40 +3273,137 @@ impl App {
                 },
                 None => format!(
                     "Current temperature: {} (usage: /temp <number>)",
-                    self.temperature
+                    self.params.temperature
                 ),
             }),
             "topp" => Some(match arg {
                 Some(n) => match n.parse::<f64>() {
                     Ok(v) if (0.0..=1.0).contains(&v) => {
-                        self.top_p = v;
+                        self.params.top_p = v;
                         format!("Top_p set to {}", v)
                     }
                     Ok(_) => "Value must be between 0.0 and 1.0".to_string(),
                     Err(_) => "Usage: /topp <number>".to_string(),
                 },
-                None => format!("Current top_p: {} (usage: /topp <number>)", self.top_p),
+                None => format!(
+                    "Current top_p: {} (usage: /topp <number>)",
+                    self.params.top_p
+                ),
             }),
             "topk" => Some(match arg {
                 Some(n) => match n.parse::<u32>() {
                     Ok(v) if (1..=100).contains(&v) => {
-                        self.top_k = v;
+                        self.params.top_k = v;
                         format!("Top_k set to {}", v)
                     }
                     Ok(_) => "Value must be between 1 and 100".to_string(),
                     Err(_) => "Usage: /topk <number>".to_string(),
                 },
-                None => format!("Current top_k: {} (usage: /topk <number>)", self.top_k),
+                None => format!(
+                    "Current top_k: {} (usage: /topk <number>)",
+                    self.params.top_k
+                ),
+            }),
+            "fpen" => Some(match arg {
+                Some(n) => match n.parse::<f64>() {
+                    Ok(v) if (-2.0..=2.0).contains(&v) => {
+                        self.params.frequency_penalty = v;
+                        format!("Frequency penalty set to {}", v)
+                    }
+                    Ok(_) => "Value must be between -2.0 and 2.0".to_string(),
+                    Err(_) => "Usage: /fpen <number>".to_string(),
+                },
+                None => format!(
+                    "Current frequency_penalty: {} (usage: /fpen <number>)",
+                    self.params.frequency_penalty
+                ),
+            }),
+            "ppen" => Some(match arg {
+                Some(n) => match n.parse::<f64>() {
+                    Ok(v) if (-2.0..=2.0).contains(&v) => {
+                        self.params.presence_penalty = v;
+                        format!("Presence penalty set to {}", v)
+                    }
+                    Ok(_) => "Value must be between -2.0 and 2.0".to_string(),
+                    Err(_) => "Usage: /ppen <number>".to_string(),
+                },
+                None => format!(
+                    "Current presence_penalty: {} (usage: /ppen <number>)",
+                    self.params.presence_penalty
+                ),
+            }),
+            "effort" => Some(match arg {
+                Some(level) => {
+                    let before = self.params.reasoning_effort.clone();
+                    self.params.apply_key("reasoning_effort", level);
+                    if self.params.reasoning_effort != before {
+                        match &self.params.reasoning_effort {
+                            Some(e) => format!("Reasoning effort set to {}", e),
+                            None => "Reasoning effort cleared".to_string(),
+                        }
+                    } else {
+                        format!(
+                            "Invalid effort '{}'. Use low, medium, high, on, off or none.",
+                            level
+                        )
+                    }
+                }
+                None => format!(
+                    "Current reasoning_effort: {} (usage: /effort <low|medium|high|on|off|none>)",
+                    self.params.reasoning_effort.as_deref().unwrap_or("(unset)")
+                ),
+            }),
+            "maxtokens" => Some(match arg {
+                Some(n) => {
+                    let before = self.params.max_output_tokens;
+                    self.params.apply_key("max_output_tokens", n);
+                    if self.params.max_output_tokens != before {
+                        match self.params.max_output_tokens {
+                            Some(v) => format!("Max output tokens set to {}", v),
+                            None => "Max output tokens cleared (provider default)".to_string(),
+                        }
+                    } else {
+                        "Usage: /maxtokens <number> or /maxtokens off".to_string()
+                    }
+                }
+                None => format!(
+                    "Current max_output_tokens: {} (usage: /maxtokens <number> or /maxtokens off)",
+                    self.params
+                        .max_output_tokens
+                        .map(|n| n.to_string())
+                        .unwrap_or_else(|| "(unset)".to_string())
+                ),
+            }),
+            "seed" => Some(match arg {
+                Some(n) => {
+                    let before = self.params.seed;
+                    self.params.apply_key("seed", n);
+                    if self.params.seed != before {
+                        match self.params.seed {
+                            Some(v) => format!("Seed set to {}", v),
+                            None => "Seed cleared".to_string(),
+                        }
+                    } else {
+                        "Usage: /seed <number> or /seed off".to_string()
+                    }
+                }
+                None => format!(
+                    "Current seed: {} (usage: /seed <number> or /seed off)",
+                    self.params
+                        .seed
+                        .map(|n| n.to_string())
+                        .unwrap_or_else(|| "(unset)".to_string())
+                ),
             }),
             "proxy" => Some(match arg {
                 Some("off") | Some("none") | Some("") => {
                     self.proxy = None;
-                    let _ = self.save_proxy_to_config();
+                    let _ = self.save_config();
                     "Proxy disabled".to_string()
                 }
                 Some(url) => {
                     self.proxy = Some(url.to_string());
-                    let _ = self.save_proxy_to_config();
+                    let _ = self.save_config();
                     format!("Proxy set to {}", url)
                 }
                 None => match &self.proxy {
@@ -3411,6 +3479,14 @@ impl App {
             ("/temp <n>", "Temperature 0.0-2.0 (default: 1.0)"),
             ("/topp <n>", "Top_p 0.0-1.0 (default: 0.9)"),
             ("/topk <n>", "Top_k 1-100 (default: 40)"),
+            ("/fpen <n>", "Frequency penalty -2.0-2.0 (default: 0.0)"),
+            ("/ppen <n>", "Presence penalty -2.0-2.0 (default: 0.0)"),
+            (
+                "/effort <level>",
+                "Reasoning effort low/medium/high/on/off",
+            ),
+            ("/maxtokens <n>", "Max output tokens (or /maxtokens off)"),
+            ("/seed <n>", "Sampling seed (or /seed off)"),
             ("/proxy <url>", "Set HTTP proxy (e.g. http://proxy:8080)"),
             ("/proxy off", "Disable proxy"),
             ("/session save", "Save current session"),
@@ -3434,9 +3510,11 @@ impl App {
             Some(name) => {
                 if self.available_models.iter().any(|m| m == name) {
                     self.model_name = name.to_string();
+                    self.apply_model_params();
                     format!("Model set to: {}", name)
                 } else if self.cloud_models.iter().any(|m| m.name == name) {
                     self.model_name = name.to_string();
+                    self.apply_model_params();
                     format!("Model set to: {} (cloud)", name)
                 } else {
                     let mut all: Vec<&str> =
@@ -3536,8 +3614,9 @@ impl App {
                 .join("rustama")
                 .join("rustama.conf")
         };
+        let p = &self.params;
         format!(
-            "Config file: {}\n\n  ollama_url     = {}\n  model          = {}\n  save_path      = {}\n  agentic        = {}\n  max_rounds     = {}\n  timeout_secs   = {}\n  logging        = {}\n  logfile        = {}\n  temperature    = {}\n  top_p          = {}\n  top_k          = {}\n  justify        = {}",
+            "Config file: {}\n\n  ollama_url     = {}\n  model          = {}\n  save_path      = {}\n  agentic        = {}\n  max_rounds     = {}\n  timeout_secs   = {}\n  logging        = {}\n  logfile        = {}\n  justify        = {}\n\nModel parameters (per-model):\n  temperature    = {}\n  top_p          = {}\n  top_k          = {}\n  frequency_pen. = {}\n  presence_pen.  = {}\n  max_tokens     = {}\n  effort         = {}\n  seed           = {}",
             conf_path.display(),
             self.ollama_url,
             self.model_name,
@@ -3547,10 +3626,19 @@ impl App {
             300,
             self.is_logging,
             self.log_file,
-            self.temperature,
-            self.top_p,
-            self.top_k,
             self.justify,
+            p.temperature,
+            p.top_p,
+            p.top_k,
+            p.frequency_penalty,
+            p.presence_penalty,
+            p.max_output_tokens
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "(unset)".to_string()),
+            p.reasoning_effort.as_deref().unwrap_or("(unset)"),
+            p.seed
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "(unset)".to_string()),
         )
     }
 
@@ -3567,8 +3655,9 @@ impl App {
         let model_count = self.available_models.len();
         let msg_count = self.messages.len();
         let tool_calls = self.tool_call_log.len();
+        let p = &self.params;
         format!(
-            "Status:\n  Session ID:    {}\n  Session Name:  {}\n  Model:         {}\n  Messages:      {}\n  Logging:       {}\n  Log file:      {}\n  Agentic mode:  {}\n  Available:     {} model(s)\n  Tool calls:    {}\n  System prompt: {}\n  Temperature:   {}\n  Top_p:         {}\n  Top_k:         {}\n  Justify:       {}",
+            "Status:\n  Session ID:    {}\n  Session Name:  {}\n  Model:         {}\n  Messages:      {}\n  Logging:       {}\n  Log file:      {}\n  Agentic mode:  {}\n  Available:     {} model(s)\n  Tool calls:    {}\n  System prompt: {}\n  Temperature:   {}\n  Top_p:         {}\n  Top_k:         {}\n  Freq penalty:  {}\n  Pres penalty:  {}\n  Max tokens:    {}\n  Effort:        {}\n  Seed:          {}\n  Justify:       {}",
             self.session_id,
             self.session_name,
             self.model_name,
@@ -3583,9 +3672,18 @@ impl App {
             } else {
                 format!("{} chars", self.system_prompt.len())
             },
-            self.temperature,
-            self.top_p,
-            self.top_k,
+            p.temperature,
+            p.top_p,
+            p.top_k,
+            p.frequency_penalty,
+            p.presence_penalty,
+            p.max_output_tokens
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "(unset)".to_string()),
+            p.reasoning_effort.as_deref().unwrap_or("(unset)"),
+            p.seed
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "(unset)".to_string()),
             if self.justify { "ON" } else { "OFF" },
         )
     }
@@ -3637,12 +3735,14 @@ impl App {
             .cloud_models
             .iter()
             .find(|m| m.name == *model)
-            .map(|m| m.max_output_tokens);
+            .and_then(|m| m.params.max_output_tokens);
 
         if let Some(max) = max_output {
             if max > 0 {
                 let pct = s.response_tokens as f64 / max as f64 * 100.0;
                 parts.push(format!("{}/{} ({:.0}%)", s.response_tokens, max, pct));
+            } else {
+                parts.push(format!("out:{}", s.response_tokens));
             }
         } else {
             // Ollama or unknown — just show count
@@ -3915,39 +4015,18 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
-fn patch_tool_call_ids(msgs: &mut Vec<ChatMessage>) {
-    for i in 0..msgs.len() {
-        if let ChatMessage::ToolCall {
-            name, tool_call_id, ..
-        } = &msgs[i]
-            && tool_call_id.is_none()
-        {
-            let id = format!("call_{}", name);
-            msgs[i] = match msgs[i].clone() {
-                ChatMessage::ToolCall {
-                    name, arguments, ..
-                } => ChatMessage::ToolCall {
-                    name,
-                    arguments,
-                    tool_call_id: Some(id),
-                },
-                other => other,
-            };
-        }
-        if let ChatMessage::ToolResult {
-            name, tool_call_id, ..
-        } = &msgs[i]
-            && tool_call_id.is_none()
-        {
-            let id = format!("call_{}", name);
-            msgs[i] = match msgs[i].clone() {
-                ChatMessage::ToolResult { name, content, .. } => ChatMessage::ToolResult {
-                    name,
-                    content,
-                    tool_call_id: Some(id),
-                },
-                other => other,
-            };
+fn patch_tool_call_ids(msgs: &mut [ChatMessage]) {
+    for msg in msgs.iter_mut() {
+        match msg {
+            ChatMessage::ToolCall {
+                name, tool_call_id, ..
+            }
+            | ChatMessage::ToolResult {
+                name, tool_call_id, ..
+            } if tool_call_id.is_none() => {
+                *tool_call_id = Some(format!("call_{}", name));
+            }
+            _ => {}
         }
     }
 }
@@ -3974,6 +4053,20 @@ fn dirs_home() -> PathBuf {
     std::env::var("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("."))
+}
+
+/// Resolves the effective generation parameters for a model: cloud models
+/// carry their own (from `cloud_models.conf`); Ollama models look up
+/// `model_params.conf` (named section, then `[default]`, then built-ins).
+fn params_for_model(
+    model: &str,
+    cloud_models: &[CloudModel],
+    store: &ModelParamsStore,
+) -> ModelParams {
+    if let Some(cm) = cloud_models.iter().find(|m| m.name == model) {
+        return cm.params.clone();
+    }
+    store.params_for(model)
 }
 
 fn get_tool_definitions() -> Vec<serde_json::Value> {
@@ -4242,6 +4335,7 @@ fn build_blocking_client(proxy: &Option<String>) -> reqwest::blocking::Client {
         .unwrap_or_else(|_| reqwest::blocking::Client::new())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn retry_countdown(
     label: &str,
     delay_secs: u64,
@@ -4280,6 +4374,7 @@ fn retry_countdown(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn send_with_retry(
     client: &reqwest::Client,
     method: reqwest::Method,
@@ -4906,7 +5001,8 @@ mod tests {
             for i in 0..3 {
                 let (mut stream, _) = listener.accept().unwrap();
                 let mut buf = [0u8; 4096];
-                stream.read(&mut buf).unwrap();
+                let n = stream.read(&mut buf).unwrap();
+                assert!(n > 0, "expected a request from the client");
                 if i < 2 {
                     let body = r#"{"error": {"message": "quota exceeded"}}"#;
                     let resp = format!(
@@ -4948,7 +5044,7 @@ mod tests {
             let msgs: Vec<String> = rx
                 .iter()
                 .filter_map(|m| match m {
-                    StreamChunk::Status(s) | StreamChunk::StatusTick(s) => Some(s),
+                    StreamChunk::StatusTick(s) => Some(s),
                     _ => None,
                 })
                 .collect();
@@ -4998,7 +5094,7 @@ mod tests {
         let result = b.read_incremental(None);
         assert_eq!(result["output"].as_str().unwrap(), "");
         assert_eq!(result["cursor"].as_u64().unwrap(), 0);
-        assert_eq!(result["gap"].as_bool().unwrap(), false);
+        assert!(!result["gap"].as_bool().unwrap());
     }
 
     #[test]
@@ -5023,7 +5119,7 @@ mod tests {
         let result = b.read_incremental(Some(3));
         assert_eq!(result["output"].as_str().unwrap(), "xyz");
         assert_eq!(result["cursor"].as_u64().unwrap(), 6);
-        assert_eq!(result["gap"].as_bool().unwrap(), false);
+        assert!(!result["gap"].as_bool().unwrap());
     }
 
     #[test]
@@ -5054,7 +5150,7 @@ mod tests {
         let result = b.read_incremental(Some(500));
         assert_eq!(result["output"].as_str().unwrap(), "xyz");
         assert_eq!(result["cursor"].as_u64().unwrap(), 1003);
-        assert_eq!(result["gap"].as_bool().unwrap(), true);
+        assert!(result["gap"].as_bool().unwrap());
     }
 
     #[test]
@@ -5062,7 +5158,7 @@ mod tests {
         let b = make_buffer("abc", 1003, 1000);
         let result = b.read_incremental(Some(1000));
         assert_eq!(result["output"].as_str().unwrap(), "abc");
-        assert_eq!(result["gap"].as_bool().unwrap(), false);
+        assert!(!result["gap"].as_bool().unwrap());
     }
 
     #[test]
@@ -5074,7 +5170,7 @@ mod tests {
         let result = b.read_incremental(Some(5000));
         assert_eq!(result["output"].as_str().unwrap().len(), 5000);
         assert_eq!(result["cursor"].as_u64().unwrap(), 10000);
-        assert_eq!(result["gap"].as_bool().unwrap(), false);
+        assert!(!result["gap"].as_bool().unwrap());
     }
 
     #[test]
@@ -5082,7 +5178,7 @@ mod tests {
         let content = "x".repeat(5000);
         let b = make_buffer(&content, 10000, 5000);
         let result = b.read_incremental(Some(4999));
-        assert_eq!(result["gap"].as_bool().unwrap(), true);
+        assert!(result["gap"].as_bool().unwrap());
         assert_eq!(result["cursor"].as_u64().unwrap(), 10000);
     }
 
@@ -5195,6 +5291,91 @@ mod tests {
     }
 }
 
+/// Builds the JSON request body for a chat request, translating the
+/// per-model [`ModelParams`] into the dialect the backend speaks:
+/// OpenAI-style top-level fields for cloud models, Ollama `options` map +
+/// top-level `think` for Ollama.
+fn build_chat_body(
+    model: &str,
+    cloud_model: Option<&CloudModel>,
+    agentic: bool,
+    api_messages: &[serde_json::Value],
+    params: &ModelParams,
+) -> serde_json::Value {
+    if let Some(cloud) = cloud_model {
+        let mut body = serde_json::json!({
+            "model": cloud.api_model,
+            "messages": api_messages,
+            "stream": true,
+        });
+        if let Some(max_tokens) = params.max_output_tokens {
+            body["max_tokens"] = serde_json::json!(max_tokens);
+        }
+        body["tools"] = serde_json::json!(get_tool_definitions());
+        body["temperature"] = serde_json::json!(params.temperature);
+        body["top_p"] = serde_json::json!(params.top_p);
+        if params.frequency_penalty != 0.0 {
+            body["frequency_penalty"] = serde_json::json!(params.frequency_penalty);
+        }
+        if params.presence_penalty != 0.0 {
+            body["presence_penalty"] = serde_json::json!(params.presence_penalty);
+        }
+        if let Some(seed) = params.seed {
+            body["seed"] = serde_json::json!(seed);
+        }
+        // OpenAI o-series / reasoning-capable cloud APIs take levels only.
+        if let Some(ref effort) = params.reasoning_effort
+            && matches!(effort.as_str(), "low" | "medium" | "high")
+        {
+            body["reasoning_effort"] = serde_json::json!(effort);
+        }
+        body
+    } else {
+        let mut body = serde_json::json!({
+            "model": model,
+            "messages": api_messages,
+            "stream": true,
+        });
+        if agentic {
+            body["tools"] = serde_json::json!(get_tool_definitions());
+        }
+        let mut options = serde_json::json!({});
+        options["temperature"] = serde_json::json!(params.temperature);
+        options["top_p"] = serde_json::json!(params.top_p);
+        if params.top_k > 0 {
+            options["top_k"] = serde_json::json!(params.top_k);
+        }
+        if params.frequency_penalty != 0.0 {
+            options["frequency_penalty"] = serde_json::json!(params.frequency_penalty);
+        }
+        if params.presence_penalty != 0.0 {
+            options["presence_penalty"] = serde_json::json!(params.presence_penalty);
+        }
+        if let Some(seed) = params.seed {
+            options["seed"] = serde_json::json!(seed);
+        }
+        if let Some(num_predict) = params.max_output_tokens {
+            options["num_predict"] = serde_json::json!(num_predict);
+        }
+        body["options"] = options;
+        // Ollama `think`: bool toggle, or a level string for models
+        // that support graded thinking (e.g. gpt-oss).
+        match params.reasoning_effort.as_deref() {
+            Some("off" | "none" | "false") => {
+                body["think"] = serde_json::json!(false);
+            }
+            Some("on" | "true") => {
+                body["think"] = serde_json::json!(true);
+            }
+            Some(level @ ("low" | "medium" | "high")) => {
+                body["think"] = serde_json::json!(level);
+            }
+            _ => {}
+        }
+        body
+    }
+}
+
 /// Shared HTTP-send + SSE/Ollama-JSON stream-parse machinery.
 ///
 /// Sends `api_messages` to the cloud or Ollama chat endpoint (with tools
@@ -5214,9 +5395,7 @@ fn stream_chat_request(
     is_logging: bool,
     log_file: String,
     session_id: String,
-    temperature: f64,
-    top_p: f64,
-    top_k: u32,
+    params: ModelParams,
     proxy: Option<String>,
     max_retries: u32,
 ) -> mpsc::Receiver<StreamChunk> {
@@ -5231,16 +5410,8 @@ fn stream_chat_request(
         rt.block_on(async {
             let client = build_reqwest_client(&proxy);
 
-            let (api_url, headers, body) = if let Some(ref cloud) = cloud_model {
-                let mut body = serde_json::json!({
-                    "model": cloud.api_model,
-                    "messages": api_messages,
-                    "stream": true,
-                    "max_tokens": cloud.max_output_tokens,
-                });
-                body["tools"] = serde_json::json!(get_tool_definitions());
-                body["temperature"] = serde_json::json!(temperature);
-                body["top_p"] = serde_json::json!(top_p);
+            let body = build_chat_body(&model, cloud_model.as_ref(), agentic, &api_messages, &params);
+            let (api_url, headers) = if let Some(ref cloud) = cloud_model {
                 let mut headers = reqwest::header::HeaderMap::new();
                 headers.insert(
                     "Authorization",
@@ -5250,24 +5421,9 @@ fn stream_chat_request(
                     "Content-Type",
                     reqwest::header::HeaderValue::from_static("application/json"),
                 );
-                (cloud.api_url.clone(), Some(headers), body)
+                (cloud.api_url.clone(), Some(headers))
             } else {
-                let mut body = serde_json::json!({
-                    "model": model,
-                    "messages": api_messages,
-                    "stream": true,
-                });
-                if agentic {
-                    body["tools"] = serde_json::json!(get_tool_definitions());
-                }
-                let mut options = serde_json::json!({});
-                options["temperature"] = serde_json::json!(temperature);
-                options["top_p"] = serde_json::json!(top_p);
-                if top_k > 0 {
-                    options["top_k"] = serde_json::json!(top_k);
-                }
-                body["options"] = options;
-                (format!("{}/api/chat", url), None, body)
+                (format!("{}/api/chat", url), None)
             };
 
             log_to_file(is_logging, &log_file, &session_id, "REQUEST", &format!("{} {}", api_url, serde_json::to_string(&body).unwrap_or_default()));
@@ -5451,4 +5607,130 @@ fn stream_chat_request(
     });
 
     rx
+}
+
+#[cfg(test)]
+mod chat_body_tests {
+    use super::*;
+
+    fn msgs() -> Vec<serde_json::Value> {
+        vec![serde_json::json!({"role": "user", "content": "hi"})]
+    }
+
+    fn cloud() -> CloudModel {
+        CloudModel {
+            name: "test-cloud".to_string(),
+            api_url: "https://example.com/v1/chat/completions".to_string(),
+            api_key: "sk-test".to_string(),
+            api_model: "test-cloud".to_string(),
+            params: ModelParams::default(),
+        }
+    }
+
+    #[test]
+    fn ollama_body_carries_all_params() {
+        let params = ModelParams {
+            temperature: 0.7,
+            top_p: 0.8,
+            top_k: 20,
+            frequency_penalty: 0.5,
+            presence_penalty: -0.5,
+            max_output_tokens: Some(4096),
+            reasoning_effort: Some("high".to_string()),
+            seed: Some(42),
+        };
+        let body = build_chat_body("llama3.2:3b", None, true, &msgs(), &params);
+        assert_eq!(body["model"], "llama3.2:3b");
+        let o = &body["options"];
+        assert_eq!(o["temperature"], 0.7);
+        assert_eq!(o["top_p"], 0.8);
+        assert_eq!(o["top_k"], 20);
+        assert_eq!(o["frequency_penalty"], 0.5);
+        assert_eq!(o["presence_penalty"], -0.5);
+        assert_eq!(o["num_predict"], 4096);
+        assert_eq!(o["seed"], 42);
+        assert_eq!(body["think"], "high");
+        assert!(body["tools"].is_array(), "agentic attaches tools");
+    }
+
+    #[test]
+    fn ollama_body_defaults_send_only_basics() {
+        let params = ModelParams::default();
+        let body = build_chat_body("m", None, false, &msgs(), &params);
+        let o = &body["options"];
+        assert_eq!(o["temperature"], 1.0);
+        assert_eq!(o["top_p"], 0.9);
+        assert_eq!(o["top_k"], 40);
+        assert!(o.get("frequency_penalty").is_none());
+        assert!(o.get("presence_penalty").is_none());
+        assert!(o.get("seed").is_none());
+        assert!(o.get("num_predict").is_none());
+        assert!(body.get("think").is_none());
+        assert!(body.get("tools").is_none(), "non-agentic: no tools");
+    }
+
+    #[test]
+    fn ollama_think_bool_mapping() {
+        let mut params = ModelParams::default();
+        params.reasoning_effort = Some("off".to_string());
+        assert_eq!(
+            build_chat_body("m", None, false, &msgs(), &params)["think"],
+            false
+        );
+        params.reasoning_effort = Some("on".to_string());
+        assert_eq!(
+            build_chat_body("m", None, false, &msgs(), &params)["think"],
+            true
+        );
+        params.reasoning_effort = Some("low".to_string());
+        assert_eq!(
+            build_chat_body("m", None, false, &msgs(), &params)["think"],
+            "low"
+        );
+    }
+
+    #[test]
+    fn cloud_body_carries_openai_fields() {
+        let cloud = cloud();
+        let params = ModelParams {
+            temperature: 0.6,
+            top_p: 0.95,
+            top_k: 10, // not an OpenAI concept — must not be sent
+            frequency_penalty: 0.3,
+            presence_penalty: 0.1,
+            max_output_tokens: Some(8192),
+            reasoning_effort: Some("medium".to_string()),
+            seed: Some(7),
+        };
+        let body = build_chat_body("test-cloud", Some(&cloud), true, &msgs(), &params);
+        assert_eq!(body["model"], "test-cloud");
+        assert_eq!(body["temperature"], 0.6);
+        assert_eq!(body["top_p"], 0.95);
+        assert_eq!(body["frequency_penalty"], 0.3);
+        assert_eq!(body["presence_penalty"], 0.1);
+        assert_eq!(body["max_tokens"], 8192);
+        assert_eq!(body["seed"], 7);
+        assert_eq!(body["reasoning_effort"], "medium");
+        assert!(body.get("top_k").is_none());
+        assert!(body.get("options").is_none());
+        assert!(body.get("think").is_none());
+        assert!(body["tools"].is_array());
+    }
+
+    #[test]
+    fn cloud_body_skips_unset_and_toggle_effort() {
+        let cloud = cloud();
+        let mut params = ModelParams::default();
+        let body = build_chat_body("test-cloud", Some(&cloud), true, &msgs(), &params);
+        assert!(body.get("max_tokens").is_none());
+        assert!(body.get("frequency_penalty").is_none());
+        assert!(body.get("presence_penalty").is_none());
+        assert!(body.get("seed").is_none());
+        assert!(body.get("reasoning_effort").is_none());
+
+        // "off"/"on" are toggles, not levels — cloud APIs reject them.
+        params.reasoning_effort = Some("off".to_string());
+        let body = build_chat_body("test-cloud", Some(&cloud), true, &msgs(), &params);
+        assert!(body.get("reasoning_effort").is_none());
+    }
 }

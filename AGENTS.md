@@ -41,7 +41,7 @@ This is the largest module. Key components:
 
 - **Data Types**: `App` (main state), `ChatMessage` (8 variants: User, Assistant, System, App, Thinking, FileContent, ToolCall, ToolResult), `InputMode` (Normal/Input/Menu), `Focus` (Output/Input), `StreamChunk` (Text/Thinking/Done/Error/ToolCalls).
 - **Input Handling**: Three modes — Normal (vim-like navigation), Input (text entry with Ctrl+C/V, Tab for model completion), Menu (arrow key navigation). Dialog-specific handlers for model selector, file browser, save/load.
-- **Slash Commands**: ~20 commands (`/help`, `/model`, `/use`, `/list`, `/tools`, `/config`, `/setsystem`, `/temp`, `/topp`, `/topk`, `/maxrounds`, `/session save|rename|load`, `/status`, `/log`, `/quit`).
+- **Slash Commands**: ~25 commands (`/help`, `/model`, `/use`, `/list`, `/tools`, `/config`, `/setsystem`, `/temp`, `/topp`, `/topk`, `/fpen`, `/ppen`, `/effort`, `/maxtokens`, `/seed`, `/maxrounds`, `/session save|rename|load`, `/status`, `/log`, `/quit`). Slash-command parameter changes are session-only; the Settings dialog (F9 → Settings) persists them to the current model's config section via `save_config()`.
 - **AI Communication**: `send_to_ollama_async()` and `send_tool_results_async()` spawn background OS threads with their own single-threaded tokio runtime. Streams are parsed line-by-line (Ollama JSON or OpenAI SSE format) and chunks are sent back via `mpsc::channel`.
 - **Agentic Tool System**: 13 tools — file ops (`read_file`, `write_file`, `edit_file`), `bash`, `list_files`, `search_files`, `search_content`, `fetch_url`, `web_search`, and 4 terminal tools (`terminal_open/send/read/close`). Tool call loop with configurable `max_tool_rounds` (default: 10). Two paths: native function calling and text-based JSON parsing fallback. **Auto-continue heuristic**: some cloud models (Kimi-K3) emit `finish_reason="stop"` right after a transitional sentence ("Let me run X:") instead of the announced tool call; `needs_continuation()` detects the unfinished-looking text and the `Done` handler auto-sends "continue" (cap `MAX_AUTO_CONTINUES = 10` per turn, reset on fresh user input).
 - **Session Management**: JSON files at `~/.config/rustama/<session_id>.session.rustama`.
@@ -53,6 +53,11 @@ This is the largest module. Key components:
 - `~/.config/rustama/rustama.conf` — main config (`ollama_url`, `model`, `save_path`, `agentic`, `timeout_secs`, `logging`, `logfile`, `system_prompt`).
 - `~/.config/rustama/cloud_models.conf` — cloud model definitions with `api_url`, `api_key`, `api_model`. Ships with Mistral Small preconfigured.
 - Boolean parsing supports English (true/yes/on/1) and Hungarian (igen).
+- **Per-model parameters**: `ModelParams` (temperature, top_p, top_k, frequency_penalty, presence_penalty, max_output_tokens, reasoning_effort, seed) is configured per model, not globally:
+  - Cloud models: parsed from the model's section in `cloud_models.conf` (max_output_tokens defaults to 16384 there).
+  - Ollama models: `~/.config/rustama/model_params.conf` with a `[default]` section (base for all models) and per-model `[model-name]` override sections. Legacy global temperature/top_p/top_k keys from `rustama.conf` are migrated into `[default]` on first run.
+  - `save_model_params()` rewrites a section in place via `update_ini_section()` (preserves comments/other sections).
+  - Request translation: cloud bodies get OpenAI-style fields (`max_tokens`, `reasoning_effort` levels only); Ollama bodies get `options.*` (`num_predict`, `seed`, penalties) plus top-level `think` (bool or low/medium/high level) — see `build_chat_body()` in app.rs.
 
 ### UI Widgets (`ui.rs`)
 
