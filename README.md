@@ -54,7 +54,8 @@ Rustama uses INI-style configuration files stored in `~/.config/rustama/`. On fi
 | `rustama.conf` | Main application settings |
 | `model_params.conf` | Per-model sampling parameters for Ollama models |
 | `cloud_models.conf` | Cloud model definitions + their parameters |
-| `<session_id>.session.rustama` | Saved sessions (JSON) |
+
+Session files live separately in `$DOCUMENTS/rustama/` (see [Session Files](#session-files)).
 
 ### Main Configuration: `~/.config/rustama/rustama.conf`
 
@@ -311,7 +312,7 @@ The agentic loop continues until the model stops making tool calls or `max_tool_
 
 ## Session Files
 
-Sessions are stored as JSON in `~/.config/rustama/<session_id>.session.rustama`. Use the save/load dialogs, the File menu, or `/session` commands to manage them.
+Sessions are stored as JSON in `$DOCUMENTS/rustama/<session_id>.session.rustama`, where `$DOCUMENTS` is resolved via `xdg-user-dir DOCUMENTS` (falling back to `~/rustama` when XDG user dirs are unavailable). Use the save/load dialogs, the File menu, or `/session` commands to manage them.
 
 ## License
 

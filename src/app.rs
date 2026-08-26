@@ -1876,8 +1876,7 @@ impl App {
     }
 
     fn open_save_dialog(&mut self) {
-        let default_path = dirs_home()
-            .join(".config/rustama")
+        let default_path = sessions_dir()
             .join(format!("{}.session.rustama", self.session_name))
             .to_string_lossy()
             .to_string();
@@ -1941,7 +1940,7 @@ impl App {
     }
 
     pub fn save_session(&self) -> Result<(), String> {
-        let sessions_dir = dirs_home().join(".config/rustama");
+        let sessions_dir = sessions_dir();
         std::fs::create_dir_all(&sessions_dir).map_err(|e| e.to_string())?;
         let path = sessions_dir.join(format!("{}.session.rustama", self.session_name));
         let data = serde_json::json!({
@@ -1955,7 +1954,7 @@ impl App {
     }
 
     pub fn load_session(&mut self, sess_id: &str) -> Result<(), String> {
-        let sessions_dir = dirs_home().join(".config/rustama");
+        let sessions_dir = sessions_dir();
         let path = sessions_dir.join(format!("{}.session.rustama", sess_id));
         let json =
             std::fs::read_to_string(&path).map_err(|e| format!("Session not found: {}", e))?;
@@ -1976,7 +1975,7 @@ impl App {
 
     fn open_load_session_dialog(&mut self) {
         self.file_dialog_mode = FileDialogMode::LoadSession;
-        self.file_dialog_path = dirs_home().join(".config/rustama");
+        self.file_dialog_path = sessions_dir();
         self.file_dialog_entries.clear();
         self.file_dialog_selection = 0;
         self.file_dialog_scroll = 0;
@@ -4053,6 +4052,72 @@ fn dirs_home() -> PathBuf {
     std::env::var("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("."))
+}
+
+/// Default directory for storing and loading session files.
+///
+/// Resolves to `<DOCUMENTS>/rustama` where `<DOCUMENTS>` comes from
+/// `xdg-user-dir DOCUMENTS` (XDG user dirs). Falls back to `~/rustama`
+/// when the tool is missing, fails, or returns an empty/non-absolute path.
+fn sessions_dir() -> PathBuf {
+    if let Some(docs) = xdg_documents_dir() {
+        return docs.join("rustama");
+    }
+    dirs_home().join("rustama")
+}
+
+/// Runs `xdg-user-dir DOCUMENTS` and returns the parsed directory.
+fn xdg_documents_dir() -> Option<PathBuf> {
+    let output = std::process::Command::new("xdg-user-dir")
+        .arg("DOCUMENTS")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if path.is_empty() {
+        return None;
+    }
+    let path = PathBuf::from(path);
+    // xdg-user-dir prints $HOME when the dir is not configured; an
+    // absolute path is the only thing we can sanity-check here.
+    if path.is_absolute() { Some(path) } else { None }
+}
+
+#[cfg(test)]
+mod sessions_dir_tests {
+    use super::*;
+
+    #[test]
+    fn sessions_dir_ends_with_rustama() {
+        let dir = sessions_dir();
+        assert_eq!(dir.file_name().unwrap().to_string_lossy(), "rustama");
+    }
+
+    #[test]
+    fn sessions_dir_is_absolute() {
+        assert!(sessions_dir().is_absolute());
+    }
+
+    #[test]
+    fn xdg_documents_dir_returns_absolute_path_or_none() {
+        if let Some(docs) = xdg_documents_dir() {
+            assert!(docs.is_absolute());
+        }
+    }
+
+    #[test]
+    fn sessions_dir_prefers_documents_when_available() {
+        // When xdg-user-dir works, sessions live under <DOCUMENTS>/rustama;
+        // otherwise under ~/rustama.
+        let dir = sessions_dir();
+        if let Some(docs) = xdg_documents_dir() {
+            assert_eq!(dir, docs.join("rustama"));
+        } else {
+            assert_eq!(dir, dirs_home().join("rustama"));
+        }
+    }
 }
 
 /// Resolves the effective generation parameters for a model: cloud models
