@@ -158,6 +158,44 @@ impl ModelParams {
     }
 }
 
+/// Per-token pricing for a cloud model, in USD per 1M tokens.
+///
+/// All fields optional: models without pricing simply show token counts
+/// without a cost estimate. `cache_write` covers providers that charge
+/// extra for cache creation (Anthropic); most providers only discount
+/// cached *reads*.
+#[derive(Debug, Clone, Default)]
+pub struct ModelPricing {
+    pub input_per_mtok: Option<f64>,
+    pub output_per_mtok: Option<f64>,
+    pub cached_read_per_mtok: Option<f64>,
+    pub cache_write_per_mtok: Option<f64>,
+}
+
+impl ModelPricing {
+    pub fn is_configured(&self) -> bool {
+        self.input_per_mtok.is_some() || self.output_per_mtok.is_some()
+    }
+
+    /// Cost in USD for one request's usage. Cached-read tokens are billed
+    /// at the cached rate when set, otherwise at the plain input rate
+    /// (they are part of prompt_tokens already — never double-counted).
+    pub fn cost(&self, input: u64, output: u64, cached_read: u64) -> Option<f64> {
+        if !self.is_configured() {
+            return None;
+        }
+        let per_m = |rate: Option<f64>, tokens: u64| rate.unwrap_or(0.0) * tokens as f64 / 1e6;
+        let cached = cached_read.min(input);
+        let fresh_input = input - cached;
+        let cached_rate = self.cached_read_per_mtok.or(self.input_per_mtok);
+        Some(
+            per_m(self.input_per_mtok, fresh_input)
+                + per_m(cached_rate, cached)
+                + per_m(self.output_per_mtok, output),
+        )
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CloudModel {
     pub name: String,
@@ -165,6 +203,7 @@ pub struct CloudModel {
     pub api_key: String,
     pub api_model: String,
     pub params: ModelParams,
+    pub pricing: ModelPricing,
 }
 
 impl Default for Config {
@@ -452,6 +491,8 @@ fn default_cloud_conf() -> String {
      # Optional model parameters: temperature (1.0), top_p (0.9), top_k (40),\n\
      #   frequency_penalty (0.0), presence_penalty (0.0),\n\
      #   reasoning_effort (low/medium/high/on/off), seed\n\
+     # Optional pricing in USD per 1M tokens (enables cost estimate):\n\
+     #   price_input, price_output, price_cached_read, price_cache_write\n\
      \n\
      [mistral-small]\n\
      api_url = https://api.mistral.ai/v1/chat/completions\n\
@@ -468,6 +509,85 @@ fn default_cloud_conf() -> String {
 /// A key left at its shipped placeholder (`YOUR_...`) counts as "not configured".
 fn is_placeholder_key(key: &str) -> bool {
     key.starts_with("YOUR_")
+}
+
+#[cfg(test)]
+mod pricing_tests {
+    use super::*;
+
+    fn priced() -> ModelPricing {
+        ModelPricing {
+            input_per_mtok: Some(3.0),
+            output_per_mtok: Some(15.0),
+            cached_read_per_mtok: Some(0.30),
+            cache_write_per_mtok: None,
+        }
+    }
+
+    #[test]
+    fn cost_splits_cached_from_fresh_input() {
+        // 1M input of which 500k cached, 100k output:
+        // 500k * $3 + 500k * $0.30 + 100k * $15 = 1.50 + 0.15 + 1.50
+        let c = priced().cost(1_000_000, 100_000, 500_000).unwrap();
+        assert!((c - 3.15).abs() < 1e-9, "got {}", c);
+    }
+
+    #[test]
+    fn cost_without_cached_rate_bills_input_rate() {
+        let mut p = priced();
+        p.cached_read_per_mtok = None;
+        // cached tokens fall back to the plain input rate.
+        let c = p.cost(1_000_000, 0, 400_000).unwrap();
+        assert!((c - 3.0).abs() < 1e-9, "got {}", c);
+    }
+
+    #[test]
+    fn cost_never_double_counts_cached() {
+        // cached > input must not produce negative fresh input.
+        let c = priced().cost(100, 0, 500).unwrap();
+        let cached_only = 0.30 * 100.0 / 1e6;
+        assert!((c - cached_only).abs() < 1e-12, "got {}", c);
+    }
+
+    #[test]
+    fn unconfigured_pricing_yields_none() {
+        assert!(ModelPricing::default().cost(1, 1, 1).is_none());
+        assert!(!ModelPricing::default().is_configured());
+    }
+
+    #[test]
+    fn parses_pricing_keys() {
+        let conf = "[m]\n\
+                    api_url = https://x\n\
+                    api_key = sk-real\n\
+                    price_input = 3.0\n\
+                    price_output = 15\n\
+                    price_cached_read = 0.3\n\
+                    price_cache_write = 3.75\n";
+        let models = parse_cloud_models(conf, &ModelParams::default());
+        assert_eq!(models.len(), 1);
+        let p = &models[0].pricing;
+        assert_eq!(p.input_per_mtok, Some(3.0));
+        assert_eq!(p.output_per_mtok, Some(15.0));
+        assert_eq!(p.cached_read_per_mtok, Some(0.3));
+        assert_eq!(p.cache_write_per_mtok, Some(3.75));
+        assert!(p.is_configured());
+    }
+
+    #[test]
+    fn pricing_optional_and_defaulted() {
+        let conf = "[m]\napi_url = https://x\napi_key = sk-real\n";
+        let models = parse_cloud_models(conf, &ModelParams::default());
+        assert_eq!(models.len(), 1);
+        assert!(!models[0].pricing.is_configured());
+        assert_eq!(models[0].cost_check(), None);
+    }
+
+    impl CloudModel {
+        fn cost_check(&self) -> Option<f64> {
+            self.pricing.cost(1, 1, 1)
+        }
+    }
 }
 
 /// Default max_tokens for cloud models when the section does not say
@@ -488,6 +608,7 @@ fn parse_cloud_models(content: &str, base: &ModelParams) -> Vec<CloudModel> {
     let mut current_key = String::new();
     let mut current_api_model = String::new();
     let mut current_params = cloud_params_default(base);
+    let mut current_pricing = ModelPricing::default();
 
     for line in content.lines() {
         let line = line.trim();
@@ -512,6 +633,7 @@ fn parse_cloud_models(content: &str, base: &ModelParams) -> Vec<CloudModel> {
                     api_key: current_key.clone(),
                     api_model,
                     params: current_params.clone(),
+                    pricing: current_pricing.clone(),
                 });
             }
             current_name = Some(line[1..line.len() - 1].trim().to_string());
@@ -519,6 +641,7 @@ fn parse_cloud_models(content: &str, base: &ModelParams) -> Vec<CloudModel> {
             current_key.clear();
             current_api_model.clear();
             current_params = cloud_params_default(base);
+            current_pricing = ModelPricing::default();
         } else if let Some((key, value)) = line.split_once('=') {
             let key = key.trim().to_lowercase();
             let value = value.trim().to_string();
@@ -526,6 +649,18 @@ fn parse_cloud_models(content: &str, base: &ModelParams) -> Vec<CloudModel> {
                 "api_url" => current_url = value,
                 "api_key" => current_key = value,
                 "api_model" => current_api_model = value,
+                "price_input" | "input_price" => {
+                    current_pricing.input_per_mtok = value.parse().ok();
+                }
+                "price_output" | "output_price" => {
+                    current_pricing.output_per_mtok = value.parse().ok();
+                }
+                "price_cached_read" | "cached_read_price" | "price_cached" => {
+                    current_pricing.cached_read_per_mtok = value.parse().ok();
+                }
+                "price_cache_write" | "cache_write_price" => {
+                    current_pricing.cache_write_per_mtok = value.parse().ok();
+                }
                 _ => {
                     current_params.apply_key(&key, &value);
                 }
@@ -549,6 +684,7 @@ fn parse_cloud_models(content: &str, base: &ModelParams) -> Vec<CloudModel> {
             api_key: current_key,
             api_model,
             params: current_params,
+            pricing: current_pricing,
         });
     }
 

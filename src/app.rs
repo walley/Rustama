@@ -174,6 +174,22 @@ pub struct TokenStats {
     pub tokens_per_sec: f64,
 }
 
+impl TokenStats {
+    /// Sums another request's usage into `self` (session totals).
+    /// Rates are meaningless once summed, so they are not accumulated.
+    fn accumulate(&mut self, other: &TokenStats) {
+        self.prompt_tokens += other.prompt_tokens;
+        self.response_tokens += other.response_tokens;
+        self.cached_tokens += other.cached_tokens;
+        self.reasoning_tokens += other.reasoning_tokens;
+        self.total_duration_ms += other.total_duration_ms;
+    }
+
+    fn has_usage(&self) -> bool {
+        self.prompt_tokens > 0 || self.response_tokens > 0
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum StreamChunk {
     Text(String),
@@ -829,6 +845,10 @@ pub struct App {
     pub is_logging: bool,
     pub log_file: String,
     pub token_stats: TokenStats,
+    /// Cumulative token usage across every completed request of this
+    /// session (token_stats alone only holds the last response). Feeds
+    /// the cost estimate.
+    pub session_usage: TokenStats,
     pub cloud_models: Vec<CloudModel>,
     pub system_prompt: String,
     pub export_format: ExportFormat,
@@ -952,6 +972,7 @@ impl App {
             is_logging: cfg.logging,
             log_file: cfg.logfile,
             token_stats: TokenStats::default(),
+            session_usage: TokenStats::default(),
             cloud_models,
             system_prompt: cfg.system_prompt.clone(),
             export_format: ExportFormat::Markdown,
@@ -1533,9 +1554,9 @@ impl App {
                         // The finish chunk carried usage (sent as Stats): commit it.
                         // Token info is rendered in the status bar's own token slot,
                         // never in the message slot.
-                        if self.last_stats.prompt_tokens > 0 || self.last_stats.response_tokens > 0
-                        {
+                        if self.last_stats.has_usage() {
                             self.token_stats = self.last_stats.clone();
+                            self.session_usage.accumulate(&self.last_stats);
                         }
                         self.response_rx = None;
                         self.tool_round_count += 1;
@@ -1554,11 +1575,12 @@ impl App {
                         self.retrying = false;
                         // A bare `[DONE]` sentinel or stream close reports default
                         // stats; keep the ones received earlier via Stats.
-                        self.token_stats = if stats.prompt_tokens > 0 || stats.response_tokens > 0 {
+                        self.token_stats = if stats.has_usage() {
                             stats
                         } else {
                             self.last_stats.clone()
                         };
+                        self.session_usage.accumulate(&self.token_stats);
 
                         // If Truncated already committed the partial text, handle continuation
                         if self.pending_continuation {
@@ -3724,6 +3746,7 @@ impl App {
                 },
             }),
             "status" => Some(self.slash_status()),
+            "usage" | "cost" | "price" => Some(self.slash_usage()),
             "system" => Some(self.slash_system()),
             "setsystem" => Some(self.slash_setsystem(arg)),
             "session" => Some(match arg {
@@ -3804,6 +3827,7 @@ impl App {
             ("/session load <name>", "Load a session by name"),
             ("/justify", "Toggle paragraph justification"),
             ("/status", "Show app status"),
+            ("/usage", "Session token usage & cost estimate"),
             ("/quit", "Exit the app"),
             ("/q", "Exit the app"),
             ("/exit", "Exit the app"),
@@ -3998,6 +4022,40 @@ impl App {
         )
     }
 
+    /// "/status" line for usage & cost: session totals plus the
+    /// estimated price when the current model has pricing configured.
+    fn slash_usage(&self) -> String {
+        let pricing_note = match self
+            .cloud_models
+            .iter()
+            .find(|m| m.name == self.model_name)
+        {
+            Some(m) if m.pricing.is_configured() => {
+                let p = &m.pricing;
+                let fmt = |v: Option<f64>| {
+                    v.map(|r| format!("${}/M", r))
+                        .unwrap_or_else(|| "-".to_string())
+                };
+                format!(
+                    "rates in/out/cached: {}/{}/{}",
+                    fmt(p.input_per_mtok),
+                    fmt(p.output_per_mtok),
+                    fmt(p.cached_read_per_mtok)
+                )
+            }
+            Some(_) => "cloud model, no pricing configured".to_string(),
+            None => "local model (free)".to_string(),
+        };
+        format!(
+            "Usage (session):\n  {}\n  Cost estimate: {}\n  Pricing:       {}",
+            self.format_session_usage(),
+            self.session_cost()
+                .map(|c| format!("${:.4}", c))
+                .unwrap_or_else(|| "n/a".to_string()),
+            pricing_note,
+        )
+    }
+
     fn slash_system(&self) -> String {
         if self.system_prompt.is_empty() {
             "No system prompt set. Use /setsystem <prompt> to set one.".to_string()
@@ -4072,10 +4130,57 @@ impl App {
             parts.push(format!("{:.1} tok/s", s.tokens_per_sec));
         }
 
+        // Running session cost once the model has pricing configured and
+        // at least one request completed.
+        if let Some(cost) = self.session_cost()
+            && self.session_usage.has_usage()
+        {
+            parts.push(format!("~${:.4}", cost));
+        }
+
         if parts.is_empty() {
             return String::new();
         }
         format!("Tokens: {}", parts.join(" | "))
+    }
+
+    /// Estimated cost of the whole session in USD, from the cumulative
+    /// usage and the current model's configured pricing. `None` for
+    /// Ollama (local, free) and for cloud models without pricing.
+    pub fn session_cost(&self) -> Option<f64> {
+        let cloud = self
+            .cloud_models
+            .iter()
+            .find(|m| m.name == self.model_name)?;
+        let u = &self.session_usage;
+        cloud
+            .pricing
+            .cost(u.prompt_tokens, u.response_tokens, u.cached_tokens)
+    }
+
+    /// Human-readable session totals, e.g. for /status:
+    /// `session: 120.5k in (98.0k cached) | 4.2k out | $0.0123`
+    pub fn format_session_usage(&self) -> String {
+        let u = &self.session_usage;
+        if !u.has_usage() {
+            return "no usage yet".to_string();
+        }
+        let k = |n: u64| {
+            if n >= 1000 {
+                format!("{:.1}k", n as f64 / 1000.0)
+            } else {
+                n.to_string()
+            }
+        };
+        let mut s = format!("{} in", k(u.prompt_tokens));
+        if u.cached_tokens > 0 {
+            s.push_str(&format!(" ({} cached)", k(u.cached_tokens)));
+        }
+        s.push_str(&format!(" | {} out", k(u.response_tokens)));
+        if let Some(cost) = self.session_cost() {
+            s.push_str(&format!(" | ${:.4}", cost));
+        }
+        s
     }
 }
 
@@ -4177,6 +4282,90 @@ fn parse_usage_stats(json: &serde_json::Value) -> TokenStats {
 #[cfg(test)]
 mod usage_tests {
     use super::*;
+
+    fn test_app() -> App {
+        let cfg = crate::config::Config {
+            logging: false,
+            logfile: std::env::temp_dir()
+                .join(format!("rustama-test-{}.log", std::process::id()))
+                .to_string_lossy()
+                .to_string(),
+            ..crate::config::Config::default()
+        };
+        App::new(cfg)
+    }
+
+    #[test]
+    fn accumulate_sums_token_fields() {
+        let mut total = TokenStats {
+            prompt_tokens: 100,
+            response_tokens: 10,
+            cached_tokens: 50,
+            reasoning_tokens: 5,
+            total_duration_ms: 1000,
+            tokens_per_sec: 20.0,
+        };
+        let req = TokenStats {
+            prompt_tokens: 200,
+            response_tokens: 20,
+            cached_tokens: 60,
+            reasoning_tokens: 7,
+            total_duration_ms: 500,
+            tokens_per_sec: 40.0,
+        };
+        total.accumulate(&req);
+        assert_eq!(total.prompt_tokens, 300);
+        assert_eq!(total.response_tokens, 30);
+        assert_eq!(total.cached_tokens, 110);
+        assert_eq!(total.reasoning_tokens, 12);
+        assert_eq!(total.total_duration_ms, 1500);
+        // Rates are not summable — left untouched.
+        assert_eq!(total.tokens_per_sec, 20.0);
+        assert!(total.has_usage());
+        assert!(!TokenStats::default().has_usage());
+    }
+
+    #[test]
+    fn session_cost_uses_current_model_pricing() {
+        use crate::config::{CloudModel, ModelParams, ModelPricing};
+        let mut app = test_app();
+        app.session_usage = TokenStats {
+            prompt_tokens: 2_000_000,
+            response_tokens: 100_000,
+            cached_tokens: 1_000_000,
+            ..TokenStats::default()
+        };
+        // Local model: no cost.
+        assert_eq!(app.session_cost(), None);
+        app.cloud_models.push(CloudModel {
+            name: app.model_name.clone(),
+            api_url: "https://x".to_string(),
+            api_key: "sk".to_string(),
+            api_model: "m".to_string(),
+            params: ModelParams::default(),
+            pricing: ModelPricing {
+                input_per_mtok: Some(3.0),
+                output_per_mtok: Some(15.0),
+                cached_read_per_mtok: Some(0.30),
+                cache_write_per_mtok: None,
+            },
+        });
+        // 1M fresh in * $3 + 1M cached * $0.30 + 100k out * $15
+        // = 3.0 + 0.3 + 1.5 = 4.8
+        let c = app.session_cost().unwrap();
+        assert!((c - 4.8).abs() < 1e-9, "got {}", c);
+        let s = app.format_session_usage();
+        assert!(s.contains("2000.0k in"), "{}", s);
+        assert!(s.contains("1000.0k cached"), "{}", s);
+        assert!(s.contains("100.0k out"), "{}", s);
+        assert!(s.contains("$4.8000"), "{}", s);
+    }
+
+    #[test]
+    fn session_usage_formats_empty() {
+        let app = test_app();
+        assert_eq!(app.format_session_usage(), "no usage yet");
+    }
 
     #[test]
     fn usage_top_level_openai_style() {
@@ -6464,6 +6653,7 @@ mod chat_body_tests {
             api_key: "sk-test".to_string(),
             api_model: "test-cloud".to_string(),
             params: ModelParams::default(),
+            pricing: crate::config::ModelPricing::default(),
         }
     }
 
