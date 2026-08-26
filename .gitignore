@@ -13,6 +13,12 @@ target
 # Contains mutation testing data
 **/mutants.out*/
 
+# Rustama log files and their numbered rotations (rustama.log, rustama.log.0-999)
+*log
+*log.[0-9]
+*log.[0-9][0-9]
+*log.[0-9][0-9][0-9]
+
 # RustRover
 #  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
 #  be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore
