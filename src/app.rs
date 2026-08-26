@@ -11,7 +11,6 @@ use ratatui_textarea::TextArea;
 use serde::{Deserialize, Serialize};
 use std::io::Read;
 use std::path::PathBuf;
-use std::process::{Child, Stdio};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
 
@@ -31,6 +30,9 @@ pub enum InputMode {
 pub enum Focus {
     Output,
     Input,
+    /// Keyboard focus is on the embedded terminal: every key is forwarded
+    /// to the PTY (except Ctrl+G, which leaves this mode).
+    Terminal,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -188,11 +190,24 @@ pub enum StreamChunk {
     Stats(TokenStats),
 }
 
-const TERMINAL_BUFFER_MAX: usize = 102400;
+const TERMINAL_RAW_LOG_MAX: usize = 256 * 1024;
 
+/// Raw output log of the PTY. Kept alongside the vt100 screen state so the
+/// model-facing `terminal_read` tool keeps its cursor-based incremental read
+/// API (the vt100 screen alone cannot provide a stable byte cursor).
+///
+/// The cursor counts *characters*, not bytes: the PTY stream contains ANSI
+/// escapes and multibyte UTF-8, and a byte-accurate cursor would require
+/// either storing raw bytes (breaking the string API) or risking
+/// mid-codepoint splits. Char-based cursors keep every offset a valid
+/// boundary by construction.
 pub struct TerminalBuffer {
+    /// Raw output received from the PTY (ANSI escapes included), drained
+    /// from the front when it exceeds [`TERMINAL_RAW_LOG_MAX`] chars.
     pub content: String,
+    /// Total chars ever written (monotonic cursor).
     pub total_bytes_written: u64,
+    /// Chars discarded from the front of `content` so far.
     pub buffer_start_offset: u64,
 }
 
@@ -205,17 +220,52 @@ impl TerminalBuffer {
         }
     }
 
+    fn push(&mut self, text: &str) {
+        let chars = text.chars().count() as u64;
+        self.total_bytes_written += chars;
+        self.content.push_str(text);
+        let len = self.content.chars().count() as u64;
+        if len as usize > TERMINAL_RAW_LOG_MAX {
+            let drain_to = (len as usize) - TERMINAL_RAW_LOG_MAX / 2;
+            let byte_idx = self
+                .content
+                .char_indices()
+                .nth(drain_to)
+                .map_or(self.content.len(), |(i, _)| i);
+            self.buffer_start_offset += drain_to as u64;
+            self.content = self.content.split_off(byte_idx);
+        }
+    }
+
+    /// Char offset → byte index (always on a char boundary, clamped).
+    fn byte_idx(&self, char_off: usize) -> usize {
+        self.content
+            .char_indices()
+            .nth(char_off)
+            .map_or(self.content.len(), |(i, _)| i)
+    }
+
     pub fn read_incremental(&self, cursor: Option<u64>) -> serde_json::Value {
         let total = self.total_bytes_written;
         let start = self.buffer_start_offset;
+        let char_len = self.content.chars().count();
+
+        let tail = |content: &str| -> String {
+            let n = content.chars().count();
+            if n > 4000 {
+                let skip_bytes = content
+                    .char_indices()
+                    .nth(n - 4000)
+                    .map_or(0, |(i, _)| i);
+                content[skip_bytes..].to_string()
+            } else {
+                content.to_string()
+            }
+        };
 
         match cursor {
             None => {
-                let output = if self.content.len() > 4000 {
-                    self.content[self.content.len() - 4000..].to_string()
-                } else {
-                    self.content.clone()
-                };
+                let output = tail(&self.content);
                 serde_json::json!({
                     "output": output,
                     "cursor": total,
@@ -229,7 +279,7 @@ impl TerminalBuffer {
                         "output": "",
                         "cursor": total,
                         "gap": false,
-                        "error": format!("Invalid cursor {}: beyond total bytes written ({})", c, total),
+                        "error": format!("Invalid cursor {}: beyond total chars written ({})", c, total),
                     })
                 } else if c == total {
                     // Exactly at the end — nothing new
@@ -240,8 +290,8 @@ impl TerminalBuffer {
                     })
                 } else if c >= start {
                     let offset = (c - start) as usize;
-                    let output = if offset < self.content.len() {
-                        self.content[offset..].to_string()
+                    let output = if offset < char_len {
+                        self.content[self.byte_idx(offset)..].to_string()
                     } else {
                         String::new()
                     };
@@ -251,11 +301,7 @@ impl TerminalBuffer {
                         "gap": false,
                     })
                 } else {
-                    let output = if self.content.len() > 4000 {
-                        self.content[self.content.len() - 4000..].to_string()
-                    } else {
-                        self.content.clone()
-                    };
+                    let output = tail(&self.content);
                     serde_json::json!({
                         "output": output,
                         "cursor": total,
@@ -267,82 +313,137 @@ impl TerminalBuffer {
     }
 }
 
+/// Everything protected by the terminal mutex: the vt100 screen emulator
+/// (what the user sees, and what the model reads as `screen`) plus the raw
+/// output log (byte cursor for incremental reads).
+pub struct TerminalCore {
+    pub parser: vt100::Parser<TerminalQueries>,
+    pub raw: TerminalBuffer,
+}
+
+impl TerminalCore {
+    fn new(cols: u16, rows: u16) -> Self {
+        TerminalCore {
+            parser: vt100::Parser::new_with_callbacks(
+                rows,
+                cols,
+                0,
+                TerminalQueries::default(),
+            ),
+            raw: TerminalBuffer::new(),
+        }
+    }
+}
+
+/// vt100 callbacks: answers terminal *queries* the child application sends.
+///
+/// Real terminals answer these; without answers, TUI frameworks hang at
+/// startup waiting for a reply (crossterm reads the cursor position —
+/// `ESC[6n` — when entering raw mode, which is exactly what made Rustama
+/// fail to start inside its own terminal).
+///
+/// The reply bytes are queued and drained by the UI loop, which writes
+/// them to the PTY master.
+#[derive(Default)]
+pub struct TerminalQueries {
+    pub pending_replies: Vec<u8>,
+}
+
+impl vt100::Callbacks for TerminalQueries {
+    fn unhandled_csi(
+        &mut self,
+        screen: &mut vt100::Screen,
+        i1: Option<u8>,
+        _i2: Option<u8>,
+        params: &[&[u16]],
+        c: char,
+    ) {
+        match (i1, params, c) {
+            // DSR "report cursor position" (ESC[6n) -> ESC[{row};{col}R
+            (None, [[6]], 'n') => {
+                let (row, col) = screen.cursor_position();
+                let reply = format!("\x1b[{};{}R", row + 1, col + 1);
+                self.pending_replies.extend_from_slice(reply.as_bytes());
+            }
+            // DSR "status report" (ESC[5n) -> ESC[0n ("terminal OK")
+            (None, [[5]], 'n') => {
+                self.pending_replies.extend_from_slice(b"\x1b[0n");
+            }
+            // DA1 "primary device attributes" (ESC[c / ESC[0c):
+            // claim to be a VT220 with 256-color-ish feature set.
+            (None, [[]] | [[0]], 'c') => {
+                self.pending_replies
+                    .extend_from_slice(b"\x1b[?62;4;6;22c");
+            }
+            // DECRQM would go here; vt100 handles the common modes itself.
+            _ => {}
+        }
+    }
+
+    fn unhandled_escape(
+        &mut self,
+        _screen: &mut vt100::Screen,
+        i1: Option<u8>,
+        _i2: Option<u8>,
+        b: u8,
+    ) {
+        // ESC Z (DECID, ~"identify terminal") — answer like DA1.
+        if i1.is_none() && b == b'Z' {
+            self.pending_replies
+                .extend_from_slice(b"\x1b[?62;4;6;22c");
+        }
+        // ESC c (RIS, full reset) — vt100 handles screen state; nothing
+        // to answer.
+    }
+}
+
+/// Interactive PTY-backed terminal embedded in the UI.
+///
+/// Replaces the original pipe-based implementation: the child process runs
+/// attached to a real pseudo-terminal (via `portable-pty`), so REPLs
+/// (python3, node), readline programs, full-screen TUIs (top, less, vim —
+/// including Rustama itself) and ssh all work. Output is parsed into a
+/// vt100 screen model which the UI renders cell-by-cell; keyboard input
+/// (user or model via the terminal tools) is written to the PTY master.
 pub struct TerminalState {
-    pub buffer: Arc<Mutex<TerminalBuffer>>,
-    pub stdin_tx: Option<std::sync::mpsc::Sender<String>>,
-    pub child: Arc<Mutex<Option<Child>>>,
-    pub reader_stdout: Option<JoinHandle<()>>,
-    pub reader_stderr: Option<JoinHandle<()>>,
-    pub stdin_writer: Option<JoinHandle<()>>,
+    pub core: Arc<Mutex<TerminalCore>>,
+    writer: Arc<Mutex<Option<Box<dyn std::io::Write + Send>>>>,
+    child: Arc<Mutex<Option<Box<dyn portable_pty::Child + Send>>>>,
+    master: Arc<Mutex<Option<Box<dyn portable_pty::MasterPty + Send>>>>,
+    reader: Option<JoinHandle<()>>,
     pub visible: bool,
     pub width_pct: u16,
     pub command: String,
-}
-
-/// Shell reserved words / builtins that must not be prefixed with `stdbuf`.
-#[cfg(test)]
-const SHELL_KEYWORDS: &[&str] = &[
-    "if", "then", "elif", "else", "fi", "for", "while", "until", "do", "done", "case", "esac",
-    "in", "function", "select", "time", "coproc", "!", "{", "}", "(", ")", "[[", "]]", "cd",
-    "echo", "export", "pwd", "set", "unset", "shift", "read", "printf", "return", "exit", "eval",
-    "exec", "source", "alias", "unalias", "declare", "typeset", "local", "readonly", "trap",
-    "wait", "jobs", "bg", "fg", "kill", "history", "let", "pushd", "popd", "dirs", "umask",
-    "ulimit", "test", "true", "false", "break", "continue",
-];
-
-/// Line-buffers the spawned command's output so long-running scripts (builds,
-/// python/node -c, ...) show output promptly even without a pty.
-///
-/// Verified: `PYTHONUNBUFFERED=1` fixes python; `stdbuf -oL -eL` fixes any
-/// program (line buffering via LD_PRELOAD). Together they handle script and
-/// progress output.
-///
-/// FIXME: interactive REPLs (python3 -q, node, ...) cannot work through pipes
-/// at all — they buffer piped stdin until EOF regardless of stdbuf/-u. Full
-/// PTY support (e.g. the `portable-pty` crate) is required for that, and for
-/// readline programs, top, less, ssh, ... . Should eventually replace this
-/// pipe-based TerminalState implementation.
-#[cfg(test)]
-fn terminal_command(command: &str) -> String {
-    let first = command.split_whitespace().next().unwrap_or("");
-    let simple = !first.is_empty()
-        && !SHELL_KEYWORDS.contains(&first)
-        && !command.contains([';', '&', '|', '<', '>', '$', '`', '\'', '"', '\n'])
-        && !command.starts_with(['{', '(', '!']);
-    if simple {
-        format!("stdbuf -oL -eL {}", command)
-    } else {
-        command.to_string()
-    }
+    /// Last PTY size we resized to (cols, rows).
+    size: (u16, u16),
 }
 
 impl TerminalState {
     pub fn new() -> Self {
         TerminalState {
-            buffer: Arc::new(Mutex::new(TerminalBuffer::new())),
-            stdin_tx: None,
+            core: Arc::new(Mutex::new(TerminalCore::new(80, 24))),
+            writer: Arc::new(Mutex::new(None)),
             child: Arc::new(Mutex::new(None)),
-            reader_stdout: None,
-            reader_stderr: None,
-            stdin_writer: None,
+            master: Arc::new(Mutex::new(None)),
+            reader: None,
             visible: false,
             width_pct: 40,
             command: String::new(),
+            size: (80, 24),
         }
     }
 
     pub fn is_running(&self) -> bool {
-        if self.stdin_tx.is_none() {
-            return false;
-        }
-        // Check if child process has exited
         let mut child = self.child.lock().unwrap();
-        if let Some(ref mut c) = *child
-            && let Ok(Some(_)) = c.try_wait()
-        {
-            return false;
+        if let Some(ref mut c) = *child {
+            // `try_wait` returns Err while the child is alive on some
+            // backends, Ok(Some) once reaped, Ok(None) if still running.
+            match c.try_wait() {
+                Ok(Some(_)) => return false,
+                _ => return true,
+            }
         }
-        true
+        false
     }
 
     pub fn open(&mut self, command: &str) -> String {
@@ -355,97 +456,62 @@ impl TerminalState {
             return "Error: sudo is not permitted.".to_string();
         }
 
-        let (stdin_tx, stdin_rx) = std::sync::mpsc::channel::<String>();
-        let buffer = Arc::new(Mutex::new(TerminalBuffer::new()));
+        let pty_system = portable_pty::native_pty_system();
+        let pair = match pty_system.openpty(portable_pty::PtySize {
+            rows: self.size.1,
+            cols: self.size.0,
+            pixel_width: 0,
+            pixel_height: 0,
+        }) {
+            Ok(p) => p,
+            Err(e) => return format!("Error opening pty: {}", e),
+        };
 
-        // Always spawn bash — commands are sent through stdin.
-        // This keeps one process, one buffer, one monotonic cursor
-        // across the entire session lifecycle.
-        match std::process::Command::new("bash")
-            .env("PYTHONUNBUFFERED", "1")
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .stdin(Stdio::piped())
-            .spawn()
-        {
-            Ok(mut child) => {
-                let mut stdin = child.stdin.take().expect("stdin was piped");
-                let stdout = child.stdout.take().expect("stdout was piped");
-                let stderr = child.stderr.take().expect("stderr was piped");
+        // Always spawn bash — commands are sent as keystrokes afterwards.
+        // This keeps one process, one screen, one monotonic cursor across
+        // the entire session lifecycle.
+        let mut cmd = portable_pty::CommandBuilder::new("bash");
+        cmd.env("TERM", "xterm-256color");
+        cmd.env("COLORTERM", "truecolor");
+        // Keep prompt noise down: a simple, recognizable prompt.
+        cmd.env("PS1", "$ ");
 
-                let stdin_writer = std::thread::spawn(move || {
-                    use std::io::Write;
-                    while let Ok(msg) = stdin_rx.recv() {
-                        if stdin.write_all(msg.as_bytes()).is_err() {
-                            break;
+        match pair.slave.spawn_command(cmd) {
+            Ok(child) => {
+                let mut reader = match pair.master.try_clone_reader() {
+                    Ok(r) => r,
+                    Err(e) => return format!("Error cloning pty reader: {}", e),
+                };
+                let writer = match pair.master.take_writer() {
+                    Ok(w) => w,
+                    Err(e) => return format!("Error taking pty writer: {}", e),
+                };
+
+                let core = Arc::new(Mutex::new(TerminalCore::new(self.size.0, self.size.1)));
+                let reader_core = core.clone();
+                let reader = std::thread::spawn(move || {
+                    let mut buf = [0u8; 8192];
+                    loop {
+                        match reader.read(&mut buf) {
+                            Ok(0) => break,
+                            Ok(n) => {
+                                let text = String::from_utf8_lossy(&buf[..n]).to_string();
+                                let mut c = reader_core.lock().unwrap();
+                                c.parser.process(text.as_bytes());
+                                c.raw.push(&text);
+                            }
+                            Err(_) => break,
                         }
-                        let _ = stdin.flush();
                     }
                 });
 
-                let reader_stdout = {
-                    let buffer = buffer.clone();
-                    std::thread::spawn(move || {
-                        let mut buf = [0u8; 4096];
-                        let mut out = stdout;
-                        loop {
-                            match out.read(&mut buf) {
-                                Ok(0) => break,
-                                Ok(n) => {
-                                    if let Ok(text) = String::from_utf8(buf[..n].to_vec()) {
-                                        let mut b = buffer.lock().unwrap();
-                                        b.total_bytes_written += text.len() as u64;
-                                        b.content.push_str(&text);
-                                        let len = b.content.len();
-                                        if len > TERMINAL_BUFFER_MAX {
-                                            let drain_to = len - TERMINAL_BUFFER_MAX / 2;
-                                            b.buffer_start_offset += drain_to as u64;
-                                            b.content = b.content.split_off(drain_to);
-                                        }
-                                    }
-                                }
-                                Err(_) => break,
-                            }
-                        }
-                    })
-                };
-
-                let reader_stderr = {
-                    let buffer = buffer.clone();
-                    std::thread::spawn(move || {
-                        let mut buf = [0u8; 4096];
-                        let mut err = stderr;
-                        loop {
-                            match err.read(&mut buf) {
-                                Ok(0) => break,
-                                Ok(n) => {
-                                    if let Ok(text) = String::from_utf8(buf[..n].to_vec()) {
-                                        let mut b = buffer.lock().unwrap();
-                                        b.total_bytes_written += text.len() as u64;
-                                        b.content.push_str(&text);
-                                        let len = b.content.len();
-                                        if len > TERMINAL_BUFFER_MAX {
-                                            let drain_to = len - TERMINAL_BUFFER_MAX / 2;
-                                            b.buffer_start_offset += drain_to as u64;
-                                            b.content = b.content.split_off(drain_to);
-                                        }
-                                    }
-                                }
-                                Err(_) => break,
-                            }
-                        }
-                    })
-                };
-
-                self.buffer = buffer;
-                self.stdin_tx = Some(stdin_tx);
+                self.core = core;
+                *self.writer.lock().unwrap() = Some(writer);
                 *self.child.lock().unwrap() = Some(child);
-                self.reader_stdout = Some(reader_stdout);
-                self.reader_stderr = Some(reader_stderr);
-                self.stdin_writer = Some(stdin_writer);
+                *self.master.lock().unwrap() = Some(pair.master);
+                self.reader = Some(reader);
                 self.visible = true;
 
-                // If a command was provided, send it to the shell
                 if !command.trim().is_empty() {
                     self.command = command.to_string();
                     let _ = self.send_input(command);
@@ -455,45 +521,174 @@ impl TerminalState {
                     "Terminal opened: bash".to_string()
                 }
             }
-            Err(e) => format!("Error opening terminal: {}", e),
+            Err(e) => format!("Error spawning shell: {}", e),
         }
     }
 
+    /// Sends text to the PTY, appending a newline — like typing the text
+    /// and pressing Enter. This is what the `terminal_send` tool uses.
     pub fn send_input(&mut self, input: &str) -> String {
-        if let Some(ref tx) = self.stdin_tx {
-            match tx.send(format!("{}\n", input)) {
-                Ok(()) => format!("Sent: {}", input),
-                Err(_) => "Error: terminal process has exited".to_string(),
+        self.send_raw(&format!("{}\n", input))
+            .map(|()| format!("Sent: {}", input))
+            .unwrap_or_else(|e| e)
+    }
+
+    /// Writes raw bytes to the PTY master with no trailing newline —
+    /// keystrokes, escape sequences, control characters.
+    pub fn send_raw(&mut self, data: &str) -> Result<(), String> {
+        let mut writer = self.writer.lock().unwrap();
+        match writer.as_mut() {
+            Some(w) => {
+                use std::io::Write;
+                w.write_all(data.as_bytes())
+                    .and_then(|()| w.flush())
+                    .map_err(|e| format!("Error writing to terminal: {}", e))
             }
-        } else {
-            "Error: no terminal running".to_string()
+            None => Err("Error: no terminal running".to_string()),
+        }
+    }
+
+    /// Resizes the PTY and the screen emulator to match the panel size.
+    pub fn resize(&mut self, cols: u16, rows: u16) {
+        if cols == 0 || rows == 0 || (cols, rows) == self.size {
+            return;
+        }
+        self.size = (cols, rows);
+        if let Some(ref master) = *self.master.lock().unwrap() {
+            let _ = master.resize(portable_pty::PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            });
+        }
+        self.core
+            .lock()
+            .unwrap()
+            .parser
+            .screen_mut()
+            .set_size(rows, cols);
+    }
+
+    /// Writes any pending terminal-query replies (cursor position reports,
+    /// device attributes — see [`TerminalQueries`]) back to the child
+    /// through the PTY master. Called from the UI loop.
+    pub fn flush_replies(&mut self) {
+        let replies = {
+            let mut core = self.core.lock().unwrap();
+            if core.parser.callbacks().pending_replies.is_empty() {
+                return;
+            }
+            std::mem::take(&mut core.parser.callbacks_mut().pending_replies)
+        };
+        let mut writer = self.writer.lock().unwrap();
+        if let Some(w) = writer.as_mut() {
+            use std::io::Write;
+            let _ = w.write_all(&replies);
+            let _ = w.flush();
         }
     }
 
     pub fn read_buffer_incremental(&self, cursor: Option<u64>) -> serde_json::Value {
-        let b = self.buffer.lock().unwrap();
-        b.read_incremental(cursor)
+        let c = self.core.lock().unwrap();
+        let mut result = c.raw.read_incremental(cursor);
+        // The rendered screen is far more useful than raw bytes for
+        // understanding what a full-screen application is showing.
+        result["screen"] = serde_json::json!(c.parser.screen().contents());
+        let (row, col) = c.parser.screen().cursor_position();
+        result["screen_cursor"] = serde_json::json!({"row": row, "col": col});
+        result
     }
 
     pub fn close(&mut self) -> String {
-        self.stdin_tx.take();
+        self.writer.lock().unwrap().take();
         if let Some(mut child) = self.child.lock().unwrap().take() {
             let _ = child.kill();
             let _ = child.wait();
         }
-        if let Some(handle) = self.stdin_writer.take() {
-            let _ = handle.join();
-        }
-        if let Some(handle) = self.reader_stdout.take() {
-            let _ = handle.join();
-        }
-        if let Some(handle) = self.reader_stderr.take() {
+        self.master.lock().unwrap().take();
+        if let Some(handle) = self.reader.take() {
             let _ = handle.join();
         }
         self.visible = false;
         self.command.clear();
-        *self.buffer.lock().unwrap() = TerminalBuffer::new();
+        *self.core.lock().unwrap() = TerminalCore::new(self.size.0, self.size.1);
         "Terminal closed".to_string()
+    }
+}
+
+/// Maps a crossterm key event to the bytes a real terminal would send for
+/// it, for forwarding to the PTY when the terminal panel has keyboard
+/// focus. Returns `None` for keys that have no terminal encoding.
+pub fn key_to_pty_bytes(key: &KeyEvent) -> Option<String> {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+
+    let base: String = match key.code {
+        KeyCode::Char(c) => {
+            if ctrl {
+                // Ctrl+letter -> control byte (0x01-0x1a); also handle a
+                // few common punctuation combos.
+                let lc = c.to_ascii_lowercase();
+                if lc.is_ascii_lowercase() {
+                    ((lc as u8 - b'a' + 1) as char).to_string()
+                } else {
+                    match c {
+                        '2' | '@' => "\x00".to_string(),
+                        '3' | '[' => "\x1b".to_string(),
+                        '4' | '\\' => "\x1c".to_string(),
+                        '5' | ']' => "\x1d".to_string(),
+                        '6' | '^' => "\x1e".to_string(),
+                        '7' | '_' => "\x1f".to_string(),
+                        '8' | '?' => "\x7f".to_string(),
+                        _ => return None,
+                    }
+                }
+            } else {
+                c.to_string()
+            }
+        }
+        KeyCode::Enter => "\r".to_string(),
+        KeyCode::Tab => {
+            if shift { "\x1b[Z".to_string() } else { "\t".to_string() }
+        }
+        KeyCode::BackTab => "\x1b[Z".to_string(),
+        KeyCode::Backspace => "\x7f".to_string(),
+        KeyCode::Esc => "\x1b".to_string(),
+        KeyCode::Up => "\x1b[A".to_string(),
+        KeyCode::Down => "\x1b[B".to_string(),
+        KeyCode::Right => "\x1b[C".to_string(),
+        KeyCode::Left => "\x1b[D".to_string(),
+        KeyCode::Home => "\x1b[H".to_string(),
+        KeyCode::End => "\x1b[F".to_string(),
+        KeyCode::PageUp => "\x1b[5~".to_string(),
+        KeyCode::PageDown => "\x1b[6~".to_string(),
+        KeyCode::Delete => "\x1b[3~".to_string(),
+        KeyCode::Insert => "\x1b[2~".to_string(),
+        KeyCode::F(n) => match n {
+            1 => "\x1bOP".to_string(),
+            2 => "\x1bOQ".to_string(),
+            3 => "\x1bOR".to_string(),
+            4 => "\x1bOS".to_string(),
+            5 => "\x1b[15~".to_string(),
+            6 => "\x1b[17~".to_string(),
+            7 => "\x1b[18~".to_string(),
+            8 => "\x1b[19~".to_string(),
+            9 => "\x1b[20~".to_string(),
+            10 => "\x1b[21~".to_string(),
+            11 => "\x1b[23~".to_string(),
+            12 => "\x1b[24~".to_string(),
+            _ => return None,
+        },
+        _ => return None,
+    };
+
+    // Alt prefixes the sequence with ESC (meta).
+    if alt && !ctrl {
+        Some(format!("\x1b{}", base))
+    } else {
+        Some(base)
     }
 }
 
@@ -760,6 +955,23 @@ impl App {
             return;
         }
 
+        // Terminal focus mode: nearly every key goes straight to the PTY.
+        // Ctrl+G is the escape hatch back to the chat UI.
+        if self.focus == Focus::Terminal {
+            if key.code == KeyCode::Char('g') || key.code == KeyCode::Char('G')
+                && key.modifiers.contains(KeyModifiers::CONTROL)
+            {
+                self.focus = Focus::Input;
+                self.input_mode = InputMode::Input;
+                self.status_message = "Terminal focus released (back to input)".to_string();
+                return;
+            }
+            if let Some(bytes) = key_to_pty_bytes(&key) {
+                let _ = self.terminal_state.send_raw(&bytes);
+            }
+            return;
+        }
+
         match key.code {
             KeyCode::F(9) => {
                 self.open_menu();
@@ -769,9 +981,28 @@ impl App {
                 self.open_quit_confirm();
                 return;
             }
+            KeyCode::F(6) => {
+                // Grab terminal keyboard focus.
+                if self.terminal_state.is_running() {
+                    self.terminal_state.visible = true;
+                    self.focus = Focus::Terminal;
+                    self.status_message =
+                        "Terminal focused — keystrokes go to the shell. Ctrl+G: release"
+                            .to_string();
+                } else {
+                    let result = self.terminal_state.open("bash");
+                    self.focus = Focus::Terminal;
+                    self.status_message = result;
+                }
+                return;
+            }
             KeyCode::Char('t' | 'T') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 if self.terminal_state.is_running() {
                     self.terminal_state.visible = !self.terminal_state.visible;
+                    if !self.terminal_state.visible && self.focus == Focus::Terminal {
+                        self.focus = Focus::Input;
+                        self.input_mode = InputMode::Input;
+                    }
                 } else {
                     let result = self.terminal_state.open("bash");
                     self.status_message = result;
@@ -1054,12 +1285,7 @@ impl App {
                     serde_json::from_str(args_json).unwrap_or(serde_json::json!({}));
                 let command = args["command"].as_str().unwrap_or("");
                 let result = self.terminal_state.open(command);
-                let cursor = self
-                    .terminal_state
-                    .buffer
-                    .lock()
-                    .unwrap()
-                    .total_bytes_written;
+                let cursor = self.terminal_state.core.lock().unwrap().raw.total_bytes_written;
                 Some(
                     serde_json::json!({
                         "status": result,
@@ -2327,6 +2553,21 @@ impl App {
         let scrollbar_col = self.output_width.saturating_sub(1);
         let input_start = height.saturating_sub(6);
         let input_bottom = height.saturating_sub(2);
+
+        // Clicks in the terminal panel grab terminal keyboard focus.
+        let terminal_visible = self.terminal_state.visible && self.terminal_state.is_running();
+        if terminal_visible {
+            let term_start_col = width
+                .saturating_mul(100 - self.terminal_state.width_pct)
+                / 100;
+            if col >= term_start_col && row > 0 {
+                self.focus = Focus::Terminal;
+                self.status_message =
+                    "Terminal focused — keystrokes go to the shell. Ctrl+G: release".to_string();
+                return;
+            }
+        }
+
         if row >= input_start && row <= input_bottom {
             if row == input_bottom && !self.textarea.lines().join("").trim().is_empty() {
                 self.send_to_ollama_async();
@@ -4317,7 +4558,7 @@ fn get_tool_definitions() -> Vec<serde_json::Value> {
             "type": "function",
             "function": {
                 "name": "terminal_open",
-                "description": "Open a terminal session to run a command. The terminal panel becomes visible so you can observe the output. Returns JSON with 'status' (message) and 'cursor' (pass this to terminal_read for incremental reads). Use terminal_send to interact and terminal_read to check output. Use terminal_close when done.",
+                "description": "Open a terminal session to run a command in a real PTY — fully interactive programs work (REPLs, ssh, top, vim, even other TUI apps). The terminal panel becomes visible so you can observe the output. Returns JSON with 'status' (message) and 'cursor' (pass this to terminal_read for incremental reads). Use terminal_send to interact (supports escape sequences for special keys) and terminal_read to check output/screen. Use terminal_close when done.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -4334,13 +4575,13 @@ fn get_tool_definitions() -> Vec<serde_json::Value> {
             "type": "function",
             "function": {
                 "name": "terminal_send",
-                "description": "Send input (keystrokes) to the running terminal session. Use this to interact with programs, answer prompts, press Enter, etc.",
+                "description": "Send input (keystrokes) to the running terminal session. The terminal is a real PTY, so interactive programs work: a newline is appended automatically (like pressing Enter). For special keys, embed the raw escape/control sequences in the string: Ctrl+C = \"\\u0003\", Ctrl+D = \"\\u0004\", arrows = \"\\u001b[A/B/C/D\" (up/down/right/left), Tab = \"\\t\", Escape = \"\\u001b\", F1 = \"\\u001bOP\", PgUp/PgDn = \"\\u001b[5~\"/\"\\u001b[6~\". Example: send \"\\u0003\" to interrupt a running program.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "input": {
                             "type": "string",
-                            "description": "The text to send to the terminal (a newline is appended automatically)"
+                            "description": "The text to send to the terminal (a newline is appended automatically). May contain escape/control sequences for special keys."
                         }
                     },
                     "required": ["input"]
@@ -4351,7 +4592,7 @@ fn get_tool_definitions() -> Vec<serde_json::Value> {
             "type": "function",
             "function": {
                 "name": "terminal_read",
-                "description": "Read output from the terminal session. Returns JSON with 'output' (the text), 'cursor' (a position to pass on the next read for incremental output), and 'gap' (true if some output was lost due to buffer overflow). On the first read, omit 'cursor'. On subsequent reads, pass the 'cursor' value from the previous response to get only new output.",
+                "description": "Read output from the terminal session. Returns JSON with 'output' (new raw output since 'cursor'), 'cursor' (pass on the next read for incremental output), 'gap' (true if output was lost to buffer overflow), 'screen' (the current rendered terminal screen as text — like a screenshot; this is what shows what full-screen/interactive programs are doing), and 'screen_cursor' (cursor row/col on screen). On the first read, omit 'cursor'. Use 'screen' to understand the current state of interactive/TUI programs.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -4984,31 +5225,7 @@ mod continuation_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::{StreamChunk, retry_countdown, send_with_retry, terminal_command};
-
-    #[test]
-    fn wraps_simple_command() {
-        assert_eq!(terminal_command("python3 -q"), "stdbuf -oL -eL python3 -q");
-        assert_eq!(terminal_command("ls -la"), "stdbuf -oL -eL ls -la");
-        assert_eq!(
-            terminal_command("cmake --build ."),
-            "stdbuf -oL -eL cmake --build ."
-        );
-    }
-
-    #[test]
-    fn leaves_shell_composites_alone() {
-        assert_eq!(terminal_command("cd /tmp && make"), "cd /tmp && make");
-        assert_eq!(terminal_command("echo hi"), "echo hi");
-        assert_eq!(
-            terminal_command("for i in 1 2; do echo $i; done"),
-            "for i in 1 2; do echo $i; done"
-        );
-        assert_eq!(terminal_command("ls | grep foo"), "ls | grep foo");
-        assert_eq!(terminal_command("cat < file"), "cat < file");
-        assert_eq!(terminal_command("FOO=1 bar"), "stdbuf -oL -eL FOO=1 bar");
-        assert_eq!(terminal_command(""), "");
-    }
+    use super::{StreamChunk, retry_countdown, send_with_retry};
 
     #[test]
     fn retry_countdown_sends_correct_messages() {
@@ -5274,7 +5491,7 @@ mod tests {
         );
 
         // Wait for the command to finish (echo is fast, but give it time)
-        std::thread::sleep(std::time::Duration::from_millis(500));
+        std::thread::sleep(std::time::Duration::from_millis(700));
 
         let r = ts.read_buffer_incremental(None);
         let output = r["output"].as_str().unwrap();
@@ -5286,6 +5503,12 @@ mod tests {
         assert!(
             r["cursor"].as_u64().unwrap() > 0,
             "cursor should have advanced past the output"
+        );
+        // The rendered screen must also carry the marker.
+        assert!(
+            r["screen"].as_str().unwrap().contains("CAPTURE_MARKER_42"),
+            "screen should contain marker: {}",
+            r["screen"].as_str().unwrap()
         );
 
         // Read again with cursor — should get empty (nothing new)
@@ -5303,7 +5526,7 @@ mod tests {
         let result = ts.open("echo BEFORE_SEND");
         assert!(result.contains("Terminal opened"), "open: {}", result);
 
-        std::thread::sleep(std::time::Duration::from_millis(500));
+        std::thread::sleep(std::time::Duration::from_millis(700));
 
         let r1 = ts.read_buffer_incremental(None);
         let cursor_before = r1["cursor"].as_u64().unwrap();
@@ -5318,7 +5541,7 @@ mod tests {
         let send_result = ts.send_input("echo AFTER_SEND");
         assert!(send_result.starts_with("Sent:"), "send: {}", send_result);
 
-        std::thread::sleep(std::time::Duration::from_millis(500));
+        std::thread::sleep(std::time::Duration::from_millis(700));
 
         // Incremental read from old cursor — must return only new bytes
         let r2 = ts.read_buffer_incremental(Some(cursor_before));
@@ -5350,6 +5573,288 @@ mod tests {
             full.contains("AFTER_SEND"),
             "full snapshot missing send output: {}",
             full
+        );
+
+        ts.close();
+    }
+
+    #[test]
+    fn pty_interactive_readline_editing() {
+        // A PTY honours readline control characters: type garbage, erase it
+        // with backspace (0x7f), then run the real command. With pipes this
+        // would send the literal bytes to the program.
+        use super::TerminalState;
+        let mut ts = TerminalState::new();
+        let result = ts.open("");
+        assert!(result.contains("Terminal opened"), "open: {}", result);
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        ts.send_raw("echo GARBAGE\x7f\x7f\x7f\x7f\x7f\x7f\x7fPTY_OK")
+            .expect("send_raw");
+        std::thread::sleep(std::time::Duration::from_millis(700));
+
+        let r = ts.read_buffer_incremental(None);
+        let screen = r["screen"].as_str().unwrap();
+        assert!(
+            screen.contains("PTY_OK"),
+            "screen should show the edited command result: {}",
+            screen
+        );
+        ts.close();
+    }
+
+    #[test]
+    fn pty_reports_tty_to_child() {
+        // Programs check isatty() to decide on interactivity. Inside our PTY
+        // the answer must be yes — this is what makes REPLs and TUIs work.
+        use super::TerminalState;
+        let mut ts = TerminalState::new();
+        let result = ts.open("[ -t 0 ] && echo STDIN_IS_TTY || echo STDIN_NOT_TTY");
+        assert!(result.contains("Terminal opened"), "open: {}", result);
+        std::thread::sleep(std::time::Duration::from_millis(700));
+
+        let r = ts.read_buffer_incremental(None);
+        let screen = r["screen"].as_str().unwrap();
+        assert!(
+            screen.contains("STDIN_IS_TTY"),
+            "child stdin should be a tty: {}",
+            screen
+        );
+        ts.close();
+    }
+
+    #[test]
+    fn pty_fullscreen_app_screen_model() {
+        // Full-screen apps draw with cursor-positioning escapes; the vt100
+        // screen model must resolve them into placed text (a linear log
+        // cannot). `clear` + absolute cursor addressing is the minimal case.
+        use super::TerminalState;
+        let mut ts = TerminalState::new();
+        let result = ts.open("clear; printf '\\033[3;10HTOP_LEFT_MARK'");
+        assert!(result.contains("Terminal opened"), "open: {}", result);
+        std::thread::sleep(std::time::Duration::from_millis(700));
+
+        let r = ts.read_buffer_incremental(None);
+        let screen = r["screen"].as_str().unwrap();
+        assert!(
+            screen.contains("TOP_LEFT_MARK"),
+            "screen should contain positioned text: {:?}",
+            screen
+        );
+        // Row 2 (0-based) must hold the mark starting at col 9 — proof the
+        // cursor positioning was interpreted, not just logged.
+        let line3 = screen.lines().nth(2).unwrap_or("");
+        assert!(
+            line3.contains("TOP_LEFT_MARK"),
+            "mark must be on screen row 3: {:?}",
+            line3
+        );
+        ts.close();
+    }
+
+    #[test]
+    fn pty_resize_keeps_screen() {
+        use super::TerminalState;
+        let mut ts = TerminalState::new();
+        let result = ts.open("echo RESIZE_MARKER");
+        assert!(result.contains("Terminal opened"), "open: {}", result);
+        std::thread::sleep(std::time::Duration::from_millis(700));
+
+        ts.resize(60, 20);
+        let r = ts.read_buffer_incremental(None);
+        assert!(
+            r["screen"].as_str().unwrap().contains("RESIZE_MARKER"),
+            "screen must survive resize: {}",
+            r["screen"].as_str().unwrap()
+        );
+        ts.close();
+    }
+
+    #[test]
+    fn key_events_map_to_terminal_bytes() {
+        use super::key_to_pty_bytes;
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let ev = |code, modifiers| KeyEvent::new(code, modifiers);
+        assert_eq!(
+            key_to_pty_bytes(&ev(KeyCode::Char('a'), KeyModifiers::NONE)).as_deref(),
+            Some("a")
+        );
+        assert_eq!(
+            key_to_pty_bytes(&ev(KeyCode::Char('c'), KeyModifiers::CONTROL)).as_deref(),
+            Some("\x03"),
+            "Ctrl+C -> ETX"
+        );
+        assert_eq!(
+            key_to_pty_bytes(&ev(KeyCode::Char('d'), KeyModifiers::CONTROL)).as_deref(),
+            Some("\x04"),
+            "Ctrl+D -> EOT"
+        );
+        assert_eq!(
+            key_to_pty_bytes(&ev(KeyCode::Enter, KeyModifiers::NONE)).as_deref(),
+            Some("\r")
+        );
+        assert_eq!(
+            key_to_pty_bytes(&ev(KeyCode::Backspace, KeyModifiers::NONE)).as_deref(),
+            Some("\x7f")
+        );
+        assert_eq!(
+            key_to_pty_bytes(&ev(KeyCode::Up, KeyModifiers::NONE)).as_deref(),
+            Some("\x1b[A")
+        );
+        assert_eq!(
+            key_to_pty_bytes(&ev(KeyCode::F(1), KeyModifiers::NONE)).as_deref(),
+            Some("\x1bOP")
+        );
+        assert_eq!(
+            key_to_pty_bytes(&ev(KeyCode::Delete, KeyModifiers::NONE)).as_deref(),
+            Some("\x1b[3~")
+        );
+        assert_eq!(
+            key_to_pty_bytes(&ev(KeyCode::Char('x'), KeyModifiers::ALT)).as_deref(),
+            Some("\x1bx"),
+            "Alt prefixes ESC"
+        );
+        assert_eq!(
+            key_to_pty_bytes(&ev(KeyCode::Tab, KeyModifiers::SHIFT)).as_deref(),
+            Some("\x1b[Z"),
+            "Shift+Tab -> backtab"
+        );
+    }
+
+    /// Full acid test: real interactive programs through the PTY — a REPL,
+    /// readline history, a full-screen pager, and Rustama itself driven
+    /// with raw keystrokes. Ignored by default (slow, spawns processes);
+    /// run with: cargo test --release pty_acid -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn pty_acid_interactive_programs() {
+        use super::TerminalState;
+        let wait = |ms: u64| std::thread::sleep(std::time::Duration::from_millis(ms));
+        let mut ts = TerminalState::new();
+        ts.resize(100, 30);
+
+        let r = ts.open("");
+        assert!(r.contains("Terminal opened"), "{}", r);
+        wait(500);
+
+        // 1. python3 REPL — impossible with pipes
+        ts.send_input("python3 -q");
+        wait(900);
+        ts.send_input("print('REPL_' + 'WORKS')");
+        wait(900);
+        let screen = ts.read_buffer_incremental(None);
+        let screen = screen["screen"].as_str().unwrap().to_string();
+        assert!(screen.contains("REPL_WORKS"), "python repl failed:\n{}", screen);
+
+        // 2. Ctrl+C interrupt, then leave the REPL
+        ts.send_raw("\x03").unwrap();
+        wait(300);
+        ts.send_input("exit()");
+        wait(500);
+
+        // 3. readline up-arrow history in bash
+        ts.send_input("echo HISTORY_ONE");
+        wait(400);
+        ts.send_raw("\x1b[A").unwrap();
+        wait(300);
+        let screen = ts.read_buffer_incremental(None);
+        let screen = screen["screen"].as_str().unwrap().to_string();
+        assert!(
+            screen.matches("HISTORY_ONE").count() >= 2,
+            "up-arrow history failed:\n{}",
+            screen
+        );
+        ts.send_raw("\x03").unwrap();
+        wait(300);
+
+        // 4. full-screen pager
+        ts.send_input("seq 1 100 > /tmp/seq_rustama_test.txt; less /tmp/seq_rustama_test.txt");
+        wait(800);
+        let screen = ts.read_buffer_incremental(None);
+        let screen = screen["screen"].as_str().unwrap().to_string();
+        assert!(
+            screen.contains("seq_rustama_test.txt"),
+            "less didn't open:\n{}",
+            screen
+        );
+        ts.send_raw("q").unwrap();
+        wait(400);
+
+        ts.close();
+    }
+
+    /// Rustama running inside its own embedded terminal: verifies the whole
+    /// stack (PTY + vt100 + key encoding) can host a full-screen crossterm
+    /// TUI and drive it with keystrokes. Needs a release binary; run with:
+    ///   cargo build --release && cargo test --release pty_acid_rustama -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn pty_acid_rustama_in_rustama() {
+        use super::TerminalState;
+        let wait = |ms: u64| std::thread::sleep(std::time::Duration::from_millis(ms));
+        let bin = format!("{}/target/release/rustama", env!("CARGO_MANIFEST_DIR"));
+        assert!(
+            std::path::Path::new(&bin).exists(),
+            "build the release binary first: cargo build --release"
+        );
+
+        let mut ts = TerminalState::new();
+        ts.resize(100, 30);
+        let r = ts.open("");
+        assert!(r.contains("Terminal opened"), "{}", r);
+        wait(500);
+
+        // Launch the inner Rustama.
+        ts.send_input(&bin);
+        // crossterm queries the cursor position at startup; the vt100
+        // callbacks queue replies that must be flushed back to the PTY.
+        for _ in 0..30 {
+            wait(100);
+            ts.flush_replies();
+        }
+        let screen = ts.read_buffer_incremental(None);
+        let screen = screen["screen"].as_str().unwrap().to_string();
+        assert!(
+            screen.contains("F9") || screen.contains("Menu") || screen.contains("Rustama"),
+            "inner rustama didn't render its UI:\n{}",
+            screen
+        );
+
+        // F9 opens the inner menu.
+        ts.send_raw("\x1b[20~").unwrap();
+        wait(700);
+        let screen = ts.read_buffer_incremental(None);
+        let screen = screen["screen"].as_str().unwrap().to_string();
+        assert!(
+            screen.contains("Load") || screen.contains("Save") || screen.contains("Exit"),
+            "F9 menu didn't open in inner rustama:\n{}",
+            screen
+        );
+
+        // Esc closes it, F10 asks to quit, 'y' confirms.
+        ts.send_raw("\x1b").unwrap();
+        wait(400);
+        ts.send_raw("\x1b[21~").unwrap();
+        for _ in 0..7 {
+            wait(100);
+            ts.flush_replies();
+        }
+        let screen = ts.read_buffer_incremental(None);
+        let screen = screen["screen"].as_str().unwrap().to_string();
+        assert!(
+            screen.contains("uit"),
+            "F10 quit dialog didn't show:\n{}",
+            screen
+        );
+        ts.send_raw("y").unwrap();
+        wait(1000);
+        let screen = ts.read_buffer_incremental(None);
+        let screen = screen["screen"].as_str().unwrap().to_string();
+        assert!(
+            !screen.contains("Confirm Quit"),
+            "inner rustama didn't exit:\n{}",
+            screen
         );
 
         ts.close();

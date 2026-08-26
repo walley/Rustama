@@ -172,6 +172,9 @@ where
 
         app.check_responses();
         app.check_model_responses();
+        // Answer terminal queries (cursor position, device attributes)
+        // coming from the child program.
+        app.terminal_state.flush_replies();
 
         if app.should_quit {
             return Ok(());
@@ -213,7 +216,14 @@ fn ui(f: &mut Frame, app: &mut App) {
         render_output(f, app, left_chunks[0]);
         render_status_bar(f, app, left_chunks[1]);
         render_input(f, app, left_chunks[2]);
-        render_terminal_panel(f, app, content_chunks[1]);
+        // Keep the PTY size in sync with the panel's inner area so
+        // full-screen apps lay themselves out correctly.
+        let term_area = content_chunks[1];
+        app.terminal_state.resize(
+            term_area.width.saturating_sub(2),
+            term_area.height.saturating_sub(2),
+        );
+        render_terminal_panel(f, app, term_area);
     } else {
         let content_chunks = Layout::vertical([
             Constraint::Min(3),
@@ -618,38 +628,86 @@ fn render_input(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_terminal_panel(f: &mut Frame, app: &App, area: Rect) {
-    let b = app.terminal_state.buffer.lock().unwrap();
-    let content = if b.content.len() > 4000 {
-        &b.content[b.content.len() - 4000..]
-    } else {
-        &b.content
-    };
-    let lines: Vec<Line> = content
-        .lines()
-        .map(|l| {
-            Line::from(Span::styled(
-                l.to_string(),
-                Style::default().fg(Color::Green).bg(Color::Black),
-            ))
-        })
-        .collect();
+    let focused = app.focus == Focus::Terminal;
+    let border_color = if focused { Color::Green } else { Color::DarkGray };
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::DarkGray))
+        .border_style(Style::default().fg(border_color))
         .style(Style::default().bg(Color::Black))
         .title(format!(" {} ", app.terminal_state.command));
 
-    let total_lines = lines.len() as u16;
-    let visible_lines = area.height.saturating_sub(2);
-    let scroll_y = total_lines.saturating_sub(visible_lines);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
 
-    let paragraph = Paragraph::new(lines)
-        .block(block)
-        .style(Style::default().bg(Color::Black))
-        .scroll((scroll_y, 0));
+    // Paint the vt100 screen model cell-by-cell, preserving colors and
+    // text attributes — this is what lets full-screen TUIs (including
+    // Rustama itself) render correctly inside the panel.
+    let core = app.terminal_state.core.lock().unwrap();
+    let screen = core.parser.screen();
+    let buf = f.buffer_mut();
 
-    f.render_widget(paragraph, area);
+    for row in 0..inner.height {
+        for col in 0..inner.width {
+            let x = inner.x + col;
+            let y = inner.y + row;
+            let dst = &mut buf[(x, y)];
+            match screen.cell(row, col) {
+                Some(cell) => {
+                    dst.set_symbol(if cell.contents().is_empty() {
+                        " "
+                    } else {
+                        cell.contents()
+                    });
+                    dst.set_style(vt100_style(cell));
+                }
+                None => {
+                    dst.set_symbol(" ");
+                    dst.set_style(Style::default().fg(Color::Green).bg(Color::Black));
+                }
+            }
+        }
+    }
+
+    // Show the child program's cursor when the panel has keyboard focus.
+    if focused {
+        let (cur_row, cur_col) = screen.cursor_position();
+        if cur_row < inner.height && cur_col < inner.width {
+            let x = inner.x + cur_col;
+            let y = inner.y + cur_row;
+            let dst = &mut buf[(x, y)];
+            let style = dst.style().add_modifier(Modifier::REVERSED);
+            dst.set_style(style);
+        }
+    }
+}
+
+/// Translates vt100 cell attributes into a ratatui style.
+fn vt100_style(cell: &vt100::Cell) -> Style {
+    let mut style = Style::default()
+        .fg(vt100_color(cell.fgcolor(), Color::Green))
+        .bg(vt100_color(cell.bgcolor(), Color::Black));
+    if cell.bold() {
+        style = style.add_modifier(Modifier::BOLD);
+    }
+    if cell.italic() {
+        style = style.add_modifier(Modifier::ITALIC);
+    }
+    if cell.underline() {
+        style = style.add_modifier(Modifier::UNDERLINED);
+    }
+    if cell.inverse() {
+        style = style.add_modifier(Modifier::REVERSED);
+    }
+    style
+}
+
+fn vt100_color(c: vt100::Color, default: Color) -> Color {
+    match c {
+        vt100::Color::Default => default,
+        vt100::Color::Idx(i) => Color::Indexed(i),
+        vt100::Color::Rgb(r, g, b) => Color::Rgb(r, g, b),
+    }
 }
 
 fn render_send_button(f: &mut Frame, app: &App, area: Rect) {
@@ -734,13 +792,28 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_keybar(f: &mut Frame, app: &App, area: Rect) {
+    // Terminal focus has its own keybar: keys go to the shell.
+    if app.focus == Focus::Terminal {
+        let keybar = Paragraph::new(Line::from(Span::styled(
+            format!(
+                " [TERMINAL: {}]  keystrokes go to the shell  Ctrl+G:Release  Ctrl+T:Hide",
+                app.terminal_state.command
+            ),
+            Style::default().fg(Color::Black).bg(Color::Green),
+        )))
+        .style(Style::default().bg(Color::Green));
+        f.render_widget(keybar, area);
+        return;
+    }
+
     let focus_label = match app.focus {
         Focus::Output => " [OUTPUT] ",
         Focus::Input => " [INPUT] ",
+        Focus::Terminal => unreachable!(),
     };
 
     let terminal_hint = if app.terminal_state.is_running() {
-        " Ctrl+T "
+        " Ctrl+T  F6:Term"
     } else {
         ""
     };

@@ -44,7 +44,8 @@ This is the largest module. Key components:
 - **Slash Commands**: ~25 commands (`/help`, `/model`, `/use`, `/list`, `/tools`, `/config`, `/setsystem`, `/temp`, `/topp`, `/topk`, `/fpen`, `/ppen`, `/effort`, `/maxtokens`, `/seed`, `/maxrounds`, `/session save|rename|load`, `/status`, `/log`, `/quit`). Slash-command parameter changes are session-only; the Settings dialog (F9 → Settings) persists them to the current model's config section via `save_config()`.
 - **AI Communication**: `send_to_ollama_async()` and `send_tool_results_async()` spawn background OS threads with their own single-threaded tokio runtime. Streams are parsed line-by-line (Ollama JSON or OpenAI SSE format) and chunks are sent back via `mpsc::channel`.
 - **Agentic Tool System**: 13 tools — file ops (`read_file`, `write_file`, `edit_file`), `bash`, `list_files`, `search_files`, `search_content`, `fetch_url`, `web_search`, and 4 terminal tools (`terminal_open/send/read/close`). Tool call loop with configurable `max_tool_rounds` (default: 10). Two paths: native function calling and text-based JSON parsing fallback. **Auto-continue heuristic**: some cloud models (Kimi-K3) emit `finish_reason="stop"` right after a transitional sentence ("Let me run X:") instead of the announced tool call; `needs_continuation()` detects the unfinished-looking text and the `Done` handler auto-sends "continue" (cap `MAX_AUTO_CONTINUES = 10` per turn, reset on fresh user input).
-- **Session Management**: JSON files at `~/.config/rustama/<session_id>.session.rustama`.
+- **Embedded Terminal**: `TerminalState` is a real PTY (`portable-pty`) with vt100 screen emulation (`vt100` crate). Interactive programs (REPLs, readline, pagers, editors, full-screen TUIs — including Rustama itself) work. The reader thread feeds both the vt100 `Parser` (screen model rendered cell-by-cell in main.rs, colors included) and a raw char-cursor log (`TerminalBuffer`, model-facing incremental reads). `terminal_read` returns both raw `output` and the rendered `screen` text. Terminal *queries* from the child (cursor position `ESC[6n`, device attributes `ESC[c`, DSR `ESC[5n`) are answered via the `TerminalQueries` vt100 callback + `flush_replies()` in the UI loop — without this, crossterm-based apps hang at startup. PTY resizes with the panel. Users can drive it: F6 focuses the panel (all keys forwarded via `key_to_pty_bytes`), Ctrl+G releases, or click the panel.
+- **Session Management**: JSON files at `$DOCUMENTS/rustama/<session_id>.session.rustama` (XDG documents dir, `~/rustama` fallback).
 - **File Dialog**: Built-in file browser for navigating directories and attaching files to conversations.
 
 ### Configuration (`config.rs`)
@@ -90,6 +91,8 @@ This is the largest module. Key components:
 | `glob` 0.3 | File pattern matching |
 | `regex` 1 | Regex for search and tool call parsing |
 | `chrono` 0.4 | Date/time formatting |
+| `portable-pty` 0.9 | Pseudo-terminal for the embedded terminal |
+| `vt100` 0.16 | Terminal screen emulation (escape-sequence parser) |
 | `dialoguer` 0.12 | Unused — dead dependency |
 | `marked` 0.3 | Unused — dead dependency |
 | `markdown` 0.1 | Unused — dead dependency |

@@ -16,7 +16,7 @@ Rustama is a modern, terminal-based interface for interacting with [Ollama](http
 - 📝 **Markdown Rendering** - Full markdown support with syntax highlighting
 - 🎛️ **Per-Model Parameters** - Temperature, top-p, top-k, penalties, seed, reasoning effort and more, configured per model
 - 💾 **Session Management** - Save, load, and manage chat sessions
-- 🖥️ **Embedded Terminal** - Interactive terminal panel the agent (and you) can drive
+- 🖥️ **Embedded Interactive Terminal** - Real PTY panel: REPLs, TUIs, ssh, full-screen apps all work — both you and the model can drive it with keystrokes
 - 📋 **Clipboard Integration** - Copy/paste support, including X11 primary selection for mouse-selected text
 - 📊 **Token Usage Stats** - Prompt/response token counts displayed per message
 - 🔧 **Highly Configurable** - INI-style configuration with sane defaults
@@ -258,6 +258,7 @@ Once running, Rustama provides a terminal interface for:
 |-----|--------|
 | `F9` | Open menu |
 | `F10` | Quit |
+| `F6` | Focus embedded terminal (Ctrl+G releases) |
 | `Tab` | Open menu (output pane) / autocomplete model name (input) |
 | `Ctrl+S` | Save / export session |
 | `Ctrl+T` | Toggle embedded terminal panel (starts a shell if not running) |
@@ -297,16 +298,28 @@ When agentic mode is enabled, the model can use these tools:
 
 ### Terminal Handling Tools
 
-These tools manage an interactive terminal session inside Rustama. The terminal panel becomes visible in the UI so you can observe the running process in real time.
+These tools manage a fully interactive terminal session inside Rustama. The terminal is a **real PTY** (pseudo-terminal) with vt100 screen emulation, so interactive programs work: REPLs (`python3`, `node`), readline apps, pagers (`less`), editors (`vim`), `ssh`, `top`, and even full-screen TUIs — you can run Rustama itself inside it. The terminal panel becomes visible in the UI so you can observe the session in real time.
 
 | Tool | Description |
 |------|-------------|
-| `terminal_open` | Open a terminal session and run a command (e.g. `npm run dev`, `cargo build`). Returns a `cursor` for incremental reads |
-| `terminal_send` | Send input (keystrokes) to the running session — interact with prompts, press Enter, etc. |
-| `terminal_read` | Read output from the session. Pass the `cursor` from a previous response to get only new output |
+| `terminal_open` | Open a terminal session and run a command (e.g. `npm run dev`, `cargo build`, `python3`). Returns a `cursor` for incremental reads |
+| `terminal_send` | Send input (keystrokes) to the running session — a newline is appended (like pressing Enter). Supports raw escape/control sequences for special keys: Ctrl+C = ``, arrows = `[A/B/C/D`, Tab = `	`, F-keys = `OP`…, PgUp/PgDn = `[5~`/`[6~` |
+| `terminal_read` | Read output. Returns `output` (new raw output since `cursor`), `cursor`, `gap`, plus **`screen`** — the current rendered terminal screen as text (like a screenshot — use it to see what interactive/full-screen programs are showing) and `screen_cursor` (cursor row/col) |
 | `terminal_close` | Close the session, hide the panel, and kill the running process |
 
-Typical workflow: `terminal_open` → `terminal_read` (poll output) → `terminal_send` (if interaction needed) → `terminal_close`.
+Typical workflow: `terminal_open` → `terminal_read` (check `screen`/`output`) → `terminal_send` (interact, incl. special keys) → `terminal_close`.
+
+### Interactive Use
+
+You can also drive the terminal yourself:
+
+| Key | Action |
+|-----|--------|
+| `F6` | Focus the terminal (starts a shell if not running) — all keystrokes go to the PTY |
+| `Ctrl+G` | Release terminal focus, back to the chat input |
+| Click panel | Grab terminal focus |
+
+While focused, the panel border turns green and every key (letters, arrows, F-keys, Ctrl/Alt combos, PgUp/PgDn…) is forwarded to the program running in the terminal.
 
 The agentic loop continues until the model stops making tool calls or `max_tool_rounds` is reached.
 
