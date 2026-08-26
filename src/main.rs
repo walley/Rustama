@@ -424,7 +424,11 @@ fn render_output(f: &mut Frame, app: &mut App, area: Rect) {
                         ),
                     ]));
                     let preview = if content.len() > 500 {
-                        format!("{}... ({} bytes total)", &content[..500], content.len())
+                        format!(
+                            "{}... ({} bytes total)",
+                            crate::app::safe_prefix(content, 500),
+                            content.len()
+                        )
                     } else {
                         content.to_string()
                     };
@@ -915,7 +919,7 @@ fn render_model_dialog(f: &mut Frame, app: &App, area: Rect) {
             };
 
             let display_name = if name.len() > 46 {
-                format!("{}...", &name[..43])
+                format!("{}...", crate::app::safe_prefix(&name, 43))
             } else {
                 name.clone()
             };

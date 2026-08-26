@@ -469,12 +469,12 @@ impl TerminalState {
 
         // Always spawn bash — commands are sent as keystrokes afterwards.
         // This keeps one process, one screen, one monotonic cursor across
-        // the entire session lifecycle.
+        // the entire session lifecycle. bash (not $SHELL) keeps the
+        // environment predictable for the agent tools; users can start
+        // their own shell inside if they want it.
         let mut cmd = portable_pty::CommandBuilder::new("bash");
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
-        // Keep prompt noise down: a simple, recognizable prompt.
-        cmd.env("PS1", "$ ");
 
         match pair.slave.spawn_command(cmd) {
             Ok(child) => {
@@ -527,8 +527,23 @@ impl TerminalState {
 
     /// Sends text to the PTY, appending a newline — like typing the text
     /// and pressing Enter. This is what the `terminal_send` tool uses.
+    /// Sends text to the PTY — like typing it and pressing Enter.
+    ///
+    /// A trailing `\r` (carriage return, what a real Enter key produces)
+    /// is appended **only when the input contains printable text**. When
+    /// the input is made up solely of escape sequences and control
+    /// characters (a bare ESC, arrow keys, F-keys, Ctrl+C, ...), it is
+    /// sent as-is: appending anything would glue an extra key onto the
+    /// sequence (and a trailing `\n` decodes as Ctrl+J, not Enter, in
+    /// raw-mode TUI apps).
     pub fn send_input(&mut self, input: &str) -> String {
-        self.send_raw(&format!("{}\n", input))
+        let has_text = input.chars().any(|c| !c.is_control());
+        let data = if has_text {
+            format!("{}\r", input)
+        } else {
+            input.to_string()
+        };
+        self.send_raw(&data)
             .map(|()| format!("Sent: {}", input))
             .unwrap_or_else(|e| e)
     }
@@ -586,6 +601,26 @@ impl TerminalState {
             use std::io::Write;
             let _ = w.write_all(&replies);
             let _ = w.flush();
+        }
+    }
+
+    /// Polls the rendered screen until `needle` appears or `timeout`
+    /// elapses, flushing terminal-query replies each iteration. Tests and
+    /// tool-side waiting should use this instead of fixed sleeps — child
+    /// startup time varies wildly (a crossterm TUI can take seconds to
+    /// finish its init sequence, and input sent before that may be
+    /// discarded by the child itself).
+    #[cfg(test)]
+    fn wait_for_screen(&mut self, needle: &str, timeout: std::time::Duration) -> String {
+        let start = std::time::Instant::now();
+        loop {
+            self.flush_replies();
+            let screen = self.read_buffer_incremental(None);
+            let screen = screen["screen"].as_str().unwrap_or("").to_string();
+            if screen.contains(needle) || start.elapsed() > timeout {
+                return screen;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
         }
     }
 
@@ -958,7 +993,7 @@ impl App {
         // Terminal focus mode: nearly every key goes straight to the PTY.
         // Ctrl+G is the escape hatch back to the chat UI.
         if self.focus == Focus::Terminal {
-            if key.code == KeyCode::Char('g') || key.code == KeyCode::Char('G')
+            if matches!(key.code, KeyCode::Char('g') | KeyCode::Char('G'))
                 && key.modifiers.contains(KeyModifiers::CONTROL)
             {
                 self.focus = Focus::Input;
@@ -1233,6 +1268,13 @@ impl App {
     fn handle_menu_key(&mut self, key: KeyEvent) {
         let action = self.main_menu.handle_key(key);
         self.handle_menu_action(action);
+        // Esc closes the menu without producing an action — leave Menu
+        // input mode too, otherwise the menu disappears visually but
+        // keystrokes keep being routed to it (typed text is swallowed
+        // and the keybar keeps showing the menu hints).
+        if !self.main_menu.is_open() {
+            self.input_mode = InputMode::Normal;
+        }
     }
 
     fn open_menu(&mut self) {
@@ -4247,11 +4289,80 @@ fn chrono_now() -> String {
     chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
-fn truncate(s: &str, max: usize) -> String {
+/// Returns the longest prefix of `s` that is at most `max` *bytes* long,
+/// backing off to the previous char boundary so multibyte UTF-8 is never
+/// split (plain `&s[..max]` panics when `max` lands inside a char).
+pub(crate) fn safe_prefix(s: &str, max: usize) -> &str {
     if s.len() <= max {
-        s.to_string()
-    } else {
-        format!("{}... ({} bytes)", &s[..max], s.len())
+        return s;
+    }
+    let end = s
+        .char_indices()
+        .map(|(i, _)| i)
+        .take_while(|&i| i <= max)
+        .last()
+        .unwrap_or(0);
+    &s[..end]
+}
+
+/// Truncates to at most `max` *bytes*, backing off to the previous char
+/// boundary so multibyte UTF-8 (box-drawing chars from TUIs, emoji, CJK)
+/// is never split — `&s[..max]` panics in that case.
+pub(crate) fn truncate(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    format!("{}... ({} bytes)", safe_prefix(s, max), s.len())
+}
+
+#[cfg(test)]
+mod truncate_tests {
+    use super::truncate;
+
+    #[test]
+    fn short_strings_pass_through() {
+        assert_eq!(truncate("hello", 500), "hello");
+        assert_eq!(truncate("", 500), "");
+    }
+
+    #[test]
+    fn ascii_truncates_at_max() {
+        let s = "x".repeat(1000);
+        let out = truncate(&s, 500);
+        assert!(out.starts_with(&"x".repeat(500)));
+        assert!(out.contains("1000 bytes"));
+    }
+
+    #[test]
+    fn multibyte_chars_are_never_split() {
+        // '─' is 3 bytes; byte 500 lands inside the char at 499..502 —
+        // the exact panic from the wild. Must back off to 499.
+        let mut s = "a".repeat(499);
+        s.push('─');
+        s.push_str(&"b".repeat(600));
+        assert_eq!(s.len(), 1102);
+        let out = truncate(&s, 500);
+        let prefix = out.strip_suffix("... (1102 bytes)").unwrap();
+        assert_eq!(prefix.len(), 499);
+        assert!(prefix.chars().all(|c| c == 'a'));
+    }
+
+    #[test]
+    fn multibyte_at_exact_boundary_is_kept() {
+        let mut s = "a".repeat(497);
+        s.push('─'); // bytes 497..500, ends exactly at 500
+        s.push_str(&"b".repeat(600));
+        let out = truncate(&s, 500);
+        let prefix = out.split("... (").next().unwrap();
+        assert_eq!(prefix.len(), 500);
+        assert!(prefix.ends_with('─'));
+    }
+
+    #[test]
+    fn truncate_tiny_max_on_multibyte_start() {
+        // Max smaller than the first char: yields an empty prefix, not a panic.
+        let out = truncate("───", 1);
+        assert!(out.starts_with("... ("));
     }
 }
 
@@ -4286,7 +4397,9 @@ fn common_prefix(items: &[String]) -> String {
             }
         }
     }
-    first[..end].to_string()
+    // `end` comes from byte comparisons and can land inside a multibyte
+    // char — back off to a boundary rather than panic on the slice.
+    safe_prefix(first, end).to_string()
 }
 
 fn dirs_home() -> PathBuf {
@@ -4943,9 +5056,10 @@ fn execute_tool_call(name: &str, args_json: &str, proxy: &Option<String>) -> Str
                             match resp.text() {
                                 Ok(text) => {
                                     if text.len() > 50000 {
+                                        let prefix = safe_prefix(&text, 50000);
                                         format!(
                                             "{}...[truncated, total {} bytes]",
-                                            &text[..50000],
+                                            prefix,
                                             text.len()
                                         )
                                     } else {
@@ -5220,6 +5334,68 @@ mod continuation_tests {
         assert!(!needs_continuation(""));
         assert!(!needs_continuation("   \n "));
         assert!(!needs_continuation("```rust\nfn main() {}\n```"));
+    }
+}
+
+#[cfg(test)]
+mod menu_focus_tests {
+    use super::{App, Focus, InputMode, common_prefix};
+    use crate::config::Config;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn test_app() -> App {
+        let cfg = Config {
+            logging: false,
+            logfile: std::env::temp_dir()
+                .join(format!("rustama-test-{}.log", std::process::id()))
+                .to_string_lossy()
+                .to_string(),
+            ..Config::default()
+        };
+        App::new(cfg)
+    }
+
+    #[test]
+    fn esc_leaves_menu_input_mode() {
+        // Regression (found by pty_acid_rustama_in_rustama): Esc closed
+        // the menu widget but left input_mode on Menu — keystrokes kept
+        // being routed to the invisible menu and typed text was
+        // swallowed while the keybar kept showing the menu hints.
+        let mut app = test_app();
+        app.handle_global_key(KeyEvent::new(KeyCode::F(9), KeyModifiers::NONE));
+        assert_eq!(app.input_mode, InputMode::Menu);
+        assert!(app.main_menu.is_open());
+        app.handle_global_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!app.main_menu.is_open());
+        assert_ne!(app.input_mode, InputMode::Menu);
+        // Typed text reaches the input box again.
+        app.handle_global_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert_eq!(app.textarea.lines().join(""), "x");
+    }
+
+    #[test]
+    fn plain_g_does_not_release_terminal_focus() {
+        // Regression: `a || b && c` precedence made a bare 'g' release
+        // terminal focus — only Ctrl+G may (the documented escape hatch).
+        let mut app = test_app();
+        app.focus = Focus::Terminal;
+        app.handle_global_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
+        assert_eq!(app.focus, Focus::Terminal);
+        app.handle_global_key(KeyEvent::new(KeyCode::Char('G'), KeyModifiers::SHIFT));
+        assert_eq!(app.focus, Focus::Terminal);
+        app.handle_global_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL));
+        assert_eq!(app.focus, Focus::Input);
+    }
+
+    #[test]
+    fn common_prefix_never_splits_chars() {
+        // '₹' and '─' share the leading byte E2 but differ at byte 1 —
+        // the byte-level match length lands inside '₹'. Must back off to
+        // a char boundary instead of panicking on the slice.
+        let items = vec!["₹abc".to_string(), "─xyz".to_string()];
+        assert_eq!(common_prefix(&items), "");
+        let items = vec!["model-a".to_string(), "model-b".to_string()];
+        assert_eq!(common_prefix(&items), "model-");
     }
 }
 
@@ -5805,16 +5981,12 @@ mod tests {
         assert!(r.contains("Terminal opened"), "{}", r);
         wait(500);
 
-        // Launch the inner Rustama.
+        // Launch the inner Rustama. Wait until its UI is actually on
+        // screen before sending anything else: crossterm drains pending
+        // input while enabling raw mode, so keystrokes sent during init
+        // are silently lost (the "typed text didn't land" race).
         ts.send_input(&bin);
-        // crossterm queries the cursor position at startup; the vt100
-        // callbacks queue replies that must be flushed back to the PTY.
-        for _ in 0..30 {
-            wait(100);
-            ts.flush_replies();
-        }
-        let screen = ts.read_buffer_incremental(None);
-        let screen = screen["screen"].as_str().unwrap().to_string();
+        let screen = ts.wait_for_screen("Rustama", std::time::Duration::from_secs(10));
         assert!(
             screen.contains("F9") || screen.contains("Menu") || screen.contains("Rustama"),
             "inner rustama didn't render its UI:\n{}",
@@ -5823,25 +5995,37 @@ mod tests {
 
         // F9 opens the inner menu.
         ts.send_raw("\x1b[20~").unwrap();
-        wait(700);
-        let screen = ts.read_buffer_incremental(None);
-        let screen = screen["screen"].as_str().unwrap().to_string();
+        let screen = ts.wait_for_screen("Load", std::time::Duration::from_secs(3));
         assert!(
             screen.contains("Load") || screen.contains("Save") || screen.contains("Exit"),
             "F9 menu didn't open in inner rustama:\n{}",
             screen
         );
 
-        // Esc closes it, F10 asks to quit, 'y' confirms.
-        ts.send_raw("\x1b").unwrap();
-        wait(400);
+        // A bare ESC closes the menu. This is the regression test for
+        // send_input appending "\n" unconditionally: glued onto a lone
+        // ESC it broke the key (and decoded as Ctrl+J elsewhere).
+        ts.send_input("\x1b");
+        let screen = ts.wait_for_screen("Enter:Send", std::time::Duration::from_secs(3));
+        assert!(
+            !screen.contains("Export..."),
+            "ESC didn't close the inner rustama menu:\n{}",
+            screen
+        );
+
+        // Plain text lands in the input box, Enter (\r, appended by
+        // send_input for text) is decoded as the Enter key.
+        ts.send_input("hi from the acid test");
+        let screen = ts.wait_for_screen("hi from the acid test", std::time::Duration::from_secs(5));
+        assert!(
+            screen.contains("hi from the acid test"),
+            "typed text didn't land in the inner rustama input:\n{}",
+            screen
+        );
+
+        // F10 asks to quit, 'y' confirms.
         ts.send_raw("\x1b[21~").unwrap();
-        for _ in 0..7 {
-            wait(100);
-            ts.flush_replies();
-        }
-        let screen = ts.read_buffer_incremental(None);
-        let screen = screen["screen"].as_str().unwrap().to_string();
+        let screen = ts.wait_for_screen("uit", std::time::Duration::from_secs(3));
         assert!(
             screen.contains("uit"),
             "F10 quit dialog didn't show:\n{}",
