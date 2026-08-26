@@ -548,6 +548,13 @@ impl TerminalState {
             .unwrap_or_else(|e| e)
     }
 
+    /// Whether the child app enabled application cursor keys mode
+    /// (DECCKM, `ESC[?1h`) — the vt100 parser tracks it. Full-screen
+    /// apps (htop, vim, less) turn it on; see [`key_to_pty_bytes`].
+    pub fn application_cursor(&self) -> bool {
+        self.core.lock().unwrap().parser.screen().application_cursor()
+    }
+
     /// Writes raw bytes to the PTY master with no trailing newline —
     /// keystrokes, escape sequences, control characters.
     pub fn send_raw(&mut self, data: &str) -> Result<(), String> {
@@ -655,7 +662,15 @@ impl TerminalState {
 /// Maps a crossterm key event to the bytes a real terminal would send for
 /// it, for forwarding to the PTY when the terminal panel has keyboard
 /// focus. Returns `None` for keys that have no terminal encoding.
-pub fn key_to_pty_bytes(key: &KeyEvent) -> Option<String> {
+///
+/// `application_cursor` must reflect the child app's DECCKM mode
+/// (`ESC[?1h`, tracked by the vt100 parser): full-screen apps like htop
+/// or vim enable it and expect SS3 sequences (`ESC O A`) for the arrow
+/// and Home/End keys, while shells and line-mode programs expect the
+/// normal CSI form (`ESC [ A`). Sending the wrong form either does
+/// nothing or decodes as unrelated keys (CSI Right decodes inside
+/// htop's ncurses input as F2/Setup).
+pub fn key_to_pty_bytes(key: &KeyEvent, application_cursor: bool) -> Option<String> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
@@ -691,12 +706,24 @@ pub fn key_to_pty_bytes(key: &KeyEvent) -> Option<String> {
         KeyCode::BackTab => "\x1b[Z".to_string(),
         KeyCode::Backspace => "\x7f".to_string(),
         KeyCode::Esc => "\x1b".to_string(),
-        KeyCode::Up => "\x1b[A".to_string(),
-        KeyCode::Down => "\x1b[B".to_string(),
-        KeyCode::Right => "\x1b[C".to_string(),
-        KeyCode::Left => "\x1b[D".to_string(),
-        KeyCode::Home => "\x1b[H".to_string(),
-        KeyCode::End => "\x1b[F".to_string(),
+        KeyCode::Up => {
+            if application_cursor { "\x1bOA" } else { "\x1b[A" }.to_string()
+        }
+        KeyCode::Down => {
+            if application_cursor { "\x1bOB" } else { "\x1b[B" }.to_string()
+        }
+        KeyCode::Right => {
+            if application_cursor { "\x1bOC" } else { "\x1b[C" }.to_string()
+        }
+        KeyCode::Left => {
+            if application_cursor { "\x1bOD" } else { "\x1b[D" }.to_string()
+        }
+        KeyCode::Home => {
+            if application_cursor { "\x1bOH" } else { "\x1b[H" }.to_string()
+        }
+        KeyCode::End => {
+            if application_cursor { "\x1bOF" } else { "\x1b[F" }.to_string()
+        }
         KeyCode::PageUp => "\x1b[5~".to_string(),
         KeyCode::PageDown => "\x1b[6~".to_string(),
         KeyCode::Delete => "\x1b[3~".to_string(),
@@ -1001,7 +1028,8 @@ impl App {
                 self.status_message = "Terminal focus released (back to input)".to_string();
                 return;
             }
-            if let Some(bytes) = key_to_pty_bytes(&key) {
+            let application_cursor = self.terminal_state.application_cursor();
+            if let Some(bytes) = key_to_pty_bytes(&key, application_cursor) {
                 let _ = self.terminal_state.send_raw(&bytes);
             }
             return;
@@ -5852,50 +5880,108 @@ mod tests {
         use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
         let ev = |code, modifiers| KeyEvent::new(code, modifiers);
+        // Normal (shell) mode: arrows/Home/End use the CSI forms.
+        let k = |code, modifiers| key_to_pty_bytes(&ev(code, modifiers), false);
+        assert_eq!(k(KeyCode::Char('a'), KeyModifiers::NONE).as_deref(), Some("a"));
         assert_eq!(
-            key_to_pty_bytes(&ev(KeyCode::Char('a'), KeyModifiers::NONE)).as_deref(),
-            Some("a")
-        );
-        assert_eq!(
-            key_to_pty_bytes(&ev(KeyCode::Char('c'), KeyModifiers::CONTROL)).as_deref(),
+            k(KeyCode::Char('c'), KeyModifiers::CONTROL).as_deref(),
             Some("\x03"),
             "Ctrl+C -> ETX"
         );
         assert_eq!(
-            key_to_pty_bytes(&ev(KeyCode::Char('d'), KeyModifiers::CONTROL)).as_deref(),
+            k(KeyCode::Char('d'), KeyModifiers::CONTROL).as_deref(),
             Some("\x04"),
             "Ctrl+D -> EOT"
         );
+        assert_eq!(k(KeyCode::Enter, KeyModifiers::NONE).as_deref(), Some("\r"));
         assert_eq!(
-            key_to_pty_bytes(&ev(KeyCode::Enter, KeyModifiers::NONE)).as_deref(),
-            Some("\r")
-        );
-        assert_eq!(
-            key_to_pty_bytes(&ev(KeyCode::Backspace, KeyModifiers::NONE)).as_deref(),
+            k(KeyCode::Backspace, KeyModifiers::NONE).as_deref(),
             Some("\x7f")
         );
+        assert_eq!(k(KeyCode::Up, KeyModifiers::NONE).as_deref(), Some("\x1b[A"));
+        assert_eq!(k(KeyCode::Down, KeyModifiers::NONE).as_deref(), Some("\x1b[B"));
         assert_eq!(
-            key_to_pty_bytes(&ev(KeyCode::Up, KeyModifiers::NONE)).as_deref(),
-            Some("\x1b[A")
+            k(KeyCode::Right, KeyModifiers::NONE).as_deref(),
+            Some("\x1b[C")
         );
+        assert_eq!(k(KeyCode::Left, KeyModifiers::NONE).as_deref(), Some("\x1b[D"));
+        assert_eq!(k(KeyCode::Home, KeyModifiers::NONE).as_deref(), Some("\x1b[H"));
+        assert_eq!(k(KeyCode::End, KeyModifiers::NONE).as_deref(), Some("\x1b[F"));
+        assert_eq!(k(KeyCode::F(1), KeyModifiers::NONE).as_deref(), Some("\x1bOP"));
         assert_eq!(
-            key_to_pty_bytes(&ev(KeyCode::F(1), KeyModifiers::NONE)).as_deref(),
-            Some("\x1bOP")
-        );
-        assert_eq!(
-            key_to_pty_bytes(&ev(KeyCode::Delete, KeyModifiers::NONE)).as_deref(),
+            k(KeyCode::Delete, KeyModifiers::NONE).as_deref(),
             Some("\x1b[3~")
         );
         assert_eq!(
-            key_to_pty_bytes(&ev(KeyCode::Char('x'), KeyModifiers::ALT)).as_deref(),
+            k(KeyCode::Char('x'), KeyModifiers::ALT).as_deref(),
             Some("\x1bx"),
             "Alt prefixes ESC"
         );
         assert_eq!(
-            key_to_pty_bytes(&ev(KeyCode::Tab, KeyModifiers::SHIFT)).as_deref(),
+            k(KeyCode::Tab, KeyModifiers::SHIFT).as_deref(),
             Some("\x1b[Z"),
             "Shift+Tab -> backtab"
         );
+    }
+
+    #[test]
+    fn key_events_application_cursor_mode() {
+        // Regression: htop (and any ncurses/crossterm full-screen app)
+        // enables DECCKM (ESC[?1h) and expects the SS3 arrow forms.
+        // The CSI forms either do nothing or decode as unrelated keys
+        // (CSI Right decodes as F2/Setup inside htop).
+        use super::key_to_pty_bytes;
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let ev = |code, modifiers| KeyEvent::new(code, modifiers);
+        let k = |code, modifiers| key_to_pty_bytes(&ev(code, modifiers), true);
+        assert_eq!(k(KeyCode::Up, KeyModifiers::NONE).as_deref(), Some("\x1bOA"));
+        assert_eq!(k(KeyCode::Down, KeyModifiers::NONE).as_deref(), Some("\x1bOB"));
+        assert_eq!(
+            k(KeyCode::Right, KeyModifiers::NONE).as_deref(),
+            Some("\x1bOC")
+        );
+        assert_eq!(k(KeyCode::Left, KeyModifiers::NONE).as_deref(), Some("\x1bOD"));
+        assert_eq!(k(KeyCode::Home, KeyModifiers::NONE).as_deref(), Some("\x1bOH"));
+        assert_eq!(k(KeyCode::End, KeyModifiers::NONE).as_deref(), Some("\x1bOF"));
+        // Application mode only changes the six cursor-editing keys.
+        assert_eq!(k(KeyCode::Char('a'), KeyModifiers::NONE).as_deref(), Some("a"));
+        assert_eq!(k(KeyCode::Enter, KeyModifiers::NONE).as_deref(), Some("\r"));
+        assert_eq!(k(KeyCode::F(2), KeyModifiers::NONE).as_deref(), Some("\x1bOQ"));
+        assert_eq!(
+            k(KeyCode::Delete, KeyModifiers::NONE).as_deref(),
+            Some("\x1b[3~")
+        );
+    }
+
+    #[test]
+    fn application_cursor_tracks_decckm() {
+        // The flag must follow the child's own mode change: ESC[?1h on,
+        // ESC[?1l back off. Feed the mode change through the real PTY so
+        // the vt100 parser sees exactly what a full-screen app emits.
+        use super::TerminalState;
+        let mut ts = TerminalState::new();
+        let result = ts.open("");
+        assert!(result.contains("Terminal opened"), "open: {}", result);
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        assert!(
+            !ts.application_cursor(),
+            "shell must start in normal cursor mode"
+        );
+        ts.send_input("printf '\\033[?1h'");
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        assert!(
+            ts.application_cursor(),
+            "ESC[?1h must switch the parser to application cursor mode"
+        );
+        ts.send_input("printf '\\033[?1l'");
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        assert!(
+            !ts.application_cursor(),
+            "ESC[?1l must switch back to normal cursor mode"
+        );
+        ts.close();
     }
 
     /// Full acid test: real interactive programs through the PTY — a REPL,
