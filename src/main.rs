@@ -479,14 +479,8 @@ fn render_output(f: &mut Frame, app: &mut App, area: Rect) {
         if app.is_loading && !app.streaming_text.is_empty() {
             let mut md_lines = render_markdown(&app.streaming_text);
             lines.append(&mut md_lines);
-        } else if app.is_loading && app.streaming_thinking.is_empty() {
-            lines.push(Line::from(Span::styled(
-                "  Streaming response...",
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::SLOW_BLINK),
-            )));
         }
+        // No "waiting" placeholder: the status bar's throbber covers it.
         app.cached_streaming_len = streaming_len;
         app.cached_streaming_thinking_len = streaming_thinking_len;
         app.cached_wrapped = wrap_and_justify_lines(&lines, output_width, app.justify);
@@ -743,11 +737,31 @@ fn render_send_button(f: &mut Frame, app: &App, area: Rect) {
     );
 }
 
+/// Activity throbber shown as the status bar's first field: a rotating
+/// ASCII spinner while a response streams, the meditating guy when idle.
+/// Animated from wall-clock time — the UI loop redraws every ~50ms.
+fn throbber(app: &App) -> &'static str {
+    if app.is_loading {
+        const FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        FRAMES[(now / 100) as usize % FRAMES.len()]
+    } else {
+        "🧘"
+    }
+}
+
 fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
     let activity = app.status_message.trim().to_string();
     let token_info = app.format_token_stats();
 
-    // Mode indicator always leads the bar: "mode | messages | tokens".
+    // Throbber always leads the bar, then "mode | messages | tokens".
+    let mut spans: Vec<Span> = vec![Span::styled(
+        format!(" {} ", throbber(app)),
+        Style::default().fg(Color::Yellow),
+    )];
     let (mode_label, mode_style) = if app.agentic_mode {
         (
             " AGENTIC ",
@@ -766,20 +780,16 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
     };
 
     let sep_style = Style::default().fg(Color::Gray);
-    let mut spans: Vec<Span> = vec![Span::styled(mode_label, mode_style)];
+    spans.push(Span::styled(mode_label, mode_style));
 
     if !activity.is_empty() {
         spans.push(Span::styled("|", sep_style));
-        let style = if app.is_loading || app.retrying {
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD)
-        } else {
+        spans.push(Span::styled(
+            format!(" {} ", activity),
             Style::default()
                 .fg(Color::White)
-                .add_modifier(Modifier::BOLD)
-        };
-        spans.push(Span::styled(format!(" {} ", activity), style));
+                .add_modifier(Modifier::BOLD),
+        ));
     }
 
     if !token_info.is_empty() {
@@ -1808,4 +1818,58 @@ fn normalize_code_fences(lines: &[&str]) -> Vec<String> {
         }
     }
     result
+}
+
+#[cfg(test)]
+mod throbber_tests {
+    use super::throbber;
+    use crate::app::App;
+    use crate::config::Config;
+
+    fn test_app() -> App {
+        App::new(Config {
+            logging: false,
+            logfile: std::env::temp_dir()
+                .join(format!("rustama-test-{}.log", std::process::id()))
+                .to_string_lossy()
+                .to_string(),
+            ..Config::default()
+        })
+    }
+
+    #[test]
+    fn idle_shows_meditating_guy() {
+        let app = test_app();
+        assert!(!app.is_loading);
+        assert_eq!(throbber(&app), "🧘");
+    }
+
+    #[test]
+    fn streaming_shows_spinner_frame() {
+        let mut app = test_app();
+        app.is_loading = true;
+        let frame = throbber(&app);
+        assert!(
+            ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"].contains(&frame),
+            "expected a spinner frame, got {:?}",
+            frame
+        );
+    }
+
+    #[test]
+    fn spinner_animates_over_time() {
+        // Two reads 150ms apart should (almost always) yield different
+        // frames — the frame changes every 100ms.
+        let mut app = test_app();
+        app.is_loading = true;
+        let a = throbber(&app);
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        let b = throbber(&app);
+        // Same frame is possible if we landed exactly on a boundary;
+        // retry once rather than flake.
+        if a == b {
+            std::thread::sleep(std::time::Duration::from_millis(120));
+            assert_ne!(a, throbber(&app), "spinner must rotate");
+        }
+    }
 }

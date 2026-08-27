@@ -1798,7 +1798,7 @@ impl App {
         self.is_loading = true;
         self.streaming_text.clear();
         self.streaming_thinking.clear();
-        self.status_message = "Processing tool results...".to_string();
+        // Tool rounds also stream: the status bar throbber signals it.
 
         let model = self.model_name.clone();
         let is_cloud = self.cloud_models.iter().any(|m| m.name == model);
@@ -1963,7 +1963,8 @@ impl App {
         self.retrying = false;
         self.streaming_text.clear();
         self.streaming_thinking.clear();
-        self.status_message = "Streaming response...".to_string();
+        // No "Streaming response..." status message: the status bar's
+        // throbber (🧘 → spinning) signals activity now.
         self.set_auto_scroll();
 
         let model = self.model_name.clone();
