@@ -759,7 +759,7 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
 
     // Throbber always leads the bar, then "mode | messages | tokens".
     let mut spans: Vec<Span> = vec![Span::styled(
-        format!(" {} ", throbber(app)),
+        format!(" {} |", throbber(app)),
         Style::default().fg(Color::Yellow),
     )];
     let (mode_label, mode_style) = if app.agentic_mode {
@@ -844,9 +844,8 @@ fn render_keybar(f: &mut Frame, app: &App, area: Rect) {
             focus_label, terminal_hint, resize_hint
         ),
         InputMode::Input => format!(" Enter:Send  Alt+Enter:Newline{}", terminal_hint),
-        InputMode::Menu => {
-            " \u{2190}\u{2192}:Navigate  \u{2191}\u{2193}:Select  Enter:Open  Esc:Close".to_string()
-        }
+        //NOTE to AI InputMode::Menu does not need hints, do not readd them
+        InputMode::Menu=> format!("")
     };
 
     let keybar = Paragraph::new(Line::from(Span::styled(
