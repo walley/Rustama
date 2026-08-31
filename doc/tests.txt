@@ -1,0 +1,80 @@
+TERMINAL REGRESSION TEST SUITE — Rustama
+=========================================
+Run in order. Each test lists: action -> expected result.
+Prereq: fresh terminal session per test unless noted.
+
+T1. BASIC OPEN + READ
+    terminal_open("echo HELLO_MARKER")
+    terminal_read(cursor=0)
+    -> output contains "HELLO_MARKER"; cursor > 0; gap=false
+
+T2. INTERACTIVE SEND
+    Open shell, terminal_send("echo REPLY_$((6*7))")
+    terminal_read(cursor=<from prev>)
+    -> output "REPLY_42"; only new bytes returned
+
+T3. STATE PERSISTENCE
+    send: export V=42 && cd /tmp
+    then send: echo "v=$V d=$PWD"
+    -> "v=42 d=/tmp" (env and cwd survive across sends, same shell)
+
+T4. SPECIAL CHARACTERS
+    send: echo 'a' "b" \$ESC héllo→✓ 's;c' "p|p"
+    -> literal output: a b $ESC héllo→✓ s;c p|p
+       (quoting honored, unicode intact, $ not expanded when escaped,
+        metachars inside quotes not executed)
+
+T5. STREAMING INCREMENTAL READS
+    send: for i in 1..6; do echo "S_$i"; sleep 1; done; echo S_DONE
+    read(cursor) immediately, then read(cursor) again after ~7s
+    -> first read: partial (S_1..S_k, k<6), no S_DONE
+       second read: ONLY remaining lines + S_DONE, no duplicates,
+       cursor strictly increasing
+
+T6. SHELL FALLBACK CONTINUITY (F8 regression)
+    terminal_open("echo T0; sleep 2; echo T5") ; read(cursor=0)
+    -> "T0\nT5", cursor=10
+    wait for exit; terminal_send("echo AFTER")
+    read(cursor=10)
+    -> "AFTER" exactly; cursor continues upward (no reset, no error)
+    read(cursor=0) -> full history T0,T5,AFTER in one stream
+
+T7. STDERR CAPTURE (F7 regression)
+    terminal_open("ls /nonexistent_xyz; echo EC=$?")
+    read(cursor=0)
+    -> contains "No such file or directory" AND "EC=2"
+
+T8. CURSOR VALIDATION (F6 regression)
+    read(cursor=999999) on a session with cursor N
+    -> error field present naming the invalid value and the
+       true total (N); returned cursor == N; session still usable
+       (subsequent normal read works)
+
+T9. EMPTY POLL EDGE CASE
+    read(cursor=<current end-of-buffer>)
+    -> output "", cursor unchanged, gap=false, no error
+
+T10. LARGE OUTPUT INTEGRITY
+    send: seq 1 1000 loop echoing ~44B lines
+    read(cursor=<pre-flood>)
+    -> all 1000 lines present, first line = LINE_1 (no mid-line
+       start), cursor advances by exact byte count
+    NOTE: if a buffer cap is ever (re)introduced, expected behavior
+       changes to: tail window returned with gap=true and cursor
+       still monotonic. Pin the cap value here when decided.
+
+T11. DOUBLE-OPEN GUARD
+    terminal_open(X) while session active
+    -> refused with "already running" message; existing session
+       and its buffer/cursor untouched; X never executes
+
+T12. CLOSE + REOPEN
+    terminal_close(), terminal_open("echo FRESH")
+    -> new shell: new PID, cwd = project root, cursor restarts
+       at 0; old buffer fully discarded
+
+QUICK SMOKE SEQUENCE (catches T1,T5,T6 in ~15s)
+    1. open:  for i in 1..8; do echo "S_$i $(date +%T)"; sleep 1; done; echo DONE
+    2. read(cursor=0) mid-run  -> partial lines, cursor c1
+    3. read(cursor=c1) after   -> only remaining lines + DONE
+    4. send: echo POST         -> read(cursor=c2) returns just "POST"
