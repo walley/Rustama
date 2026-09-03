@@ -17,6 +17,9 @@ pub struct Config {
     pub max_retries: u32,
     pub terminal_width_pct: u16,
     pub justify: bool,
+    /// Show the hint bar (key hints / focus indicator) on the
+    /// second-to-last terminal line. Default: off.
+    pub hintbar: bool,
 }
 
 /// Per-model sampling / generation parameters.
@@ -222,6 +225,7 @@ impl Default for Config {
             max_retries: 10,
             terminal_width_pct: 40,
             justify: false,
+            hintbar: false,
         }
     }
 }
@@ -254,6 +258,14 @@ impl Config {
                             "true".to_string()
                         } else {
                             "false".to_string()
+                        },
+                    ),
+                    (
+                        "hintbar",
+                        if dflt.hintbar {
+                            "on".to_string()
+                        } else {
+                            "off".to_string()
                         },
                     ),
                 ];
@@ -309,6 +321,8 @@ impl Config {
              max_retries = {}\n\n\
              # Justify paragraphs in output (true/false, default: false)\n\
              justify = {}\n\n\
+             # Show the hint bar above the keybar (on/off, default: off)\n\
+             hintbar = {}\n\n\
              # NOTE: model parameters (temperature, top_p, top_k,\n\
              # frequency_penalty, presence_penalty, max_output_tokens,\n\
              # reasoning_effort, seed) are per-model now — see\n\
@@ -324,6 +338,7 @@ impl Config {
             self.max_tool_rounds,
             self.max_retries,
             self.justify,
+            if self.hintbar { "on" } else { "off" },
         )
     }
 
@@ -390,6 +405,9 @@ impl Config {
         if let Some(v) = values.get("justify") {
             cfg.justify = parse_bool(v);
         }
+        if let Some(v) = values.get("hintbar") {
+            cfg.hintbar = parse_bool(v);
+        }
 
         cfg
     }
@@ -452,6 +470,10 @@ impl Config {
         lines.push(format!("max_retries = {}", self.max_retries));
         lines.push(format!("terminal_width_pct = {}", self.terminal_width_pct));
         lines.push(format!("justify = {}", self.justify));
+        lines.push(format!(
+            "hintbar = {}",
+            if self.hintbar { "on" } else { "off" }
+        ));
         fs::write(&conf_path, lines.join("\n")).map_err(|e| e.to_string())?;
         Ok(())
     }

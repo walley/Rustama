@@ -688,6 +688,7 @@ pub enum ActiveMenu {
 #[derive(Debug, Clone, PartialEq)]
 pub enum MenuAction {
     None,
+    NewSession,
     LoadSession,
     SaveSession,
     ExportChat,
@@ -727,7 +728,7 @@ impl MainMenu {
 
     pub fn item_names(&self) -> Vec<&'static str> {
         match self.active {
-            ActiveMenu::File => vec!["Load", "Save", "Export...", "\u{2500}", "Exit"],
+            ActiveMenu::File => vec!["New", "Load", "Save", "Export...", "\u{2500}", "Exit"],
             ActiveMenu::Edit => vec!["Set Model", "Agentic Mode", "\u{2500}", "Settings..."],
             ActiveMenu::View => vec!["Terminal"],
             ActiveMenu::Help => vec!["About"],
@@ -786,10 +787,11 @@ impl MainMenu {
 
     fn action_for(&self, menu: ActiveMenu, index: usize) -> MenuAction {
         match (menu, index) {
-            (ActiveMenu::File, 0) => MenuAction::LoadSession,
-            (ActiveMenu::File, 1) => MenuAction::SaveSession,
-            (ActiveMenu::File, 2) => MenuAction::ExportChat,
-            (ActiveMenu::File, 4) => MenuAction::Quit,
+            (ActiveMenu::File, 0) => MenuAction::NewSession,
+            (ActiveMenu::File, 1) => MenuAction::LoadSession,
+            (ActiveMenu::File, 2) => MenuAction::SaveSession,
+            (ActiveMenu::File, 3) => MenuAction::ExportChat,
+            (ActiveMenu::File, 5) => MenuAction::Quit,
             (ActiveMenu::Edit, 0) => MenuAction::OpenModelDialog,
             (ActiveMenu::Edit, 1) => MenuAction::ToggleAgenticMode(true),
             (ActiveMenu::Edit, 3) => MenuAction::OpenSettingsDialog,

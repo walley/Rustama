@@ -24,6 +24,10 @@ use app::{App, ChatMessage, Focus, InputMode, ModelDialogFocus, SaveDialogFocus,
 use config::Config;
 use ui::{Button, ConfirmationBox, FileActionDialog, dialog_block};
 
+/// Midnight Commander's signature turquoise-green (its "cyan" keybar/menu
+/// text, approximated as truecolor).
+const MC_GREEN: Color = Color::Rgb(0, 187, 187);
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -93,7 +97,8 @@ where
                         }
                         MouseEventKind::Drag(MouseButton::Left) => {
                             let size = terminal.size()?;
-                            let input_start = size.height.saturating_sub(6);
+                            let input_start =
+                                size.height.saturating_sub(6 + app.bottom_rows());
                             app.handle_mouse_drag(mouse.row, input_start);
                         }
                         _ => {}
@@ -117,7 +122,8 @@ where
                             }
                             MouseEventKind::Drag(MouseButton::Left) => {
                                 let size = terminal.size()?;
-                                let input_start = size.height.saturating_sub(6);
+                                let input_start =
+                                    size.height.saturating_sub(6 + app.bottom_rows());
                                 app.handle_mouse_drag(mouse.row, input_start);
                             }
                             _ => {}
@@ -160,7 +166,8 @@ where
                             }
                             MouseEventKind::Drag(MouseButton::Left) => {
                                 let size = terminal.size()?;
-                                let input_start = size.height.saturating_sub(6);
+                                let input_start =
+                                    size.height.saturating_sub(6 + app.bottom_rows());
                                 app.handle_mouse_drag(mouse.row, input_start);
                             }
                             _ => {}
@@ -185,15 +192,23 @@ where
 fn ui(f: &mut Frame, app: &mut App) {
     let area = f.area();
 
+    // Bottom rows: the keybar (F-key strip) is always the last line;
+    // the hint bar sits right above it (second-to-last line) and is
+    // only shown when `hintbar = on` in the config.
+    let hintbar_rows = app.bottom_rows() - 1;
     let main_chunks = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(1),
+        Constraint::Length(hintbar_rows),
         Constraint::Length(1),
     ])
     .split(area);
 
     app.main_menu.render_bar(f, main_chunks[0]);
-    render_keybar(f, app, main_chunks[2]);
+    if app.hintbar {
+        render_hintbar(f, app, main_chunks[2]);
+    }
+    render_keybar(f, app, main_chunks[3]);
 
     let show_terminal = app.terminal_state.visible && app.terminal_state.is_running();
 
@@ -611,6 +626,9 @@ fn render_input(f: &mut Frame, app: &App, area: Rect) {
             " Input (i or Enter to type) ".to_string(),
             Style::default().fg(Color::DarkGray),
         ),
+
+
+
     };
 
     let block = Block::default()
@@ -740,9 +758,16 @@ fn render_send_button(f: &mut Frame, app: &App, area: Rect) {
 /// Activity throbber shown as the status bar's first field: a rotating
 /// ASCII spinner while a response streams, the meditating guy when idle.
 /// Animated from wall-clock time — the UI loop redraws every ~50ms.
+///Braille Circle: ⣾ ⣽ ⣻ ⢿ ⡿ ⣟ ⣯ ⣷
+///Clockwise Quadrants: ◴ ◷ ◶ ◵
+///Audio Equalizer Bars: ▂ ▃ ▄ ▆ ▇ █ ▇ ▆ ▅ ▄ ▃ ▂
+///Trigrams / Radar: ☰ ☱ ☳ ☷ ☶ ☴
+
 fn throbber(app: &App) -> &'static str {
     if app.is_loading {
-        const FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+//        const FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+        const FRAMES: &[&str] = &["⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"];
+
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -805,10 +830,13 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(bar, area);
 }
 
-fn render_keybar(f: &mut Frame, app: &App, area: Rect) {
-    // Terminal focus has its own keybar: keys go to the shell.
+/// The hint bar: context-sensitive key hints and the focus indicator.
+/// Rendered on the second-to-last line, only when `hintbar = on` in the
+/// config (see `ui()`).
+fn render_hintbar(f: &mut Frame, app: &App, area: Rect) {
+    // Terminal focus has its own hintbar: keys go to the shell.
     if app.focus == Focus::Terminal {
-        let keybar = Paragraph::new(Line::from(Span::styled(
+        let hintbar = Paragraph::new(Line::from(Span::styled(
             format!(
                 " [TERMINAL: {}]  keystrokes go to the shell  Ctrl+G:Release  Ctrl+T:Hide",
                 app.terminal_state.command
@@ -816,7 +844,7 @@ fn render_keybar(f: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(Color::Black).bg(Color::Green),
         )))
         .style(Style::default().bg(Color::Green));
-        f.render_widget(keybar, area);
+        f.render_widget(hintbar, area);
         return;
     }
 
@@ -848,12 +876,63 @@ fn render_keybar(f: &mut Frame, app: &App, area: Rect) {
         InputMode::Menu=> format!("")
     };
 
-    let keybar = Paragraph::new(Line::from(Span::styled(
+    let hintbar = Paragraph::new(Line::from(Span::styled(
         text,
         Style::default().fg(Color::White).bg(Color::DarkGray),
     )))
     .style(Style::default().bg(Color::DarkGray));
 
+    f.render_widget(hintbar, area);
+}
+
+/// Midnight-Commander style key strip, always the last terminal line.
+/// Shows all the F-keys currently unused are empty
+/// — with white-on-black numbers and MC's turquoise-green bg labels,
+/// stretched to fill the whole terminal width.
+fn render_keybar(f: &mut Frame, app: &App, area: Rect) {
+    const NUM_STYLE: Style = Style::new().fg(Color::White).bg(Color::Black);
+    const LABEL_STYLE: Style = Style::new().fg(Color::Black).bg(MC_GREEN);
+
+    let labels: [(&str, &str); 10] = if app.focus == Focus::Terminal {
+        [("1", "Help"), ("2", " "),("3", " "),("4", " "),("5", " "), ("6", "Release"),("7", "Release"),("8", "Release"), ("9", " "), ("10", "Exit")]
+    } else {
+        [("1", "Help"), ("2", " "),("3", " "),("4", " "),("5", " "), ("6", "t"),("7", "Release"),("8", "Release"), ("9", " "), ("10", "Exit")]
+    };
+
+    // Slot layout: two cells per F-key ("10" needs two for its number).
+    // Slots are stretched evenly across the full width, MC-style.
+    let slot_count: u16 = labels.iter().map(|(n, _)| n.len() as u16 + 1).sum();
+    let width = area.width;
+    let base = width / slot_count;
+    let extra = width % slot_count;
+
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut offset: u16 = 0;
+    for (num, label) in labels {
+        let cells = num.len() as u16 + 1;
+        let end = offset + cells * base + extra.min(offset + cells) - extra.min(offset);
+        let slot_w = end.saturating_sub(offset) as usize;
+        offset = end;
+
+        let text = format!("{}{}", num, label);
+        let text_w = text.chars().count();
+        let left_pad = 1;
+        let right_pad = slot_w.saturating_sub(text_w + left_pad);
+
+        if !label.is_empty() {
+            spans.push(Span::styled(
+                " ".repeat(left_pad),
+                Style::default().bg(Color::Black),
+            ));
+        }
+        spans.push(Span::styled(num.to_string(), NUM_STYLE));
+        spans.push(Span::styled(
+            format!("{}{}", label, " ".repeat(right_pad)),
+            LABEL_STYLE,
+        ));
+    }
+
+    let keybar = Paragraph::new(Line::from(spans)).style(Style::default().bg(Color::Black));
     f.render_widget(keybar, area);
 }
 
