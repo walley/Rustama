@@ -303,7 +303,7 @@ These tools manage a fully interactive terminal session inside Rustama. The term
 | Tool | Description |
 |------|-------------|
 | `terminal_open` | Open a terminal session and run a command (e.g. `npm run dev`, `cargo build`, `python3`). Returns a `cursor` for incremental reads |
-| `terminal_send` | Send input (keystrokes) to the running session — a newline is appended (like pressing Enter). Supports raw escape/control sequences for special keys: Ctrl+C = ``, arrows = `[A/B/C/D`, Tab = `	`, F-keys = `OP`…, PgUp/PgDn = `[5~`/`[6~` |
+| `terminal_send` | Send input (keystrokes) to the running session — a newline is appended (like pressing Enter). Backslash escapes are decoded into real control bytes before sending: Ctrl+C = `\u0003`, arrows = `\u001b[A/B/C/D`, Tab = `\t`, Escape = `\u001b`, F-keys = `\u001bOP`…, PgUp/PgDn = `\u001b[5~`/`\u001b[6~` |
 | `terminal_read` | Read output. Returns `output` (new raw output since `cursor`), `cursor`, `gap`, plus **`screen`** — the current rendered terminal screen as text (like a screenshot — use it to see what interactive/full-screen programs are showing) and `screen_cursor` (cursor row/col) |
 | `terminal_close` | Close the session, hide the panel, and kill the running process |
 

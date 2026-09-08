@@ -770,6 +770,95 @@ pub fn key_to_pty_bytes(key: &KeyEvent, application_cursor: bool) -> Option<Stri
     }
 }
 
+/// Decodes escape sequences embedded in a `terminal_send` input string into
+/// the actual bytes a terminal would receive for them.
+///
+/// Models (and the `terminal_send` tool description) express special keys as
+/// backslash escapes: `\u001b[A` for the Up arrow, `\u0003` for Ctrl+C,
+/// `\u001b[5~` for PageUp, `\t` for Tab, and so on. If these are written
+/// straight to the PTY they arrive as the *literal* characters `\`, `u`,
+/// `0`… and the child app never sees the intended key. This function turns
+/// those textual escapes into the real control bytes first.
+///
+/// Handled sequences:
+///   * `\uXXXX` / `\u{XXXX}` — a Unicode scalar, emitted as UTF-8 (this is
+///     what turns `\u001b` into the ESC byte, `\u0003` into ETX, …).
+///   * `\n` / `\r` / `\t` — newline, carriage return, tab.
+///   * `\\` — a literal backslash.
+/// Anything else (including an unknown `\x`) is passed through unchanged so
+/// ordinary text is never mangled.
+fn decode_terminal_escapes(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
+            Some('t') => out.push('\t'),
+            Some('\\') => out.push('\\'),
+            Some('u') => {
+                // `\uXXXX` (4 hex) or `\u{XXXX...}` (braced form).
+                if chars.peek() == Some(&'{') {
+                    chars.next(); // consume '{'
+                    let mut hex = String::new();
+                    for h in chars.by_ref() {
+                        if h == '}' {
+                            break;
+                        }
+                        hex.push(h);
+                    }
+                    if let Ok(n) = u32::from_str_radix(&hex, 16)
+                        && let Some(ch) = char::from_u32(n)
+                    {
+                        out.push(ch);
+                    } else {
+                        // Invalid escape — keep the literal text.
+                        out.push_str("\\u{");
+                        out.push_str(&hex);
+                        out.push('}');
+                    }
+                } else {
+                    let mut hex = String::new();
+                    for _ in 0..4 {
+                        if let Some(h) = chars.peek()
+                            && h.is_ascii_hexdigit()
+                        {
+                            hex.push(*h);
+                            chars.next();
+                        } else {
+                            break;
+                        }
+                    }
+                    if hex.len() == 4
+                        && let Ok(n) = u32::from_str_radix(&hex, 16)
+                        && let Some(ch) = char::from_u32(n)
+                    {
+                        out.push(ch);
+                    } else {
+                        // Not a valid \uXXXX — keep the literal text.
+                        out.push_str("\\u");
+                        out.push_str(&hex);
+                    }
+                }
+            }
+            Some(other) => {
+                // Unknown escape — keep the backslash and the char as-is.
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+
+    out
+}
+
 pub struct App {
     pub messages: Vec<ChatMessage>,
     pub textarea: TextArea<'static>,
@@ -1387,7 +1476,12 @@ impl App {
                 let args: serde_json::Value =
                     serde_json::from_str(args_json).unwrap_or(serde_json::json!({}));
                 let input = args["input"].as_str().unwrap_or("");
-                Some(self.terminal_state.send_input(input))
+                // Decode `\u001b[A`, `\u0003`, `\t`, ... into real bytes
+                // before writing to the PTY, so arrow/F-keys and control
+                // characters actually reach the child app (see
+                // `decode_terminal_escapes`).
+                let decoded = decode_terminal_escapes(input);
+                Some(self.terminal_state.send_input(&decoded))
             }
             "terminal_read" => {
                 let args: serde_json::Value =
@@ -4984,13 +5078,13 @@ fn get_tool_definitions() -> Vec<serde_json::Value> {
             "type": "function",
             "function": {
                 "name": "terminal_send",
-                "description": "Send input (keystrokes) to the running terminal session. The terminal is a real PTY, so interactive programs work: a newline is appended automatically (like pressing Enter). For special keys, embed the raw escape/control sequences in the string: Ctrl+C = \"\\u0003\", Ctrl+D = \"\\u0004\", arrows = \"\\u001b[A/B/C/D\" (up/down/right/left), Tab = \"\\t\", Escape = \"\\u001b\", F1 = \"\\u001bOP\", PgUp/PgDn = \"\\u001b[5~\"/\"\\u001b[6~\". Example: send \"\\u0003\" to interrupt a running program.",
+                "description": "Send input (keystrokes) to the running terminal session. The terminal is a real PTY, so interactive programs work: a newline is appended automatically (like pressing Enter). For special keys, write backslash escapes directly in the input string — they are decoded into the real control bytes before being written to the PTY: Ctrl+C = \"\\u0003\", Ctrl+D = \"\\u0004\", arrows = \"\\u001b[A/B/C/D\" (up/down/right/left), Tab = \"\\t\", Escape = \"\\u001b\", F1 = \"\\u001bOP\", PgUp/PgDn = \"\\u001b[5~\"/\"\\u001b[6~\". Example: send \"\\u0003\" to interrupt a running program.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "input": {
                             "type": "string",
-                            "description": "The text to send to the terminal (a newline is appended automatically). May contain escape/control sequences for special keys."
+                            "description": "The text to send to the terminal (a newline is appended automatically). May contain backslash escapes (\\uXXXX, \\n, \\r, \\t) for special keys, which are decoded before sending."
                         }
                     },
                     "required": ["input"]
@@ -6193,9 +6287,41 @@ mod tests {
     }
 
     #[test]
+    fn decode_terminal_escapes_converts_control_sequences() {
+        use super::decode_terminal_escapes;
+
+        // Arrow keys, control chars, and F-keys encoded as \uXXXX must turn
+        // into real bytes — otherwise terminal_send writes the literal text.
+        assert_eq!(decode_terminal_escapes("\\u001b[A"), "\x1b[A");
+        assert_eq!(decode_terminal_escapes("\\u001b[B"), "\x1b[B");
+        assert_eq!(decode_terminal_escapes("\\u001b[C"), "\x1b[C");
+        assert_eq!(decode_terminal_escapes("\\u001b[D"), "\x1b[D");
+        assert_eq!(decode_terminal_escapes("\\u0003"), "\x03");
+        assert_eq!(decode_terminal_escapes("\\u0004"), "\x04");
+        assert_eq!(decode_terminal_escapes("\\u001bOP"), "\x1bOP");
+        assert_eq!(decode_terminal_escapes("\\u001b[5~"), "\x1b[5~");
+        assert_eq!(decode_terminal_escapes("\\u001b[15~"), "\x1b[15~");
+    }
+
+    #[test]
+    fn decode_terminal_escapes_handles_basic_and_literal() {
+        use super::decode_terminal_escapes;
+
+        // Simple escapes.
+        assert_eq!(decode_terminal_escapes("a\\tb"), "a\tb");
+        assert_eq!(decode_terminal_escapes("a\\nb"), "a\nb");
+        assert_eq!(decode_terminal_escapes("a\\rb"), "a\rb");
+        assert_eq!(decode_terminal_escapes("a\\\\b"), "a\\b");
+        // Plain text passes through unchanged.
+        assert_eq!(decode_terminal_escapes("hello world"), "hello world");
+        // Unknown escape is left as-is (backslash + char).
+        assert_eq!(decode_terminal_escapes("a\\zb"), "a\\zb");
+        // Braced form.
+        assert_eq!(decode_terminal_escapes("\\u{1f600}"), "😀");
+    }
+
+    #[test]
     fn key_events_application_cursor_mode() {
-        // Regression: htop (and any ncurses/crossterm full-screen app)
-        // enables DECCKM (ESC[?1h) and expects the SS3 arrow forms.
         // The CSI forms either do nothing or decode as unrelated keys
         // (CSI Right decodes as F2/Setup inside htop).
         use super::key_to_pty_bytes;
