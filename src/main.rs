@@ -22,11 +22,7 @@ mod primary_selection;
 mod ui;
 use app::{App, ChatMessage, Focus, InputMode, ModelDialogFocus, SaveDialogFocus, SettingsFocus};
 use config::Config;
-use ui::{Button, ConfirmationBox, FileActionDialog, dialog_block};
-
-/// Midnight Commander's signature turquoise-green (its "cyan" keybar/menu
-/// text, approximated as truecolor).
-const MC_GREEN: Color = Color::Rgb(0, 187, 187);
+use ui::{Button, ConfirmationBox, FileActionDialog, MC_GREEN, dialog_block};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let original_hook = std::panic::take_hook();
@@ -80,100 +76,12 @@ where
             let size = terminal.size()?;
             app.terminal_height = size.height;
 
-            if !app.retrying {
-                match event::read()? {
-                    Event::Key(key) => {
-                        app.handle_global_key(key);
-                    }
-                    Event::Mouse(mouse) => match mouse.kind {
-                        MouseEventKind::ScrollUp => app.scroll_up(),
-                        MouseEventKind::ScrollDown => app.scroll_down(),
-                        MouseEventKind::Down(MouseButton::Left) => {
-                            let size = terminal.size()?;
-                            app.handle_click(mouse.column, mouse.row, size.width, size.height);
-                        }
-                        MouseEventKind::Up(MouseButton::Left) => {
-                            app.handle_mouse_up();
-                        }
-                        MouseEventKind::Drag(MouseButton::Left) => {
-                            let size = terminal.size()?;
-                            let input_start =
-                                size.height.saturating_sub(6 + app.bottom_rows());
-                            app.handle_mouse_drag(mouse.row, input_start);
-                        }
-                        _ => {}
-                    },
-                    _ => {}
-                }
-                while event::poll(Duration::ZERO)? {
-                    match event::read()? {
-                        Event::Key(key) => {
-                            app.handle_global_key(key);
-                        }
-                        Event::Mouse(mouse) => match mouse.kind {
-                            MouseEventKind::ScrollUp => app.scroll_up(),
-                            MouseEventKind::ScrollDown => app.scroll_down(),
-                            MouseEventKind::Down(MouseButton::Left) => {
-                                let size = terminal.size()?;
-                                app.handle_click(mouse.column, mouse.row, size.width, size.height);
-                            }
-                            MouseEventKind::Up(MouseButton::Left) => {
-                                app.handle_mouse_up();
-                            }
-                            MouseEventKind::Drag(MouseButton::Left) => {
-                                let size = terminal.size()?;
-                                let input_start =
-                                    size.height.saturating_sub(6 + app.bottom_rows());
-                                app.handle_mouse_drag(mouse.row, input_start);
-                            }
-                            _ => {}
-                        },
-                        _ => {}
-                    }
-                }
-            } else {
-                // During retry: allow scrolling and text selection, block everything else
-                if let Event::Mouse(mouse) = event::read()? {
-                    match mouse.kind {
-                        MouseEventKind::ScrollUp => app.scroll_up(),
-                        MouseEventKind::ScrollDown => app.scroll_down(),
-                        MouseEventKind::Down(MouseButton::Left) => {
-                            let size = terminal.size()?;
-                            app.handle_click(mouse.column, mouse.row, size.width, size.height);
-                        }
-                        MouseEventKind::Up(MouseButton::Left) => {
-                            app.handle_mouse_up();
-                        }
-                        MouseEventKind::Drag(MouseButton::Left) => {
-                            let size = terminal.size()?;
-                            let input_start = size.height.saturating_sub(6);
-                            app.handle_mouse_drag(mouse.row, input_start);
-                        }
-                        _ => {}
-                    }
-                }
-                while event::poll(Duration::ZERO)? {
-                    if let Event::Mouse(mouse) = event::read()? {
-                        match mouse.kind {
-                            MouseEventKind::ScrollUp => app.scroll_up(),
-                            MouseEventKind::ScrollDown => app.scroll_down(),
-                            MouseEventKind::Down(MouseButton::Left) => {
-                                let size = terminal.size()?;
-                                app.handle_click(mouse.column, mouse.row, size.width, size.height);
-                            }
-                            MouseEventKind::Up(MouseButton::Left) => {
-                                app.handle_mouse_up();
-                            }
-                            MouseEventKind::Drag(MouseButton::Left) => {
-                                let size = terminal.size()?;
-                                let input_start =
-                                    size.height.saturating_sub(6 + app.bottom_rows());
-                                app.handle_mouse_drag(mouse.row, input_start);
-                            }
-                            _ => {}
-                        }
-                    }
-                }
+            // Keyboard and mouse always work — even while a request is
+            // streaming or waiting to retry. Only *sending* is blocked
+            // while busy (App shows a warning on send attempts).
+            handle_event(app, event::read()?, terminal)?;
+            while event::poll(Duration::ZERO)? {
+                handle_event(app, event::read()?, terminal)?;
             }
         }
 
@@ -187,6 +95,42 @@ where
             return Ok(());
         }
     }
+}
+
+/// Dispatch a single terminal event to the app. Used for both the first
+/// polled event and the drain loop that follows it.
+fn handle_event<B: Backend>(
+    app: &mut App,
+    ev: Event,
+    terminal: &mut Terminal<B>,
+) -> io::Result<()>
+where
+    io::Error: From<<B as Backend>::Error>,
+{
+    match ev {
+        Event::Key(key) => {
+            app.handle_global_key(key);
+        }
+        Event::Mouse(mouse) => match mouse.kind {
+            MouseEventKind::ScrollUp => app.scroll_up(),
+            MouseEventKind::ScrollDown => app.scroll_down(),
+            MouseEventKind::Down(MouseButton::Left) => {
+                let size = terminal.size()?;
+                app.handle_click(mouse.column, mouse.row, size.width, size.height);
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                app.handle_mouse_up();
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                let size = terminal.size()?;
+                let input_start = size.height.saturating_sub(6 + app.bottom_rows());
+                app.handle_mouse_drag(mouse.row, input_start);
+            }
+            _ => {}
+        },
+        _ => {}
+    }
+    Ok(())
 }
 
 fn ui(f: &mut Frame, app: &mut App) {
@@ -204,7 +148,7 @@ fn ui(f: &mut Frame, app: &mut App) {
     ])
     .split(area);
 
-    app.main_menu.render_bar(f, main_chunks[0]);
+    app.main_menu.render_bar(f, main_chunks[0], &app.theme);
     if app.hintbar {
         render_hintbar(f, app, main_chunks[2]);
     }
@@ -253,7 +197,7 @@ fn ui(f: &mut Frame, app: &mut App) {
     }
 
     if app.main_menu.is_open() {
-        app.main_menu.render_submenu(f, main_chunks[0]);
+        app.main_menu.render_submenu(f, main_chunks[0], &app.theme);
     }
 
     if app.show_about {
@@ -756,23 +700,18 @@ fn render_send_button(f: &mut Frame, app: &App, area: Rect) {
 }
 
 /// Activity throbber shown as the status bar's first field: a rotating
-/// ASCII spinner while a response streams, the meditating guy when idle.
-/// Animated from wall-clock time — the UI loop redraws every ~50ms.
-///Braille Circle: ⣾ ⣽ ⣻ ⢿ ⡿ ⣟ ⣯ ⣷
-///Clockwise Quadrants: ◴ ◷ ◶ ◵
-///Audio Equalizer Bars: ▂ ▃ ▄ ▆ ▇ █ ▇ ▆ ▅ ▄ ▃ ▂
-///Trigrams / Radar: ☰ ☱ ☳ ☷ ☶ ☴
-
+/// spinner while a response streams, the meditating guy when idle.
+/// The spinner style is picked at random per request from
+/// `app::SPINNERS` (see `App::reroll_spinner`); the frame animates from
+/// wall-clock time — the UI loop redraws every ~50ms.
 fn throbber(app: &App) -> &'static str {
     if app.is_loading {
-//        const FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-        const FRAMES: &[&str] = &["⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"];
-
+        let frames = app::SPINNERS[app.spinner_idx % app::SPINNERS.len()];
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis();
-        FRAMES[(now / 100) as usize % FRAMES.len()]
+        frames[(now / 100) as usize % frames.len()]
     } else {
         "🧘"
     }
@@ -1926,12 +1865,27 @@ mod throbber_tests {
     fn streaming_shows_spinner_frame() {
         let mut app = test_app();
         app.is_loading = true;
-        let frame = throbber(&app);
-        assert!(
-            ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"].contains(&frame),
-            "expected a spinner frame, got {:?}",
-            frame
-        );
+        // Any frame from any of the spinner sets is valid — the style is
+        // chosen at random per request.
+        for idx in 0..crate::app::SPINNERS.len() {
+            app.spinner_idx = idx;
+            let frame = throbber(&app);
+            assert!(
+                crate::app::SPINNERS[idx].contains(&frame),
+                "frame {:?} must come from SPINNERS[{}]",
+                frame,
+                idx
+            );
+        }
+    }
+
+    #[test]
+    fn reroll_picks_valid_spinner() {
+        let mut app = test_app();
+        for _ in 0..20 {
+            app.reroll_spinner();
+            assert!(app.spinner_idx < crate::app::SPINNERS.len());
+        }
     }
 
     #[test]

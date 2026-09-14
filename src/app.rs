@@ -15,9 +15,24 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
 
 use crate::config::{
-    CloudModel, Config, ModelParams, ModelParamsStore, load_cloud_models_with_base,
-    load_model_params, save_model_params,
+    CloudModel, Config, ModelParams, ModelParamsStore, load_agents_md,
+    load_cloud_models_with_base, load_model_params, save_model_params,
 };
+
+/// Spinner frame sets for the status-bar throbber. One is picked at
+/// random for every API request (see `App::reroll_spinner`).
+pub const SPINNERS: &[&[&str]] = &[
+    // Braille circle
+    &["⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"],
+    // Braille dots (classic)
+    &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"],
+    // Clockwise quadrants
+    &["◴", "◷", "◶", "◵"],
+    // Audio equalizer bars
+    &["▂", "▃", "▄", "▆", "▇", "█", "▇", "▆", "▅", "▄", "▃", "▂"],
+    // Trigrams / radar
+    &["☰", "☱", "☳", "☷", "☶", "☴"],
+];
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum InputMode {
@@ -877,6 +892,9 @@ pub struct App {
     pub quit_confirm_focus: crate::ui::ConfirmFocus,
     pub is_loading: bool,
     pub retrying: bool,
+    /// Index into `SPINNERS` — which spinner style the throbber shows
+    /// for the current request. Re-rolled randomly on each request.
+    pub spinner_idx: usize,
     pub status_message: String,
     pub ollama_url: String,
     pub model_name: String,
@@ -1006,6 +1024,7 @@ impl App {
             quit_confirm_focus: crate::ui::ConfirmFocus::No,
             is_loading: false,
             retrying: false,
+            spinner_idx: 0,
             status_message: String::new(),
             ollama_url: cfg.ollama_url.clone(),
             model_name: cfg.model,
@@ -1291,8 +1310,14 @@ impl App {
             KeyCode::Enter => {
                 if key.modifiers == KeyModifiers::ALT {
                     self.textarea.input(key);
-                } else if !self.textarea.lines().join("").trim().is_empty() && !self.is_loading {
-                    self.send_to_ollama_async();
+                } else if !self.textarea.lines().join("").trim().is_empty() {
+                    if self.is_loading {
+                        self.status_message =
+                            "⚠ Request in progress — wait for it to finish before sending"
+                                .to_string();
+                    } else {
+                        self.send_to_ollama_async();
+                    }
                 }
             }
             KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -1527,6 +1552,33 @@ impl App {
     pub fn set_auto_scroll(&mut self) {
         self.auto_scroll = true;
         self.scroll_offset = u16::MAX;
+    }
+
+    /// Pick a random spinner style for the next request's throbber.
+    /// Time-based pseudo-randomness is plenty for cosmetic variety —
+    /// no need for a rand dependency.
+    pub fn reroll_spinner(&mut self) {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos() as usize;
+        self.spinner_idx = nanos % SPINNERS.len();
+    }
+
+    /// Build the system prompt sent with API requests: the configured
+    /// system prompt (or the default agentic one) plus the contents of
+    /// the application-global AGENTS.md (~/.config/rustama/AGENTS.md),
+    /// when present.
+    fn build_system_content(&self) -> String {
+        let base = if !self.system_prompt.is_empty() {
+            self.system_prompt.clone()
+        } else {
+            "You are a coding assistant with access to tools. When the user asks you to do something, use the available tools to accomplish the task. Always use tools when needed - do not just describe what you would do. Execute the actual tool calls. After using a tool, continue working until the task is complete.".to_string()
+        };
+        match load_agents_md() {
+            Some(agents) => format!("{}\n\n# AGENTS.md\n{}", base, agents),
+            None => base,
+        }
     }
 
     pub fn check_responses(&mut self) {
@@ -1892,6 +1944,7 @@ impl App {
 
     fn send_tool_results_async(&mut self) {
         self.is_loading = true;
+        self.reroll_spinner();
         self.streaming_text.clear();
         self.streaming_thinking.clear();
         // Tool rounds also stream: the status bar throbber signals it.
@@ -1901,13 +1954,7 @@ impl App {
 
         let mut api_messages: Vec<serde_json::Value> = Vec::new();
 
-        let agentic_sys = "You are a coding assistant with access to tools. When the user asks you to do something, use the available tools to accomplish the task. Always use tools when needed - do not just describe what you would do. Execute the actual tool calls. After using a tool, continue working until the task is complete.";
-
-        let sys_content = if !self.system_prompt.is_empty() {
-            self.system_prompt.clone()
-        } else {
-            agentic_sys.to_string()
-        };
+        let sys_content = self.build_system_content();
 
         if !sys_content.is_empty() {
             api_messages.push(serde_json::json!({
@@ -2058,6 +2105,7 @@ impl App {
         self.tool_round_count = 0;
         self.tool_call_count = 0;
         self.is_loading = true;
+        self.reroll_spinner();
         self.retrying = false;
         self.streaming_text.clear();
         self.streaming_thinking.clear();
@@ -2070,13 +2118,7 @@ impl App {
 
         let mut api_messages: Vec<serde_json::Value> = Vec::new();
 
-        let agentic_sys = "You are a coding assistant with access to tools. When the user asks you to do something, use the available tools to accomplish the task. Always use tools when needed - do not just describe what you would do. Execute the actual tool calls. After using a tool, continue working until the task is complete.";
-
-        let sys_content = if !self.system_prompt.is_empty() {
-            self.system_prompt.clone()
-        } else {
-            agentic_sys.to_string()
-        };
+        let sys_content = self.build_system_content();
 
         if !sys_content.is_empty() {
             api_messages.push(serde_json::json!({
@@ -2812,7 +2854,13 @@ impl App {
 
         if row >= input_start && row <= input_bottom {
             if row == input_bottom && !self.textarea.lines().join("").trim().is_empty() {
-                self.send_to_ollama_async();
+                if self.is_loading {
+                    self.status_message =
+                        "⚠ Request in progress — wait for it to finish before sending"
+                            .to_string();
+                } else {
+                    self.send_to_ollama_async();
+                }
                 return;
             }
             self.input_mode = InputMode::Input;
@@ -4884,13 +4932,21 @@ fn get_tool_definitions() -> Vec<serde_json::Value> {
             "type": "function",
             "function": {
                 "name": "read_file",
-                "description": "Read the contents of a file",
+                "description": "Read the contents of a file. For large files, use offset/limit to read a window of lines instead of the whole file.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "path": {
                             "type": "string",
                             "description": "The file path to read"
+                        },
+                        "offset": {
+                            "type": "integer",
+                            "description": "First line to return (1-based). Default: 1 (start of file)."
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "description": "Maximum number of lines to return. Default: no limit (whole file)."
                         }
                     },
                     "required": ["path"]
@@ -5285,8 +5341,41 @@ fn execute_tool_call(name: &str, args_json: &str, proxy: &Option<String>) -> Str
     match name {
         "read_file" => {
             let path = args["path"].as_str().unwrap_or("");
+            // 1-based first line; default: start of file.
+            let offset = args["offset"].as_u64().unwrap_or(1).max(1) as usize;
+            let limit = args["limit"].as_u64().map(|n| n as usize);
             match std::fs::read_to_string(path) {
-                Ok(content) => content,
+                Ok(content) => {
+                    let total_lines = content.lines().count();
+                    if offset == 1 && limit.is_none() {
+                        return content;
+                    }
+                    let window: Vec<&str> = match limit {
+                        Some(n) => content.lines().skip(offset - 1).take(n).collect(),
+                        None => content.lines().skip(offset - 1).collect(),
+                    };
+                    if window.is_empty() {
+                        return format!(
+                            "(no lines in range: file has {} lines, offset {})",
+                            total_lines, offset
+                        );
+                    }
+                    let first = offset;
+                    let last = offset + window.len() - 1;
+                    let mut out = window.join("\n");
+                    if last < total_lines {
+                        out.push_str(&format!(
+                            "\n[... {} more lines — showing lines {}-{} of {}. Use offset/limit to read more.]",
+                            total_lines - last, first, last, total_lines
+                        ));
+                    } else {
+                        out.push_str(&format!(
+                            "\n[showing lines {}-{} of {}]",
+                            first, last, total_lines
+                        ));
+                    }
+                    out
+                }
                 Err(e) => format!("Error reading file: {}", e),
             }
         }
@@ -5791,7 +5880,59 @@ mod menu_focus_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::{StreamChunk, retry_countdown, send_with_retry};
+    use super::{StreamChunk, execute_tool_call, retry_countdown, send_with_retry};
+
+    #[test]
+    fn read_file_offset_limit() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("rustama-readfile-test-{}.txt", std::process::id()));
+        let content = (1..=10).map(|i| format!("line{}", i)).collect::<Vec<_>>().join("\n");
+        std::fs::write(&path, &content).unwrap();
+        let p = path.to_string_lossy().to_string();
+
+        // Whole file when no offset/limit given
+        let out = execute_tool_call("read_file", &serde_json::json!({"path": p}).to_string(), &None);
+        assert_eq!(out, content);
+
+        // limit only
+        let out = execute_tool_call(
+            "read_file",
+            &serde_json::json!({"path": p, "limit": 3}).to_string(),
+            &None,
+        );
+        assert!(out.starts_with("line1\nline2\nline3"), "got: {}", out);
+        assert!(out.contains("showing lines 1-3 of 10"), "got: {}", out);
+        assert!(out.contains("7 more lines"), "got: {}", out);
+
+        // offset + limit window
+        let out = execute_tool_call(
+            "read_file",
+            &serde_json::json!({"path": p, "offset": 4, "limit": 2}).to_string(),
+            &None,
+        );
+        assert!(out.starts_with("line4\nline5"), "got: {}", out);
+        assert!(out.contains("showing lines 4-5 of 10"), "got: {}", out);
+
+        // offset past end of file
+        let out = execute_tool_call(
+            "read_file",
+            &serde_json::json!({"path": p, "offset": 99}).to_string(),
+            &None,
+        );
+        assert!(out.contains("no lines in range"), "got: {}", out);
+
+        // window reaching EOF
+        let out = execute_tool_call(
+            "read_file",
+            &serde_json::json!({"path": p, "offset": 9, "limit": 50}).to_string(),
+            &None,
+        );
+        assert!(out.starts_with("line9\nline10"), "got: {}", out);
+        assert!(out.contains("showing lines 9-10 of 10"), "got: {}", out);
+        assert!(!out.contains("more lines"), "got: {}", out);
+
+        let _ = std::fs::remove_file(&path);
+    }
 
     #[test]
     fn retry_countdown_sends_correct_messages() {

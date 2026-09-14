@@ -928,6 +928,21 @@ fn conf_dir() -> Option<PathBuf> {
     Some(home.join(".config").join("rustama"))
 }
 
+/// Load the application-global AGENTS.md (~/.config/rustama/AGENTS.md).
+/// Returns `None` if the file does not exist or is empty after trimming.
+/// The content is appended to the system prompt on every request so agents
+/// always see these standing instructions.
+pub fn load_agents_md() -> Option<String> {
+    let path = conf_dir()?.join("AGENTS.md");
+    let content = fs::read_to_string(path).ok()?;
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
 fn find_conf_file() -> Option<PathBuf> {
     let home = dirs_home()?;
     let preferred = home.join(".config").join("rustama").join("rustama.conf");

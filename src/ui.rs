@@ -6,6 +6,10 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::dimmed;
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Shadow};
 
+/// Midnight Commander's signature turquoise-green (its "cyan" keybar/menu
+/// text, approximated as truecolor). Shared by the keybar and the menu bar.
+pub const MC_GREEN: Color = Color::Rgb(0, 187, 187);
+
 #[derive(Debug, Clone)]
 pub struct Theme {
     pub dialog_border: Color,
@@ -18,6 +22,12 @@ pub struct Theme {
     pub focus_fg: Color,
     pub accent: Color,
     pub thinking_fg: Color,
+    /// Menu bar / submenu item when selected (highlighted).
+    pub menu_selected_bg: Color,
+    pub menu_selected_fg: Color,
+    /// Menu bar / submenu item when not selected.
+    pub menu_unselected_bg: Color,
+    pub menu_unselected_fg: Color,
 }
 
 impl Theme {
@@ -34,6 +44,10 @@ impl Theme {
             focus_fg: Color::Yellow,
             accent: Color::Cyan,
             thinking_fg: Color::Yellow,
+            menu_selected_bg: Color::Black,
+            menu_selected_fg: Color::White,
+            menu_unselected_bg: MC_GREEN,
+            menu_unselected_fg: Color::White,
         }
     }
 
@@ -49,6 +63,10 @@ impl Theme {
             focus_fg: Color::Yellow,
             accent: Color::Cyan,
             thinking_fg: Color::Yellow,
+            menu_selected_bg: Color::Black,
+            menu_selected_fg: Color::White,
+            menu_unselected_bg: MC_GREEN,
+            menu_unselected_fg: Color::White,
         }
     }
 }
@@ -906,10 +924,15 @@ impl MainMenu {
 
     /// Renders the top menu bar: the menu names on the left and the clock
     /// (`HH:MM`) on the right. Status text and mode indicators belong to the
-    /// status bar / keybar, not here.
-    pub fn render_bar(&self, f: &mut Frame, area: Rect) {
-        let normal_style = Style::default().fg(Color::White).bg(Color::DarkGray);
-        let selected_style = Style::default().fg(Color::Black).bg(Color::White);
+    /// status bar / keybar, not here. Colors come from the theme's
+    /// `menu_*` variables.
+    pub fn render_bar(&self, f: &mut Frame, area: Rect, theme: &Theme) {
+        let normal_style = Style::default()
+            .fg(theme.menu_unselected_fg)
+            .bg(theme.menu_unselected_bg);
+        let selected_style = Style::default()
+            .fg(theme.menu_selected_fg)
+            .bg(theme.menu_selected_bg);
 
         let file_style = if self.active == ActiveMenu::File {
             selected_style
@@ -953,7 +976,7 @@ impl MainMenu {
         f.render_widget(Paragraph::new(menu_bar).style(normal_style), area);
     }
 
-    pub fn render_submenu(&self, f: &mut Frame, menu_bar_area: Rect) {
+    pub fn render_submenu(&self, f: &mut Frame, menu_bar_area: Rect, theme: &Theme) {
         let items = self.item_names();
         if items.is_empty() {
             return;
@@ -978,13 +1001,19 @@ impl MainMenu {
                     let line = "\u{2500}".repeat(inner_width);
                     ListItem::new(Line::from(Span::styled(
                         line,
-                        Style::default().fg(Color::DarkGray),
+                        Style::default()
+                            .fg(Color::DarkGray)
+                            .bg(theme.menu_unselected_bg),
                     )))
                 } else {
                     let style = if i == self.selection {
-                        Style::default().fg(Color::Black).bg(Color::White)
+                        Style::default()
+                            .fg(theme.menu_selected_fg)
+                            .bg(theme.menu_selected_bg)
                     } else {
                         Style::default()
+                            .fg(theme.menu_unselected_fg)
+                            .bg(theme.menu_unselected_bg)
                     };
                     ListItem::new(Line::from(Span::styled(format!(" {} ", name), style)))
                 }
@@ -995,7 +1024,7 @@ impl MainMenu {
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::White))
-                .style(Style::default().bg(Color::Black)),
+                .style(Style::default().bg(theme.menu_unselected_bg)),
         );
 
         f.render_widget(Clear, popup_area);

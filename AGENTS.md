@@ -52,6 +52,7 @@ This is the largest module. Key components:
 
 - INI-style parser (hand-rolled, no external config crate).
 - `~/.config/rustama/rustama.conf` — main config (`ollama_url`, `model`, `save_path`, `agentic`, `timeout_secs`, `logging`, `logfile`, `system_prompt`).
+- `~/.config/rustama/AGENTS.md` — application-global agent instructions, loaded via `load_agents_md()` and appended to the system prompt on every request (`App::build_system_content()` in app.rs). Missing or empty file is silently ignored.
 - `~/.config/rustama/cloud_models.conf` — cloud model definitions with `api_url`, `api_key`, `api_model`. Ships with Mistral Small preconfigured.
 - Boolean parsing supports English (true/yes/on/1) and Hungarian (igen).
 - **Per-model parameters**: `ModelParams` (temperature, top_p, top_k, frequency_penalty, presence_penalty, max_output_tokens, reasoning_effort, seed) is configured per model, not globally:
