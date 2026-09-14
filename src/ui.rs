@@ -764,42 +764,68 @@ impl MainMenu {
             .is_some_and(|name| *name == "\u{2500}")
     }
 
-    fn x_offset_for(menu: ActiveMenu) -> u16 {
+    /// The menus shown in the bar, in left-to-right order.
+    const MENUS: &[ActiveMenu] = &[
+        ActiveMenu::File,
+        ActiveMenu::Edit,
+        ActiveMenu::View,
+        ActiveMenu::Help,
+    ];
+
+    /// Display title of a menu in the bar (without padding).
+    fn menu_title(menu: ActiveMenu) -> &'static str {
         match menu {
-            ActiveMenu::File => 0,
-            ActiveMenu::Edit => 7,
-            ActiveMenu::View => 14,
-            ActiveMenu::Help => 21,
-            ActiveMenu::None => 0,
+            ActiveMenu::File => "File",
+            ActiveMenu::Edit => "Edit",
+            ActiveMenu::View => "View",
+            ActiveMenu::Help => "Help",
+            ActiveMenu::None => "",
         }
+    }
+
+    /// Column span of each menu in the bar: `" title "` plus a one-column
+    /// separator gap. Computed from the titles, so renaming or reordering
+    /// menus can't desync the offsets.
+    fn menu_spans() -> Vec<(ActiveMenu, u16, u16)> {
+        let mut spans = Vec::new();
+        let mut col = 0u16;
+        for &menu in Self::MENUS {
+            let width = Self::menu_title(menu).chars().count() as u16 + 2;
+            spans.push((menu, col, col + width));
+            col += width + 1; // gap between menus
+        }
+        spans
+    }
+
+    fn x_offset_for(menu: ActiveMenu) -> u16 {
+        Self::menu_spans()
+            .iter()
+            .find(|(m, _, _)| *m == menu)
+            .map(|(_, start, _)| *start)
+            .unwrap_or(0)
     }
 
     pub fn bar_col_to_menu(col: u16) -> ActiveMenu {
-        match col {
-            0..=6 => ActiveMenu::File,
-            7..=13 => ActiveMenu::Edit,
-            14..=20 => ActiveMenu::View,
-            _ => ActiveMenu::Help,
-        }
+        Self::menu_spans()
+            .iter()
+            .find(|(_, start, end)| col >= *start && col < *end)
+            .map(|(m, _, _)| *m)
+            .unwrap_or(ActiveMenu::Help)
     }
 
     fn next_menu(menu: ActiveMenu) -> ActiveMenu {
-        match menu {
-            ActiveMenu::File => ActiveMenu::Edit,
-            ActiveMenu::Edit => ActiveMenu::View,
-            ActiveMenu::View => ActiveMenu::Help,
-            ActiveMenu::Help => ActiveMenu::File,
-            ActiveMenu::None => ActiveMenu::File,
+        let menus = Self::MENUS;
+        match menus.iter().position(|m| *m == menu) {
+            Some(i) => menus[(i + 1) % menus.len()],
+            None => menus[0],
         }
     }
 
     fn prev_menu(menu: ActiveMenu) -> ActiveMenu {
-        match menu {
-            ActiveMenu::File => ActiveMenu::Help,
-            ActiveMenu::Edit => ActiveMenu::File,
-            ActiveMenu::View => ActiveMenu::Edit,
-            ActiveMenu::Help => ActiveMenu::View,
-            ActiveMenu::None => ActiveMenu::File,
+        let menus = Self::MENUS;
+        match menus.iter().position(|m| *m == menu) {
+            Some(i) => menus[(i + menus.len() - 1) % menus.len()],
+            None => menus[0],
         }
     }
 
@@ -934,43 +960,34 @@ impl MainMenu {
             .fg(theme.menu_selected_fg)
             .bg(theme.menu_selected_bg);
 
-        let file_style = if self.active == ActiveMenu::File {
-            selected_style
-        } else {
-            normal_style
-        };
-        let edit_style = if self.active == ActiveMenu::Edit {
-            selected_style
-        } else {
-            normal_style
-        };
-        let view_style = if self.active == ActiveMenu::View {
-            selected_style
-        } else {
-            normal_style
-        };
-        let help_style = if self.active == ActiveMenu::Help {
-            selected_style
-        } else {
-            normal_style
-        };
-
         let now = chrono::Local::now();
         let clock = format!("  {}  ", now.format("%H:%M"));
         let clock_len = clock.len() as u16;
-        let used = 6 + 1 + 6 + 1 + 6 + 1 + 5 + 1;
+
+        // Titles and gaps come from the same `menu_spans()` table used for
+        // hit-testing and submenu placement, so they can never desync.
+        let spans_table = Self::menu_spans();
+        let used = spans_table
+            .last()
+            .map(|(_, _, end)| *end)
+            .unwrap_or(0);
         let pad = area.width.saturating_sub(used + clock_len);
-        let menu_bar_spans = vec![
-            Span::styled(" File ", file_style),
-            Span::styled(" ", normal_style),
-            Span::styled(" Edit ", edit_style),
-            Span::styled(" ", normal_style),
-            Span::styled(" View ", view_style),
-            Span::styled(" ", normal_style),
-            Span::styled(" Help ", help_style),
-            Span::styled(" ".repeat(pad as usize), normal_style),
-            Span::styled(clock, normal_style),
-        ];
+
+        let mut menu_bar_spans: Vec<Span> = Vec::new();
+        for (menu, _, _) in &spans_table {
+            let style = if self.active == *menu {
+                selected_style
+            } else {
+                normal_style
+            };
+            menu_bar_spans.push(Span::styled(
+                format!(" {} ", Self::menu_title(*menu)),
+                style,
+            ));
+            menu_bar_spans.push(Span::styled(" ", normal_style));
+        }
+        menu_bar_spans.push(Span::styled(" ".repeat(pad as usize), normal_style));
+        menu_bar_spans.push(Span::styled(clock, normal_style));
         let menu_bar = Line::from(menu_bar_spans);
 
         f.render_widget(Paragraph::new(menu_bar).style(normal_style), area);
@@ -1360,6 +1377,54 @@ impl ConfirmationBox {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn menu_offsets_computed_from_titles() {
+        // " File " = 6 cols + 1 gap, so Edit starts at 7, etc.
+        assert_eq!(MainMenu::x_offset_for(ActiveMenu::File), 0);
+        assert_eq!(MainMenu::x_offset_for(ActiveMenu::Edit), 7);
+        assert_eq!(MainMenu::x_offset_for(ActiveMenu::View), 14);
+        assert_eq!(MainMenu::x_offset_for(ActiveMenu::Help), 21);
+        assert_eq!(MainMenu::x_offset_for(ActiveMenu::None), 0);
+    }
+
+    #[test]
+    fn menu_hit_testing_matches_spans() {
+        // Columns inside each " title " span map to that menu…
+        assert_eq!(MainMenu::bar_col_to_menu(0), ActiveMenu::File);
+        assert_eq!(MainMenu::bar_col_to_menu(5), ActiveMenu::File);
+        assert_eq!(MainMenu::bar_col_to_menu(7), ActiveMenu::Edit);
+        assert_eq!(MainMenu::bar_col_to_menu(12), ActiveMenu::Edit);
+        assert_eq!(MainMenu::bar_col_to_menu(14), ActiveMenu::View);
+        assert_eq!(MainMenu::bar_col_to_menu(19), ActiveMenu::View);
+        assert_eq!(MainMenu::bar_col_to_menu(21), ActiveMenu::Help);
+        // …gap columns belong to no menu's span — they fall through to
+        // the last menu (same behavior as the old hardcoded catch-all).
+        assert_eq!(MainMenu::bar_col_to_menu(6), ActiveMenu::Help);
+        assert_eq!(MainMenu::bar_col_to_menu(80), ActiveMenu::Help);
+    }
+
+    #[test]
+    fn menu_cycling_visits_each_once() {
+        let mut m = ActiveMenu::File;
+        let mut seen = vec![m];
+        for _ in 0..3 {
+            m = MainMenu::next_menu(m);
+            seen.push(m);
+        }
+        assert_eq!(
+            seen,
+            vec![
+                ActiveMenu::File,
+                ActiveMenu::Edit,
+                ActiveMenu::View,
+                ActiveMenu::Help
+            ]
+        );
+        assert_eq!(MainMenu::next_menu(ActiveMenu::Help), ActiveMenu::File);
+        assert_eq!(MainMenu::prev_menu(ActiveMenu::File), ActiveMenu::Help);
+        assert_eq!(MainMenu::next_menu(ActiveMenu::None), ActiveMenu::File);
+    }
 
     #[test]
     fn wrap_short_lines_unchanged() {
