@@ -11,6 +11,7 @@ use ratatui_textarea::TextArea;
 use serde::{Deserialize, Serialize};
 use std::io::Read;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
 
@@ -895,6 +896,11 @@ pub struct App {
     pub model_name: String,
     pub save_path: String,
     pub response_rx: Option<mpsc::Receiver<StreamChunk>>,
+    /// Cancellation flag shared with the in-flight request thread —
+    /// set by F7 ("Stop"). The thread aborts the HTTP stream / retry
+    /// countdown at the next opportunity; the app side stops instantly
+    /// by dropping `response_rx` (late chunks then fail to send).
+    pub request_cancel: Option<Arc<AtomicBool>>,
     pub streaming_text: String,
     pub streaming_thinking: String,
     pub show_model_dialog: bool,
@@ -1025,6 +1031,7 @@ impl App {
             model_name: cfg.model,
             save_path: cfg.save_path.clone(),
             response_rx: None,
+            request_cancel: None,
             streaming_text: String::new(),
             streaming_thinking: String::new(),
             show_model_dialog: false,
@@ -1139,14 +1146,22 @@ impl App {
         }
 
         // Terminal focus mode: nearly every key goes straight to the PTY.
-        // Ctrl+G is the escape hatch back to the chat UI.
+        // F8 and Ctrl+G are the escape hatches: they close the terminal.
+        // F7 stops an in-flight request (e.g. the agentic loop driving
+        // this terminal); with no request running F7 goes to the PTY.
         if self.focus == Focus::Terminal {
-            if matches!(key.code, KeyCode::Char('g') | KeyCode::Char('G'))
-                && key.modifiers.contains(KeyModifiers::CONTROL)
+            if key.code == KeyCode::F(7) && self.is_loading {
+                self.stop_request();
+                return;
+            }
+            if key.code == KeyCode::F(8)
+                || (matches!(key.code, KeyCode::Char('g') | KeyCode::Char('G'))
+                    && key.modifiers.contains(KeyModifiers::CONTROL))
             {
+                self.terminal_state.close();
                 self.focus = Focus::Input;
                 self.input_mode = InputMode::Input;
-                self.status_message = "Terminal focus released (back to input)".to_string();
+                self.status_message = "Terminal closed".to_string();
                 return;
             }
             let application_cursor = self.terminal_state.application_cursor();
@@ -1157,8 +1172,27 @@ impl App {
         }
 
         match key.code {
+            KeyCode::F(7) => {
+                // "Stop" — interrupt the in-flight request (streaming
+                // answer, tool round, or retry countdown).
+                self.stop_request();
+                return;
+            }
             KeyCode::F(9) => {
                 self.open_menu();
+                return;
+            }
+            KeyCode::F(8) => {
+                // Terminal toggle: open + focus when not running,
+                // close when running (keybar: "Term" / "CloseTerm").
+                if self.terminal_state.is_running() {
+                    self.terminal_state.close();
+                    self.status_message = "Terminal closed".to_string();
+                } else {
+                    let result = self.terminal_state.open("bash");
+                    self.focus = Focus::Terminal;
+                    self.status_message = result;
+                }
                 return;
             }
             KeyCode::F(10) => {
@@ -1171,7 +1205,7 @@ impl App {
                     self.terminal_state.visible = true;
                     self.focus = Focus::Terminal;
                     self.status_message =
-                        "Terminal focused — keystrokes go to the shell. Ctrl+G: release"
+                        "Terminal focused — keystrokes go to the shell. F8/^G: close terminal"
                             .to_string();
                 } else {
                     let result = self.terminal_state.open("bash");
@@ -1574,6 +1608,48 @@ impl App {
             Some(agents) => format!("{}\n\n# AGENTS.md\n{}", base, agents),
             None => base,
         }
+    }
+
+    /// F7 "Stop": interrupt the in-flight request (streaming answer,
+    /// tool round, or retry countdown). Any text received so far is
+    /// kept and marked as stopped; no auto-continue or tool round
+    /// follows. Instant app-side (is_loading cleared right away); the
+    /// request thread notices the cancel flag at the next chunk/tick
+    /// and aborts the HTTP stream — its sends then fail on the dropped
+    /// channel, so the connection is closed and no more tokens are
+    /// generated server-side than already in flight.
+    pub fn stop_request(&mut self) {
+        if !self.is_loading && self.response_rx.is_none() && !self.retrying {
+            self.status_message = "Nothing to stop".to_string();
+            return;
+        }
+        if let Some(flag) = &self.request_cancel {
+            flag.store(true, Ordering::Relaxed);
+        }
+        self.request_cancel = None;
+        // Dropping the receiver makes the thread's next send fail.
+        self.response_rx = None;
+        self.is_loading = false;
+        self.retrying = false;
+        self.pending_continuation = false;
+
+        if !self.streaming_thinking.is_empty() {
+            self.messages
+                .push(ChatMessage::Thinking(self.streaming_thinking.clone()));
+            self.streaming_thinking.clear();
+        }
+        if !self.streaming_text.is_empty() {
+            self.messages
+                .push(ChatMessage::Assistant(self.streaming_text.clone()));
+            self.log_event("ASSISTANT", &self.streaming_text);
+            self.streaming_text.clear();
+        }
+        self.messages
+            .push(ChatMessage::App("⏹ Stopped by user (F7)".to_string()));
+        self.log_event("STOP", "request interrupted by user (F7)");
+        self.autosave_session();
+        self.status_message = "⏹ Request stopped".to_string();
+        self.set_auto_scroll();
     }
 
     pub fn check_responses(&mut self) {
@@ -2048,6 +2124,7 @@ impl App {
             &serde_json::to_string_pretty(&api_messages).unwrap_or_default(),
         );
 
+        let cancel = Arc::new(AtomicBool::new(false));
         let rx = stream_chat_request(
             api_messages,
             agentic,
@@ -2060,8 +2137,10 @@ impl App {
             params,
             proxy,
             max_retries,
+            cancel.clone(),
         );
         self.response_rx = Some(rx);
+        self.request_cancel = Some(cancel);
     }
 
     fn send_to_ollama_async(&mut self) {
@@ -2212,6 +2291,7 @@ impl App {
             &serde_json::to_string_pretty(&api_messages).unwrap_or_default(),
         );
 
+        let cancel = Arc::new(AtomicBool::new(false));
         let rx = stream_chat_request(
             api_messages,
             agentic,
@@ -2224,8 +2304,10 @@ impl App {
             params,
             proxy,
             max_retries,
+            cancel.clone(),
         );
         self.response_rx = Some(rx);
+        self.request_cancel = Some(cancel);
     }
 
     pub fn export_output(&mut self) {
@@ -2842,7 +2924,8 @@ impl App {
             if col >= term_start_col && row > 0 {
                 self.focus = Focus::Terminal;
                 self.status_message =
-                    "Terminal focused — keystrokes go to the shell. Ctrl+G: release".to_string();
+                    "Terminal focused — keystrokes go to the shell. F8/^G: close terminal"
+                        .to_string();
                 return;
             }
         }
@@ -5196,6 +5279,10 @@ fn build_blocking_client(proxy: &Option<String>) -> reqwest::blocking::Client {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Waits out a retry backoff, ticking the countdown into the status
+/// bar once per second. Returns `true` when the wait was cut short by
+/// the cancel flag (F7 "Stop") — the caller must abort the retry loop.
+#[allow(clippy::too_many_arguments)]
 fn retry_countdown(
     label: &str,
     delay_secs: u64,
@@ -5206,7 +5293,8 @@ fn retry_countdown(
     is_logging: bool,
     log_file: &str,
     session_id: &str,
-) {
+    cancel: &AtomicBool,
+) -> bool {
     let ra_str = retry_after.map_or("none".to_string(), |v| format!("{}s", v));
     log_to_file(
         is_logging,
@@ -5223,6 +5311,9 @@ fn retry_countdown(
         ),
     );
     for sec in 1..=delay_secs {
+        if cancel.load(Ordering::Relaxed) {
+            return true;
+        }
         let _ = tx.send(StreamChunk::StatusTick(format!(
             "⏳ {}/{}s (attempt {}/{})",
             sec,
@@ -5232,6 +5323,15 @@ fn retry_countdown(
         )));
         std::thread::sleep(std::time::Duration::from_secs(1));
     }
+    false
+}
+
+/// Outcome of [`send_with_retry`] — unlike a plain `Result`, it can
+/// also report that the user interrupted the request (F7 "Stop").
+enum SendOutcome {
+    Response(reqwest::Response),
+    Error(reqwest::Error),
+    Cancelled,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5246,9 +5346,13 @@ async fn send_with_retry(
     is_logging: bool,
     log_file: &str,
     session_id: &str,
-) -> Result<reqwest::Response, reqwest::Error> {
+    cancel: &AtomicBool,
+) -> SendOutcome {
     let mut last_err = None;
     for attempt in 0..=max_retries {
+        if cancel.load(Ordering::Relaxed) {
+            return SendOutcome::Cancelled;
+        }
         let mut req = client.request(method.clone(), url).json(body);
         if let Some(ref h) = headers {
             req = req.headers(h.clone());
@@ -5268,7 +5372,7 @@ async fn send_with_retry(
                 };
                 let delay_secs = retry_after.map_or(delay_secs, |ra| delay_secs.max(ra));
                 let _ = resp.text().await;
-                retry_countdown(
+                if retry_countdown(
                     "Rate limited (429)",
                     delay_secs,
                     retry_after,
@@ -5278,7 +5382,10 @@ async fn send_with_retry(
                     is_logging,
                     log_file,
                     session_id,
-                );
+                    cancel,
+                ) {
+                    return SendOutcome::Cancelled;
+                }
                 continue;
             }
             Ok(resp) if resp.status().is_server_error() && attempt < max_retries => {
@@ -5289,7 +5396,7 @@ async fn send_with_retry(
                     2u64.pow(attempt) + 1
                 };
                 let _ = resp.text().await;
-                retry_countdown(
+                if retry_countdown(
                     &format!("Server error ({})", status),
                     delay_secs,
                     None,
@@ -5299,10 +5406,13 @@ async fn send_with_retry(
                     is_logging,
                     log_file,
                     session_id,
-                );
+                    cancel,
+                ) {
+                    return SendOutcome::Cancelled;
+                }
                 continue;
             }
-            Ok(resp) => return Ok(resp),
+            Ok(resp) => return SendOutcome::Response(resp),
             Err(e) => {
                 last_err = Some(e);
                 if attempt < max_retries {
@@ -5311,7 +5421,7 @@ async fn send_with_retry(
                     } else {
                         2u64.pow(attempt) + 1
                     };
-                    retry_countdown(
+                    if retry_countdown(
                         "Request error",
                         delay_secs,
                         None,
@@ -5321,13 +5431,145 @@ async fn send_with_retry(
                         is_logging,
                         log_file,
                         session_id,
-                    );
+                        cancel,
+                    ) {
+                        return SendOutcome::Cancelled;
+                    }
                     continue;
                 }
             }
         }
     }
-    Err(last_err.unwrap())
+    SendOutcome::Error(last_err.unwrap())
+}
+
+/// Builds a compact unified diff (`diff -u` style) between two file
+/// contents, with `context` unchanged lines around each change hunk.
+/// Used for the `edit_file` tool result so the model (and the user)
+/// sees exactly what changed instead of a bare "edited" confirmation.
+/// The chat UI colors lines starting with `+`/`-` green/red.
+fn unified_diff(old: &str, new: &str, path: &str, context: usize) -> String {
+    let old_lines: Vec<&str> = old.lines().collect();
+    let new_lines: Vec<&str> = new.lines().collect();
+
+    // Longest common subsequence over lines (files edited through the
+    // tool are small enough for an O(n*m) table).
+    let (n, m) = (old_lines.len(), new_lines.len());
+    let mut lcs = vec![vec![0usize; m + 1]; n + 1];
+    for i in (0..n).rev() {
+        for j in (0..m).rev() {
+            lcs[i][j] = if old_lines[i] == new_lines[j] {
+                lcs[i + 1][j + 1] + 1
+            } else {
+                lcs[i + 1][j].max(lcs[i][j + 1])
+            };
+        }
+    }
+
+    // Walk the LCS table into a flat op list: (kind, old_idx, new_idx).
+    enum Op {
+        Keep(usize, usize),
+        Del(usize),
+        Add(usize),
+    }
+    let mut ops = Vec::new();
+    let (mut i, mut j) = (0, 0);
+    while i < n && j < m {
+        if old_lines[i] == new_lines[j] {
+            ops.push(Op::Keep(i, j));
+            i += 1;
+            j += 1;
+        } else if lcs[i + 1][j] >= lcs[i][j + 1] {
+            ops.push(Op::Del(i));
+            i += 1;
+        } else {
+            ops.push(Op::Add(j));
+            j += 1;
+        }
+    }
+    while i < n {
+        ops.push(Op::Del(i));
+        i += 1;
+    }
+    while j < m {
+        ops.push(Op::Add(j));
+        j += 1;
+    }
+
+    // Mark ops that belong to a visible hunk (a change plus `context`
+    // unchanged lines on each side), then merge into hunks. The
+    // distance of a context line is measured in ops between it and the
+    // nearest change, so exactly `context` unchanged lines are kept.
+    let keep_flags: Vec<bool> = ops
+        .iter()
+        .enumerate()
+        .map(|(idx, op)| {
+            if !matches!(op, Op::Keep(..)) {
+                return true;
+            }
+            let near_before = (0..idx)
+                .rev()
+                .take(context)
+                .any(|k| !matches!(ops[k], Op::Keep(..)));
+            let near_after = (idx + 1..ops.len())
+                .take(context)
+                .any(|k| !matches!(ops[k], Op::Keep(..)));
+            near_before || near_after
+        })
+        .collect();
+
+    let mut out = format!("--- {}\n+++ {}\n", path, path);
+    let mut idx = 0;
+    while idx < ops.len() {
+        if !keep_flags[idx] {
+            idx += 1;
+            continue;
+        }
+        // Collect one hunk (consecutive flagged ops).
+        let start = idx;
+        let mut end = idx;
+        while end < ops.len() && keep_flags[end] {
+            end += 1;
+        }
+        let hunk = &ops[start..end];
+        let old_start = hunk
+            .iter()
+            .find_map(|o| match o {
+                Op::Keep(oi, _) | Op::Del(oi) => Some(*oi),
+                Op::Add(_) => None,
+            })
+            .map(|oi| oi + 1)
+            .unwrap_or(1);
+        let new_start = hunk
+            .iter()
+            .find_map(|o| match o {
+                Op::Keep(_, ni) | Op::Add(ni) => Some(*ni),
+                Op::Del(_) => None,
+            })
+            .map(|ni| ni + 1)
+            .unwrap_or(1);
+        let old_count = hunk
+            .iter()
+            .filter(|o| matches!(o, Op::Keep(..) | Op::Del(_)))
+            .count();
+        let new_count = hunk
+            .iter()
+            .filter(|o| matches!(o, Op::Keep(..) | Op::Add(_)))
+            .count();
+        out.push_str(&format!(
+            "@@ -{},{} +{},{} @@\n",
+            old_start, old_count, new_start, new_count
+        ));
+        for op in hunk {
+            match op {
+                Op::Keep(oi, _) => out.push_str(&format!(" {}\n", old_lines[*oi])),
+                Op::Del(oi) => out.push_str(&format!("-{}\n", old_lines[*oi])),
+                Op::Add(ni) => out.push_str(&format!("+{}\n", new_lines[*ni])),
+            }
+        }
+        idx = end;
+    }
+    out
 }
 
 fn execute_tool_call(name: &str, args_json: &str, proxy: &Option<String>) -> String {
@@ -5392,7 +5634,10 @@ fn execute_tool_call(name: &str, args_json: &str, proxy: &Option<String>) -> Str
                         let mut new_content = content.clone();
                         new_content.replace_range(pos..pos + old.len(), new);
                         match std::fs::write(path, &new_content) {
-                            Ok(()) => format!("Successfully edited {}", path),
+                            Ok(()) => {
+                                let diff = unified_diff(&content, &new_content, path, 3);
+                                format!("Successfully edited {}\n{}", path, diff)
+                            }
                             Err(e) => format!("Error writing file: {}", e),
                         }
                     } else {
@@ -5813,7 +6058,7 @@ mod continuation_tests {
 
 #[cfg(test)]
 mod menu_focus_tests {
-    use super::{App, Focus, InputMode, common_prefix};
+    use super::{App, ChatMessage, Focus, InputMode, common_prefix};
     use crate::config::Config;
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -5848,9 +6093,10 @@ mod menu_focus_tests {
     }
 
     #[test]
-    fn plain_g_does_not_release_terminal_focus() {
+    fn plain_g_does_not_close_terminal() {
         // Regression: `a || b && c` precedence made a bare 'g' release
-        // terminal focus — only Ctrl+G may (the documented escape hatch).
+        // terminal focus — only Ctrl+G may act (the documented escape
+        // hatch, closes the terminal).
         let mut app = test_app();
         app.focus = Focus::Terminal;
         app.handle_global_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
@@ -5871,11 +6117,81 @@ mod menu_focus_tests {
         let items = vec!["model-a".to_string(), "model-b".to_string()];
         assert_eq!(common_prefix(&items), "model-");
     }
+
+    #[test]
+    fn stop_request_commits_partial_and_unblocks() {
+        // F7 "Stop": partial streamed text is committed to history with
+        // a stopped marker, the turn is unblocked immediately, and the
+        // cancel flag is raised for the request thread.
+        let mut app = test_app();
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (_tx, rx) = std::sync::mpsc::channel();
+        app.response_rx = Some(rx);
+        app.request_cancel = Some(flag.clone());
+        app.is_loading = true;
+        app.retrying = true;
+        app.streaming_text = "partial answer".to_string();
+        app.streaming_thinking = "partial thinking".to_string();
+
+        app.stop_request();
+
+        assert!(flag.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(!app.is_loading);
+        assert!(!app.retrying);
+        assert!(app.response_rx.is_none());
+        assert!(app.request_cancel.is_none());
+        assert!(app.streaming_text.is_empty());
+        assert!(app.streaming_thinking.is_empty());
+        let has_assistant = app
+            .messages
+            .iter()
+            .any(|m| matches!(m, ChatMessage::Assistant(t) if t == "partial answer"));
+        let has_thinking = app
+            .messages
+            .iter()
+            .any(|m| matches!(m, ChatMessage::Thinking(t) if t == "partial thinking"));
+        let has_marker = app
+            .messages
+            .iter()
+            .any(|m| matches!(m, ChatMessage::App(t) if t.contains("Stopped by user")));
+        assert!(has_assistant, "partial answer committed");
+        assert!(has_thinking, "partial thinking committed");
+        assert!(has_marker, "stopped marker pushed");
+    }
+
+    #[test]
+    fn stop_request_idle_is_noop() {
+        // F7 with nothing in flight must not touch history or state.
+        let mut app = test_app();
+        let msg_count = app.messages.len();
+        app.stop_request();
+        assert_eq!(app.messages.len(), msg_count);
+        assert!(app.status_message.contains("Nothing to stop"));
+        assert!(!app.is_loading);
+    }
+
+    #[test]
+    fn f7_stops_in_flight_request() {
+        // The F7 key routes to stop_request even while busy.
+        let mut app = test_app();
+        let (_tx, rx) = std::sync::mpsc::channel();
+        app.response_rx = Some(rx);
+        app.is_loading = true;
+        app.handle_global_key(KeyEvent::new(KeyCode::F(7), KeyModifiers::NONE));
+        assert!(!app.is_loading);
+        assert!(app.response_rx.is_none());
+        assert!(
+            app.messages
+                .iter()
+                .any(|m| matches!(m, ChatMessage::App(t) if t.contains("Stopped by user")))
+        );
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{StreamChunk, execute_tool_call, retry_countdown, send_with_retry};
+    use super::{StreamChunk, execute_tool_call, retry_countdown, send_with_retry, unified_diff};
+    use std::sync::atomic::AtomicBool;
 
     #[test]
     fn read_file_offset_limit() {
@@ -5930,10 +6246,79 @@ mod tests {
     }
 
     #[test]
+    fn unified_diff_single_change_with_context() {
+        let old = "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten\n";
+        let new = "one\ntwo\nthree\nfour\nFIVE\nsix\nseven\neight\nnine\nten\n";
+        let diff = unified_diff(old, new, "f.txt", 3);
+        assert!(diff.starts_with("--- f.txt\n+++ f.txt\n"), "header: {}", diff);
+        // Change at line 5, ±3 context → hunk spans lines 2..8.
+        assert!(diff.contains("@@ -2,7 +2,7 @@"), "hunk header: {}", diff);
+        assert!(diff.contains(" two\n"), "context line: {}", diff);
+        assert!(diff.contains(" eight\n"), "context line: {}", diff);
+        assert!(diff.contains("-five\n"), "removed line: {}", diff);
+        assert!(diff.contains("+FIVE\n"), "added line: {}", diff);
+        // Context limits the hunk: lines 1, 9, 10 are outside ±3.
+        assert!(!diff.contains(" one\n"), "outside context: {}", diff);
+        assert!(!diff.contains(" nine\n"), "outside context: {}", diff);
+        assert!(!diff.contains(" ten\n"), "outside context: {}", diff);
+    }
+
+    #[test]
+    fn unified_diff_context_covers_whole_small_file() {
+        // A change in the middle of a 7-line file with context=3
+        // reaches both edges — one full-file hunk, like `diff -u -U3`.
+        let old = "one\ntwo\nthree\nfour\nfive\nsix\nseven\n";
+        let new = "one\ntwo\nthree\nFOUR\nfive\nsix\nseven\n";
+        let diff = unified_diff(old, new, "f.txt", 3);
+        assert!(diff.contains("@@ -1,7 +1,7 @@"), "hunk header: {}", diff);
+        assert!(diff.contains("-four\n"), "removed: {}", diff);
+        assert!(diff.contains("+FOUR\n"), "added: {}", diff);
+    }
+
+    #[test]
+    fn unified_diff_insert_and_delete() {
+        // Pure insertion at the top and deletion at the bottom.
+        let old = "a\nb\nc\nd\ne\nf\ng\nh\ni\nj\n";
+        let new = "NEW\na\nb\nc\nd\ne\nf\ng\nh\ni\n";
+        let diff = unified_diff(old, new, "f.txt", 1);
+        assert!(diff.contains("+NEW\n"), "insertion: {}", diff);
+        assert!(diff.contains("-j\n"), "deletion: {}", diff);
+        // Two separate hunks (change at line 1 and line 10, context 1).
+        assert_eq!(diff.matches("@@ ").count(), 2, "two hunks: {}", diff);
+    }
+
+    #[test]
+    fn unified_diff_no_change_has_no_hunks() {
+        let diff = unified_diff("x\ny\n", "x\ny\n", "f.txt", 3);
+        assert!(!diff.contains("@@"), "no hunks: {}", diff);
+    }
+
+    #[test]
+    fn edit_file_result_contains_diff() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("rustama-editfile-test-{}.txt", std::process::id()));
+        std::fs::write(&path, "alpha\nbeta\ngamma\n").unwrap();
+        let p = path.to_string_lossy().to_string();
+        let out = execute_tool_call(
+            "edit_file",
+            &serde_json::json!({"path": p, "old_string": "beta", "new_string": "BETA"})
+                .to_string(),
+            &None,
+        );
+        assert!(out.starts_with("Successfully edited"), "got: {}", out);
+        assert!(out.contains("--- "), "diff header: {}", out);
+        assert!(out.contains("@@ "), "hunk header: {}", out);
+        assert!(out.contains("-beta\n"), "removed line: {}", out);
+        assert!(out.contains("+BETA\n"), "added line: {}", out);
+        assert!(out.contains(" alpha\n"), "context line: {}", out);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn retry_countdown_sends_correct_messages() {
         use std::sync::mpsc;
         let (tx, rx) = mpsc::channel();
-        retry_countdown("Test error", 3, Some(5), 0, 3, &tx, false, "", "");
+        retry_countdown("Test error", 3, Some(5), 0, 3, &tx, false, "", "", &AtomicBool::new(false));
         drop(tx);
         let msgs: Vec<String> = rx
             .iter()
@@ -5957,7 +6342,7 @@ mod tests {
     fn retry_countdown_no_detail() {
         use std::sync::mpsc;
         let (tx, rx) = mpsc::channel();
-        retry_countdown("Rate limited (429)", 2, None, 1, 3, &tx, false, "", "");
+        retry_countdown("Rate limited (429)", 2, None, 1, 3, &tx, false, "", "", &AtomicBool::new(false));
         drop(tx);
         let msgs: Vec<String> = rx
             .iter()
@@ -6022,6 +6407,7 @@ mod tests {
                 false,
                 "",
                 "test",
+                &AtomicBool::new(false),
             )
             .await;
             drop(tx);
@@ -6032,7 +6418,10 @@ mod tests {
                     _ => None,
                 })
                 .collect();
-            assert!(result.is_err(), "should fail after retries + server error");
+            assert!(
+                matches!(result, super::SendOutcome::Error(_)),
+                "should fail after retries + server error"
+            );
             assert!(
                 msgs.iter().any(|m| m.contains("attempt 1/2")),
                 "should show attempt count: {:?}",
@@ -6052,12 +6441,38 @@ mod tests {
         use std::time::Instant;
         let (tx, rx) = mpsc::channel();
         let start = Instant::now();
-        retry_countdown("Test", 3, None, 0, 3, &tx, false, "", "");
+        retry_countdown("Test", 3, None, 0, 3, &tx, false, "", "", &AtomicBool::new(false));
         let elapsed = start.elapsed().as_secs();
         drop(tx);
         let _: Vec<_> = rx.iter().collect();
         assert!(elapsed >= 2, "expected >=2s wait, got {}s", elapsed);
         assert!(elapsed <= 4, "expected <=4s wait, got {}s", elapsed);
+    }
+
+    #[test]
+    fn retry_countdown_aborts_on_cancel() {
+        // F7 "Stop" during retry backoff: the countdown returns within
+        // ~1s of the flag being raised and reports the cancellation.
+        use std::sync::Arc;
+        use std::sync::atomic::Ordering;
+        use std::sync::mpsc;
+        use std::time::Instant;
+        let (tx, _rx) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let flag = cancel.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(1500));
+            flag.store(true, Ordering::Relaxed);
+        });
+        let start = Instant::now();
+        let cancelled = retry_countdown("Test", 60, None, 0, 3, &tx, false, "", "", &cancel);
+        let elapsed = start.elapsed();
+        assert!(cancelled, "countdown must report the cancellation");
+        assert!(
+            elapsed >= std::time::Duration::from_secs(1) && elapsed.as_secs() <= 4,
+            "should abort ~1 tick after the flag: {:?}",
+            elapsed
+        );
     }
 
     // --- TerminalBuffer cursor arithmetic tests ---
@@ -6812,6 +7227,7 @@ fn stream_chat_request(
     params: ModelParams,
     proxy: Option<String>,
     max_retries: u32,
+    cancel: Arc<AtomicBool>,
 ) -> mpsc::Receiver<StreamChunk> {
     let (tx, rx) = mpsc::channel();
 
@@ -6842,11 +7258,17 @@ fn stream_chat_request(
 
             log_to_file(is_logging, &log_file, &session_id, "REQUEST", &format!("{} {}", api_url, serde_json::to_string(&body).unwrap_or_default()));
 
-            let result = send_with_retry(&client, reqwest::Method::POST, &api_url, headers, &body, max_retries, &tx, is_logging, &log_file, &session_id).await;
+            let result = send_with_retry(&client, reqwest::Method::POST, &api_url, headers, &body, max_retries, &tx, is_logging, &log_file, &session_id, &cancel).await;
 
             let is_cloud = cloud_model.is_some();
             match result {
-                Ok(mut resp) => {
+                SendOutcome::Cancelled => {
+                    // F7 "Stop" during connect/retry backoff — nothing
+                    // was streamed; just give up quietly (the app side
+                    // already committed the stopped state).
+                    log_to_file(is_logging, &log_file, &session_id, "REQUEST_CANCELLED", "stopped by user (F7)");
+                }
+                SendOutcome::Response(mut resp) => {
                     if !resp.status().is_success() {
                         let status = resp.status();
                         let body = resp.text().await.unwrap_or_default();
@@ -6862,6 +7284,13 @@ fn stream_chat_request(
                     let mut buffer = String::new();
                     let mut tool_call_map: std::collections::HashMap<u32, serde_json::Value> = std::collections::HashMap::new();
                     loop {
+                        // F7 "Stop": the app flagged cancellation (and
+                        // dropped the receiver) — abort the HTTP stream
+                        // right away instead of reading another chunk.
+                        if cancel.load(Ordering::Relaxed) {
+                            log_to_file(is_logging, &log_file, &session_id, "STREAM_CANCELLED", "stopped by user (F7)");
+                            return;
+                        }
                         match resp.chunk().await {
                             Ok(Some(chunk)) => {
                                 buffer.push_str(&String::from_utf8_lossy(&chunk));
@@ -7012,7 +7441,7 @@ fn stream_chat_request(
                         }
                     }
                 }
-                Err(e) => {
+                SendOutcome::Error(e) => {
                     log_to_file(is_logging, &log_file, &session_id, "CONNECT_ERROR", &e.to_string());
                     let _ = tx.send(StreamChunk::Error(format!("Failed to connect: {}", e)));
                 }

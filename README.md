@@ -256,9 +256,11 @@ Once running, Rustama provides a terminal interface for:
 
 | Key | Action |
 |-----|--------|
+| `F7` | Stop the in-flight request (streaming answer, tool round, or retry countdown) — partial text is kept |
+| `F8` | Open embedded terminal (starts a shell) / close it when running — keybar shows "Term" / "CloseTerm" |
 | `F9` | Open menu |
 | `F10` | Quit |
-| `F6` | Focus embedded terminal (Ctrl+G releases) |
+| `F6` | Focus embedded terminal |
 | `Tab` | Open menu (output pane) / autocomplete model name (input) |
 | `Ctrl+S` | Save / export session |
 | `Ctrl+T` | Toggle embedded terminal panel (starts a shell if not running) |
@@ -283,7 +285,7 @@ When agentic mode is enabled, the model can use these tools:
 |------|-------------|
 | `read_file` | Read contents of a file |
 | `write_file` | Create or overwrite a file |
-| `edit_file` | Search-and-replace edit in a file |
+| `edit_file` | Search-and-replace edit in a file — the result includes a unified diff of the change (rendered `+`green / `-`red in the chat) |
 | `bash` | Execute a shell command |
 | `list_files` | List directory contents |
 | `search_files` | Find files by glob pattern |
@@ -315,8 +317,10 @@ You can also drive the terminal yourself:
 
 | Key | Action |
 |-----|--------|
+| `F8` | Open the terminal (starts a shell) / close it when running |
 | `F6` | Focus the terminal (starts a shell if not running) — all keystrokes go to the PTY |
-| `Ctrl+G` | Release terminal focus, back to the chat input |
+| `Ctrl+G` or `F8` | Close the terminal (while focused) |
+| `Ctrl+T` | Hide/show the panel (keeps the session running) |
 | Click panel | Grab terminal focus |
 
 While focused, the panel border turns green and every key (letters, arrows, F-keys, Ctrl/Alt combos, PgUp/PgDn…) is forwarded to the program running in the terminal.

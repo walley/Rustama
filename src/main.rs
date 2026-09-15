@@ -392,9 +392,25 @@ fn render_output(f: &mut Frame, app: &mut App, area: Rect) {
                         content.to_string()
                     };
                     for result_line in preview.lines().take(20) {
+                        // Unified-diff lines (edit_file results) get
+                        // diff colors: + green, - red, @@ headers cyan;
+                        // --- / +++ file headers stay dim like context.
+                        let style = if result_line.starts_with('+')
+                            && !result_line.starts_with("+++")
+                        {
+                            Style::default().fg(Color::Green)
+                        } else if result_line.starts_with('-')
+                            && !result_line.starts_with("---")
+                        {
+                            Style::default().fg(Color::Red)
+                        } else if result_line.starts_with('@') {
+                            Style::default().fg(Color::Cyan)
+                        } else {
+                            Style::default().fg(Color::DarkGray)
+                        };
                         hist.push(Line::from(Span::styled(
                             format!("    {}", result_line),
-                            Style::default().fg(Color::DarkGray),
+                            style,
                         )));
                     }
                     if content.lines().count() > 20 {
@@ -775,10 +791,11 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
 fn render_hintbar(f: &mut Frame, app: &App, area: Rect) {
     // Terminal focus has its own hintbar: keys go to the shell.
     if app.focus == Focus::Terminal {
+        let stop_hint = if app.is_loading { "  F7:Stop" } else { "" };
         let hintbar = Paragraph::new(Line::from(Span::styled(
             format!(
-                " [TERMINAL: {}]  keystrokes go to the shell  Ctrl+G:Release  Ctrl+T:Hide",
-                app.terminal_state.command
+                " [TERMINAL: {}]  keystrokes go to the shell  F8/^G:CloseTerm  Ctrl+T:Hide{}",
+                app.terminal_state.command, stop_hint
             ),
             Style::default().fg(Color::Black).bg(Color::Green),
         )))
@@ -794,9 +811,9 @@ fn render_hintbar(f: &mut Frame, app: &App, area: Rect) {
     };
 
     let terminal_hint = if app.terminal_state.is_running() {
-        " Ctrl+T  F6:Term"
+        " F8/^G:CloseTerm  F6:Focus  Ctrl+T:Hide"
     } else {
-        ""
+        " F8:Term"
     };
 
     let resize_hint = if app.terminal_state.is_running() && app.terminal_state.visible {
@@ -805,12 +822,17 @@ fn render_hintbar(f: &mut Frame, app: &App, area: Rect) {
         ""
     };
 
+    let stop_hint = if app.is_loading { "  F7:Stop" } else { "" };
+
     let text = match app.input_mode {
         InputMode::Normal => format!(
-            " F9:Menu  F10:Quit  Ctrl+S:Save  Mouse:Scroll{}{}{}",
-            focus_label, terminal_hint, resize_hint
+            " F9:Menu  F10:Quit  Ctrl+S:Save  Mouse:Scroll{}{}{}{}",
+            focus_label, terminal_hint, resize_hint, stop_hint
         ),
-        InputMode::Input => format!(" Enter:Send  Alt+Enter:Newline{}", terminal_hint),
+        InputMode::Input => format!(
+            " Enter:Send  Alt+Enter:Newline{}{}",
+            terminal_hint, stop_hint
+        ),
         //NOTE to AI InputMode::Menu does not need hints, do not readd them
         InputMode::Menu=> format!("")
     };
@@ -832,10 +854,19 @@ fn render_keybar(f: &mut Frame, app: &App, area: Rect) {
     const NUM_STYLE: Style = Style::new().fg(Color::White).bg(Color::Black);
     const LABEL_STYLE: Style = Style::new().fg(Color::Black).bg(MC_GREEN);
 
-    let labels: [(&str, &str); 10] = if app.focus == Focus::Terminal {
-        [("1", "Help"), ("2", " "),("3", " "),("4", " "),("5", " "), ("6", "Release"),("7", "Release"),("8", "Release"), ("9", " "), ("10", "Exit")]
+    // F8 toggles the embedded terminal: "Term" opens (+focuses) it,
+    // "CloseTerm" closes it (also reachable via ^G while focused).
+    let f8_label = if app.terminal_state.is_running() {
+        "CloseTerm"
     } else {
-        [("1", "Help"), ("2", " "),("3", " "),("4", " "),("5", " "), ("6", "t"),("7", "Release"),("8", "Release"), ("9", " "), ("10", "Exit")]
+        "Term"
+    };
+    // F7 "Stop" is only offered while a request is in flight.
+    let f7_label = if app.is_loading { "Stop" } else { " " };
+    let labels: [(&str, &str); 10] = if app.focus == Focus::Terminal {
+        [("1", "Help"), ("2", " "),("3", " "),("4", " "),("5", " "), ("6", " "),("7", f7_label),("8", f8_label), ("9", "PullDn"), ("10", "Exit")]
+    } else {
+        [("1", "Help"), ("2", " "),("3", " "),("4", " "),("5", " "), ("6", "t"),("7", f7_label),("8", f8_label), ("9", "PullDn"), ("10", "Exit")]
     };
 
     // Slot layout: two cells per F-key ("10" needs two for its number).
