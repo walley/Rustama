@@ -103,11 +103,12 @@ Hand-rolled INI parser (no external crate). Files:
 - **Adding a slash command** = arm in `handle_slash_command()` + help text in `slash_help()`.
 - **Adding a menu item** = extend `item_names()` + `action_for()`; offsets/hit-testing are automatic (see `menu_spans()`).
 - **The retry countdown tests and `mock_server_429_flow` are slow** (~60s); don't "fix" them for being slow.
-- **Terminal tool escape sequences** are documented in a comment above `key_to_pty_bytes()`; TUI apps in the embedded terminal need application-cursor-key sequences (`ESC O A/B/C/D`), see `application_cursor()`.
+- **Terminal tool escape sequences** are documented in a comment above `key_to_pty_bytes()`; TUI apps in the embedded terminal need application-cursor-key sequences (`ESC O A/B/C/D`), see `application_cursor()`. `terminal_send` writes input **verbatim** (no auto-Enter) — the model appends `\r` itself when it wants to submit a line.
 - There are ~20 unit-test modules (`usage_tests`, `scrollbar_tests`, `truncate_tests`, `sessions_dir_tests`, `continuation_tests`, `menu_focus_tests`, `chat_body_tests`, `pricing_tests`, `throbber_tests`, …). New features should add tests to the matching module (or a new one).
 
 ## Recent Changes (keep this section current)
 
+- `terminal_send` no longer appends a newline/Enter — input is written exactly as given; the model must include `\r` explicitly to submit a line (`TerminalState::send_input`, `pty_send_input_appends_nothing` test). Fixes batched arrow keys (`ESC O B` — printable bytes!) triggering Enter in TUI apps like mc.
 - App-global `~/.config/rustama/AGENTS.md` loaded into every system prompt (`config::load_agents_md`, `App::build_system_content`).
 - Keyboard no longer blocked during retry backoff; send attempts while busy show a warning (event dispatch unified in `handle_event()`).
 - Random per-request throbber spinner (`SPINNERS`, `App::reroll_spinner`).

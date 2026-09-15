@@ -545,7 +545,8 @@ impl TerminalState {
 
                 if !command.trim().is_empty() {
                     self.command = command.to_string();
-                    let _ = self.send_input(command);
+                    // Type the command and press Enter (\r) so it runs.
+                    let _ = self.send_raw(&format!("{}\r", command));
                     format!("Terminal opened running: {}", command)
                 } else {
                     self.command = "bash".to_string();
@@ -556,25 +557,19 @@ impl TerminalState {
         }
     }
 
-    /// Sends text to the PTY, appending a newline — like typing the text
-    /// and pressing Enter. This is what the `terminal_send` tool uses.
-    /// Sends text to the PTY — like typing it and pressing Enter.
+    /// Sends input to the PTY exactly as given — nothing is appended.
+    /// This is what the `terminal_send` tool uses.
     ///
-    /// A trailing `\r` (carriage return, what a real Enter key produces)
-    /// is appended **only when the input contains printable text**. When
-    /// the input is made up solely of escape sequences and control
-    /// characters (a bare ESC, arrow keys, F-keys, Ctrl+C, ...), it is
-    /// sent as-is: appending anything would glue an extra key onto the
-    /// sequence (and a trailing `\n` decodes as Ctrl+J, not Enter, in
-    /// raw-mode TUI apps).
+    /// The caller decides whether the input ends with an Enter key
+    /// (`\r`): to run a shell command send `"ls -la\r"`, to drive a TUI
+    /// send bare keystrokes like `"\x1bOB"` (Down) with no trailing
+    /// newline. Auto-appending anything is wrong in general: escape
+    /// sequences such as `ESC O B` contain printable bytes, so a
+    /// "contains text" heuristic cannot tell a command from an arrow
+    /// key — and a glued-on `\r` is an unwanted Enter press in apps
+    /// like mc.
     pub fn send_input(&mut self, input: &str) -> String {
-        let has_text = input.chars().any(|c| !c.is_control());
-        let data = if has_text {
-            format!("{}\r", input)
-        } else {
-            input.to_string()
-        };
-        self.send_raw(&data)
+        self.send_raw(input)
             .map(|()| format!("Sent: {}", input))
             .unwrap_or_else(|e| e)
     }
@@ -5134,13 +5129,13 @@ fn get_tool_definitions() -> Vec<serde_json::Value> {
             "type": "function",
             "function": {
                 "name": "terminal_send",
-                "description": "Send input (keystrokes) to the running terminal session. The terminal is a real PTY, so interactive programs work: a newline is appended automatically (like pressing Enter). For special keys, write backslash escapes directly in the input string — they are decoded into the real control bytes before being written to the PTY: Ctrl+C = \"\\u0003\", Ctrl+D = \"\\u0004\", arrows = \"\\u001b[A/B/C/D\" (up/down/right/left), Tab = \"\\t\", Escape = \"\\u001b\", F1 = \"\\u001bOP\", PgUp/PgDn = \"\\u001b[5~\"/\"\\u001b[6~\". Example: send \"\\u0003\" to interrupt a running program.",
+                "description": "Send input (keystrokes) to the running terminal session. The terminal is a real PTY, so interactive programs work. The input is written EXACTLY as given — nothing is appended, so you must include the Enter key yourself: to run a shell command send \"ls -la\\r\" (or end the input with \\r), to drive a TUI send bare keystrokes with no newline (e.g. \"q\" to quit less, \"\\u001bOB\\u001bOB\" for two Down presses in mc). For special keys, write backslash escapes directly in the input string — they are decoded into the real control bytes before being written to the PTY: Enter = \"\\r\", Ctrl+C = \"\\u0003\", Ctrl+D = \"\\u0004\", arrows = \"\\u001b[A/B/C/D\" (up/down/right/left), Tab = \"\\t\", Escape = \"\\u001b\", F1 = \"\\u001bOP\", PgUp/PgDn = \"\\u001b[5~\"/\"\\u001b[6~\". Example: send \"\\u0003\" to interrupt a running program.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "input": {
                             "type": "string",
-                            "description": "The text to send to the terminal (a newline is appended automatically). May contain backslash escapes (\\uXXXX, \\n, \\r, \\t) for special keys, which are decoded before sending."
+                            "description": "The exact bytes to write to the terminal — nothing is appended. Include \\r (Enter) explicitly to submit a line (e.g. \"make build\\r\"). May contain backslash escapes (\\uXXXX, \\n, \\r, \\t) for special keys, which are decoded before sending."
                         }
                     },
                     "required": ["input"]
@@ -6244,8 +6239,9 @@ mod tests {
             r1["output"].as_str().unwrap()
         );
 
-        // Send more input — same process, same buffer, cursor must remain valid
-        let send_result = ts.send_input("echo AFTER_SEND");
+        // Send more input (with an explicit Enter — send_input appends
+        // nothing) — same process, same buffer, cursor must remain valid
+        let send_result = ts.send_input("echo AFTER_SEND\r");
         assert!(send_result.starts_with("Sent:"), "send: {}", send_result);
 
         std::thread::sleep(std::time::Duration::from_millis(700));
@@ -6490,6 +6486,49 @@ mod tests {
     }
 
     #[test]
+    fn pty_send_input_appends_nothing() {
+        // Regression: send_input must write exactly the bytes given —
+        // the caller (the terminal_send tool, i.e. the model) decides
+        // whether to press Enter. Previously a "\r" was auto-appended
+        // whenever the input contained printable bytes, which turned
+        // batched arrow keys (ESC O B — 'O' and 'B' are printable!)
+        // into an unwanted Enter press in TUI apps like mc.
+        use super::TerminalState;
+        let mut ts = TerminalState::new();
+        let result = ts.open("");
+        assert!(result.contains("Terminal opened"), "open: {}", result);
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        // Type a command without Enter: it must sit on the command line
+        // (tty echo shows it once) and NOT execute (which would print
+        // the marker a second time as command output).
+        ts.send_input("echo NO_AUTO_ENTER");
+        std::thread::sleep(std::time::Duration::from_millis(700));
+        let r = ts.read_buffer_incremental(None);
+        let output = r["output"].as_str().unwrap();
+        let count = output.matches("NO_AUTO_ENTER").count();
+        assert_eq!(
+            count, 1,
+            "command must not execute without an explicit Enter (marker x{}): {}",
+            count, output
+        );
+
+        // An explicit Enter runs it: the marker now appears twice (the
+        // echoed command line plus the echo output).
+        ts.send_input("\r");
+        std::thread::sleep(std::time::Duration::from_millis(700));
+        let r = ts.read_buffer_incremental(None);
+        let output = r["output"].as_str().unwrap();
+        let count = output.matches("NO_AUTO_ENTER").count();
+        assert!(
+            count >= 2,
+            "explicit Enter must run the command (marker x{}): {}",
+            count, output
+        );
+        ts.close();
+    }
+
+    #[test]
     fn application_cursor_tracks_decckm() {
         // The flag must follow the child's own mode change: ESC[?1h on,
         // ESC[?1l back off. Feed the mode change through the real PTY so
@@ -6504,13 +6543,13 @@ mod tests {
             !ts.application_cursor(),
             "shell must start in normal cursor mode"
         );
-        ts.send_input("printf '\\033[?1h'");
+        ts.send_input("printf '\\033[?1h'\r");
         std::thread::sleep(std::time::Duration::from_millis(400));
         assert!(
             ts.application_cursor(),
             "ESC[?1h must switch the parser to application cursor mode"
         );
-        ts.send_input("printf '\\033[?1l'");
+        ts.send_input("printf '\\033[?1l'\r");
         std::thread::sleep(std::time::Duration::from_millis(400));
         assert!(
             !ts.application_cursor(),
@@ -6536,9 +6575,9 @@ mod tests {
         wait(500);
 
         // 1. python3 REPL — impossible with pipes
-        ts.send_input("python3 -q");
+        ts.send_input("python3 -q\r");
         wait(900);
-        ts.send_input("print('REPL_' + 'WORKS')");
+        ts.send_input("print('REPL_' + 'WORKS')\r");
         wait(900);
         let screen = ts.read_buffer_incremental(None);
         let screen = screen["screen"].as_str().unwrap().to_string();
@@ -6547,11 +6586,11 @@ mod tests {
         // 2. Ctrl+C interrupt, then leave the REPL
         ts.send_raw("\x03").unwrap();
         wait(300);
-        ts.send_input("exit()");
+        ts.send_input("exit()\r");
         wait(500);
 
         // 3. readline up-arrow history in bash
-        ts.send_input("echo HISTORY_ONE");
+        ts.send_input("echo HISTORY_ONE\r");
         wait(400);
         ts.send_raw("\x1b[A").unwrap();
         wait(300);
@@ -6566,7 +6605,7 @@ mod tests {
         wait(300);
 
         // 4. full-screen pager
-        ts.send_input("seq 1 100 > /tmp/seq_rustama_test.txt; less /tmp/seq_rustama_test.txt");
+        ts.send_input("seq 1 100 > /tmp/seq_rustama_test.txt; less /tmp/seq_rustama_test.txt\r");
         wait(800);
         let screen = ts.read_buffer_incremental(None);
         let screen = screen["screen"].as_str().unwrap().to_string();
@@ -6606,7 +6645,7 @@ mod tests {
         // screen before sending anything else: crossterm drains pending
         // input while enabling raw mode, so keystrokes sent during init
         // are silently lost (the "typed text didn't land" race).
-        ts.send_input(&bin);
+        ts.send_input(&format!("{}\r", bin));
         let screen = ts.wait_for_screen("Rustama", std::time::Duration::from_secs(10));
         assert!(
             screen.contains("F9") || screen.contains("Menu") || screen.contains("Rustama"),
@@ -6623,9 +6662,9 @@ mod tests {
             screen
         );
 
-        // A bare ESC closes the menu. This is the regression test for
-        // send_input appending "\n" unconditionally: glued onto a lone
-        // ESC it broke the key (and decoded as Ctrl+J elsewhere).
+        // A bare ESC closes the menu. Regression test: send_input must
+        // write exactly these bytes — a glued-on trailing newline would
+        // break the key (and decode as Ctrl+J elsewhere).
         ts.send_input("\x1b");
         let screen = ts.wait_for_screen("Enter:Send", std::time::Duration::from_secs(3));
         assert!(
@@ -6634,8 +6673,8 @@ mod tests {
             screen
         );
 
-        // Plain text lands in the input box, Enter (\r, appended by
-        // send_input for text) is decoded as the Enter key.
+        // Plain text lands in the input box and stays there — no Enter
+        // is appended, so the message is typed but not sent.
         ts.send_input("hi from the acid test");
         let screen = ts.wait_for_screen("hi from the acid test", std::time::Duration::from_secs(5));
         assert!(
