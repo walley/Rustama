@@ -65,7 +65,7 @@ Hand-rolled INI parser (no external crate). Files:
 - `~/.config/rustama/AGENTS.md` — app-global agent instructions appended to every system prompt (see above).
 - `~/.config/rustama/cloud_models.conf` — per-cloud-model `api_url`/`api_key`/`api_model` + per-model params + optional pricing.
 - `~/.config/rustama/model_params.conf` — Ollama per-model params: `[default]` base + `[model-name]` overrides; legacy global temp/top_p/top_k migrated into `[default]` on first run.
-- `ModelParams`: temperature, top_p, top_k, frequency/presence penalties, `max_output_tokens`, `reasoning_effort`, `seed`.
+- `ModelParams`: temperature, top_p, top_k, frequency/presence penalties, `max_output_tokens`, `reasoning_effort`, `seed`, `num_ctx`.
 - `update_ini_section()` rewrites one section in place, preserving comments and other sections — used by all `save_*` functions.
 - Booleans accept English (true/yes/on/1) and Hungarian (igen).
 
@@ -109,6 +109,7 @@ Hand-rolled INI parser (no external crate). Files:
 
 ## Recent Changes (keep this section current)
 
+- **Ollama context window (`num_ctx`)**: Rustama now overcomes Ollama's default 2048-token context limit by auto-detecting the model's native context window and sending it as `options.num_ctx`. Detection queries `/api/show` and reads `model_info.<architecture>.context_length` (falls back to `llama.context_length`); triggered on startup, on model switch, and via `/ctx auto`. The detected value is a per-run default that never overwrites an explicit setting. New `ModelParams.num_ctx` (config keys `num_ctx`/`n_ctx`/`context_length`, sent only for Ollama; cloud models ignore it). New slash command `/ctx <n> | auto | off` (+ `/context` alias); "Num Ctx:" field added to the Settings dialog (F9 → Settings persists it).
 - `edit_file` tool result now embeds a unified diff (`unified_diff()`, LCS-based, ±3 context lines) instead of just "Successfully edited"; `render_output` colors diff lines in tool results (+green, −red, @@ cyan).
 - F7 "Stop": interrupts the in-flight request (stream / tool round / retry countdown) — `App::stop_request()`, per-request `Arc<AtomicBool>` cancel flag, `SendOutcome` enum in `send_with_retry`. Partial text is kept with a stopped marker; keybar F7 shows "Stop" only while loading; hintbar shows "F7:Stop" during requests.
 - F8 is now the terminal toggle: opens+focuses the terminal when not running, closes it when running; ^G (was: release focus) also closes the terminal while focused. Keybar F8 label: "Term"/"CloseTerm"; hints live in the hintbar. F9 still opens the menu (keybar: "PullDn").

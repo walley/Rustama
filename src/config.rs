@@ -42,6 +42,11 @@ pub struct ModelParams {
     /// top-level `think` field (bool or level string).
     pub reasoning_effort: Option<String>,
     pub seed: Option<u32>,
+    /// Ollama only: context window in tokens, sent as `options.num_ctx`.
+    /// Overrides Ollama's default context window (2048) which silently
+    /// forgets history beyond it. `None` = Ollama default (Rustama then
+    /// falls back to the model's reported `context_length` when known).
+    pub num_ctx: Option<u32>,
 }
 
 impl Default for ModelParams {
@@ -55,6 +60,7 @@ impl Default for ModelParams {
             max_output_tokens: None,
             reasoning_effort: None,
             seed: None,
+            num_ctx: None,
         }
     }
 }
@@ -128,6 +134,16 @@ impl ModelParams {
                     self.seed = Some(n);
                 }
             }
+            "num_ctx" | "n_ctx" | "context_length" => {
+                let v = value.trim();
+                if v.is_empty() || v.eq_ignore_ascii_case("off") || v.eq_ignore_ascii_case("none") {
+                    self.num_ctx = None;
+                } else if let Ok(n) = v.parse::<u32>()
+                    && n > 0
+                {
+                    self.num_ctx = Some(n);
+                }
+            }
             _ => return false,
         }
         true
@@ -156,6 +172,9 @@ impl ModelParams {
         }
         if let Some(n) = self.seed {
             out.push(("seed".to_string(), n.to_string()));
+        }
+        if let Some(n) = self.num_ctx {
+            out.push(("num_ctx".to_string(), n.to_string()));
         }
         out
     }
@@ -765,7 +784,8 @@ fn default_model_params_conf() -> String {
         "# Per-model parameters for Ollama models\n\
          # [default] applies to every model; a named section overrides it.\n\
          # Keys: temperature, top_p, top_k, frequency_penalty, presence_penalty,\n\
-         #   max_output_tokens, reasoning_effort (low/medium/high/on/off), seed\n\
+         #   max_output_tokens, reasoning_effort (low/medium/high/on/off), seed,\n\
+         #   num_ctx (context window in tokens, Ollama only)\n\
          \n\
          [default]\n",
     );
@@ -1123,6 +1143,42 @@ mod tests {
         assert!(p.apply_key("max_output_tokens", "off"));
         assert_eq!(p.max_output_tokens, None);
         assert!(!p.apply_key("not_a_param", "1"));
+    }
+
+    #[test]
+    fn apply_key_handles_num_ctx() {
+        let mut p = ModelParams::default();
+        assert_eq!(p.num_ctx, None);
+        assert!(p.apply_key("num_ctx", "202752"));
+        assert_eq!(p.num_ctx, Some(202752));
+        // aliases
+        let mut q = ModelParams::default();
+        assert!(q.apply_key("n_ctx", "8192"));
+        assert_eq!(q.num_ctx, Some(8192));
+        let mut r = ModelParams::default();
+        assert!(r.apply_key("context_length", "4096"));
+        assert_eq!(r.num_ctx, Some(4096));
+        // off / invalid
+        let mut s = ModelParams::default();
+        s.num_ctx = Some(123);
+        assert!(s.apply_key("num_ctx", "off"));
+        assert_eq!(s.num_ctx, None);
+        assert!(p.apply_key("num_ctx", "abc")); // ignored
+        assert_eq!(p.num_ctx, Some(202752));
+    }
+
+    #[test]
+    fn num_ctx_round_trips_through_conf_entries() {
+        let mut p = ModelParams::default();
+        p.num_ctx = Some(202752);
+        let entries = p.to_conf_entries();
+        assert!(entries.iter().any(|(k, v)| k == "num_ctx" && v == "202752"));
+        // parses back
+        let mut q = ModelParams::default();
+        for (k, v) in &entries {
+            q.apply_key(k, v);
+        }
+        assert_eq!(q.num_ctx, Some(202752));
     }
 
     #[test]

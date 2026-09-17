@@ -194,6 +194,7 @@ pub enum SettingsFocus {
     ReasoningEffort,
     MaxToolRounds,
     MaxRetries,
+    NumCtx,
     Justify,
     Save,
     Cancel,
@@ -201,7 +202,7 @@ pub enum SettingsFocus {
 
 impl SettingsFocus {
     /// Field order used by Tab/BackTab and Up/Down navigation.
-    const ORDER: [SettingsFocus; 14] = [
+    const ORDER: [SettingsFocus; 15] = [
         SettingsFocus::Proxy,
         SettingsFocus::OllamaUrl,
         SettingsFocus::Temperature,
@@ -213,6 +214,7 @@ impl SettingsFocus {
         SettingsFocus::ReasoningEffort,
         SettingsFocus::MaxToolRounds,
         SettingsFocus::MaxRetries,
+        SettingsFocus::NumCtx,
         SettingsFocus::Justify,
         SettingsFocus::Save,
         SettingsFocus::Cancel,
@@ -242,6 +244,7 @@ impl SettingsFocus {
                 | SettingsFocus::ReasoningEffort
                 | SettingsFocus::MaxToolRounds
                 | SettingsFocus::MaxRetries
+                | SettingsFocus::NumCtx
         )
     }
 }
@@ -1004,6 +1007,13 @@ pub struct App {
     pub model_dialog_selection: usize,
     pub model_dialog_focus: ModelDialogFocus,
     pub models_rx: Option<mpsc::Receiver<Result<Vec<String>, String>>>,
+    /// Auto-detected Ollama context window (tokens) for the current model,
+    /// from `/api/show` (`model_info.<arch>.context_length`). Used as the
+    /// default `num_ctx` unless the user sets one explicitly. `None` until
+    /// detected / for cloud models.
+    pub ollama_ctx_length: Option<u32>,
+    /// Receiver for the in-flight context-length detection request.
+    pub ctx_rx: Option<mpsc::Receiver<Option<u32>>>,
     pub show_file_dialog: bool,
     pub file_dialog_path: PathBuf,
     pub file_dialog_entries: Vec<(String, bool)>,
@@ -1044,6 +1054,7 @@ pub struct App {
     pub settings_reasoning_effort: String,
     pub settings_max_tool_rounds: String,
     pub settings_max_retries: String,
+    pub settings_num_ctx: String,
     pub settings_cursor: usize,
     pub proxy: Option<String>,
     pub is_logging: bool,
@@ -1135,6 +1146,8 @@ impl App {
             model_dialog_selection: 0,
             model_dialog_focus: ModelDialogFocus::List,
             models_rx: None,
+            ollama_ctx_length: None,
+            ctx_rx: None,
             show_file_dialog: false,
             file_dialog_path: dirs_home(),
             file_dialog_entries: Vec::new(),
@@ -1176,6 +1189,7 @@ impl App {
             settings_reasoning_effort: params.reasoning_effort.clone().unwrap_or_default(),
             settings_max_tool_rounds: cfg.max_tool_rounds.to_string(),
             settings_max_retries: cfg.max_retries.to_string(),
+            settings_num_ctx: String::new(),
             settings_cursor: 0,
             proxy: cfg.proxy.clone(),
             is_logging: cfg.logging,
@@ -1223,6 +1237,12 @@ impl App {
             "Program started",
         );
         app.fetch_models_async();
+        // Kick off auto-detection of the default model's context window so
+        // requests can overcome Ollama's default 2048-token limit.
+        let is_cloud = app.cloud_models.iter().any(|m| m.name == app.model_name);
+        if !is_cloud {
+            app.fetch_ctx_async(app.model_name.clone());
+        }
         app
     }
 
@@ -2206,7 +2226,12 @@ impl App {
         let is_logging = self.is_logging;
         let log_file = self.log_file.clone();
         let session_id = self.session_id.clone();
-        let params = self.params.clone();
+        let mut params = self.params.clone();
+        // Use the auto-detected model context window unless the user set
+        // an explicit num_ctx. Cloud models manage their own context.
+        if cloud_model.is_none() && params.num_ctx.is_none() {
+            params.num_ctx = self.ollama_ctx_length;
+        }
         let proxy = if cloud_model.is_some() {
             self.proxy.clone()
         } else {
@@ -2374,7 +2399,12 @@ impl App {
         let is_logging = self.is_logging;
         let log_file = self.log_file.clone();
         let session_id = self.session_id.clone();
-        let params = self.params.clone();
+        let mut params = self.params.clone();
+        // Use the auto-detected model context window unless the user set
+        // an explicit num_ctx. Cloud models manage their own context.
+        if cloud_model.is_none() && params.num_ctx.is_none() {
+            params.num_ctx = self.ollama_ctx_length;
+        }
         let proxy = if cloud_model.is_some() {
             self.proxy.clone()
         } else {
@@ -3211,6 +3241,67 @@ impl App {
                 }
             }
         }
+        self.check_ctx_response();
+    }
+
+    /// Polls an in-flight context-length detection request and caches the
+    /// result on `self.ollama_ctx_length`. Detection is only stored in
+    /// memory (used as the default `num_ctx`); it never overwrites an
+    /// explicit user-set `params.num_ctx`.
+    fn check_ctx_response(&mut self) {
+        if let Some(rx) = &self.ctx_rx {
+            match rx.try_recv() {
+                Ok(Some(len)) => {
+                    self.ollama_ctx_length = Some(len);
+                    self.status_message = format!(
+                        "Context window detected: {} tokens ({})",
+                        len, self.model_name
+                    );
+                    self.ctx_rx = None;
+                }
+                Ok(None) => {
+                    self.ctx_rx = None;
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.ctx_rx = None;
+                }
+            }
+        }
+    }
+
+    /// Asynchronously queries Ollama's `/api/show` for the current model's
+    /// context window and reports it through `ctx_rx`. Non-Ollama (cloud)
+    /// models and any fetch failure simply yield `None`.
+    pub fn fetch_ctx_async(&mut self, model: String) {
+        let url = self.ollama_url.clone();
+        let (tx, rx) = mpsc::channel();
+        self.ctx_rx = Some(rx);
+
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+
+            rt.block_on(async {
+                let client = build_reqwest_client(&None);
+                let ctx = match client
+                    .post(format!("{}/api/show", url))
+                    .json(&serde_json::json!({ "model": model }))
+                    .timeout(std::time::Duration::from_secs(10))
+                    .send()
+                    .await
+                {
+                    Ok(resp) => match resp.json::<serde_json::Value>().await {
+                        Ok(json) => extract_context_length(&json),
+                        Err(_) => None,
+                    },
+                    Err(_) => None,
+                };
+                let _ = tx.send(ctx);
+            });
+        });
     }
 
     fn handle_model_dialog_key(&mut self, key: KeyEvent) {
@@ -3273,6 +3364,12 @@ impl App {
         if let Some(model) = self.available_models.get(self.model_dialog_selection) {
             self.model_name = model.clone();
             self.apply_model_params();
+            self.ollama_ctx_length = None;
+            // Re-detect the new model's context window for Ollama models.
+            let is_cloud = self.cloud_models.iter().any(|m| m.name == self.model_name);
+            if !is_cloud {
+                self.fetch_ctx_async(self.model_name.clone());
+            }
             self.status_message = format!("Model set to: {}", self.model_name);
         }
         self.show_model_dialog = false;
@@ -3353,6 +3450,11 @@ impl App {
             self.params.reasoning_effort.clone().unwrap_or_default();
         self.settings_max_tool_rounds = self.max_tool_rounds.to_string();
         self.settings_justify = self.justify;
+        self.settings_num_ctx = self
+            .params
+            .num_ctx
+            .map(|n| n.to_string())
+            .unwrap_or_default();
     }
 
     fn handle_settings_dialog_key(&mut self, key: KeyEvent) {
@@ -3477,6 +3579,7 @@ impl App {
             SettingsFocus::ReasoningEffort => &self.settings_reasoning_effort,
             SettingsFocus::MaxToolRounds => &self.settings_max_tool_rounds,
             SettingsFocus::MaxRetries => &self.settings_max_retries,
+            SettingsFocus::NumCtx => &self.settings_num_ctx,
             _ => "",
         }
     }
@@ -3494,6 +3597,7 @@ impl App {
             SettingsFocus::ReasoningEffort => &mut self.settings_reasoning_effort,
             SettingsFocus::MaxToolRounds => &mut self.settings_max_tool_rounds,
             SettingsFocus::MaxRetries => &mut self.settings_max_retries,
+            SettingsFocus::NumCtx => &mut self.settings_num_ctx,
             _ => unreachable!(),
         }
     }
@@ -3518,6 +3622,8 @@ impl App {
             .apply_key("max_output_tokens", self.settings_max_tokens.trim());
         self.params
             .apply_key("reasoning_effort", self.settings_reasoning_effort.trim());
+        self.params
+            .apply_key("num_ctx", self.settings_num_ctx.trim());
         if let Ok(v) = self.settings_max_tool_rounds.trim().parse::<usize>()
             && (1..=100).contains(&v)
         {
@@ -3564,6 +3670,7 @@ impl App {
             (SettingsFocus::ReasoningEffort, "Effort:"),
             (SettingsFocus::MaxToolRounds, "Max Rounds:"),
             (SettingsFocus::MaxRetries, "Max Retries:"),
+            (SettingsFocus::NumCtx, "Num Ctx:"),
             (SettingsFocus::Justify, "Justify:"),
         ];
 
@@ -3582,7 +3689,7 @@ impl App {
             }
         }
 
-        let num_fields = 12u16;
+        let num_fields = 13u16;
         let btn_y = inner_y + num_fields * 2 + 1;
         let save_label = "Save";
         let cancel_label = "Cancel";
@@ -4103,6 +4210,7 @@ impl App {
                         .unwrap_or_else(|| "(unset)".to_string())
                 ),
             }),
+            "ctx" | "context" => Some(self.slash_ctx(arg)),
             "proxy" => Some(match arg {
                 Some("off") | Some("none") | Some("") => {
                     self.proxy = None;
@@ -4200,6 +4308,7 @@ impl App {
             ),
             ("/maxtokens <n>", "Max output tokens (or /maxtokens off)"),
             ("/seed <n>", "Sampling seed (or /seed off)"),
+            ("/ctx <n>", "Context window / num_ctx (auto | off)"),
             ("/proxy <url>", "Set HTTP proxy (e.g. http://proxy:8080)"),
             ("/proxy off", "Disable proxy"),
             ("/session new", "Start a new session (autosaves current)"),
@@ -4220,12 +4329,81 @@ impl App {
         out
     }
 
+    /// `/ctx` shows or sets the Ollama context window (`options.num_ctx`).
+    ///
+    /// - `/ctx` → show the effective value (explicit or auto-detected).
+    /// - `/ctx <n>` → set an explicit context window (persisted via config).
+    /// - `/ctx off` → clear the explicit value (back to auto-detect/default).
+    /// - `/ctx auto` → re-query Ollama `/api/show` for the model's native
+    ///   context window and use it.
+    fn slash_ctx(&mut self, arg: Option<&str>) -> String {
+        let is_cloud = self.cloud_models.iter().any(|m| m.name == self.model_name);
+        match arg {
+            Some("auto") | Some("detect") => {
+                if is_cloud {
+                    "Context window is managed by the cloud provider — not applicable.".to_string()
+                } else {
+                    self.ollama_ctx_length = None;
+                    self.fetch_ctx_async(self.model_name.clone());
+                    "Querying Ollama for the model's context window…".to_string()
+                }
+            }
+            Some("off") | Some("none") | Some("") => {
+                self.params.num_ctx = None;
+                let _ = self.save_config();
+                "num_ctx cleared (auto-detected or Ollama default will be used)".to_string()
+            }
+            Some(n) => match n.parse::<u32>() {
+                Ok(v) if v > 0 => {
+                    self.params.num_ctx = Some(v);
+                    let _ = self.save_config();
+                    format!("num_ctx set to {} tokens", v)
+                }
+                _ => "Usage: /ctx <number> or /ctx auto | off".to_string(),
+            },
+            None => {
+                let explicit = self.params.num_ctx;
+                let effective = explicit.or_else(|| {
+                    if is_cloud {
+                        None
+                    } else {
+                        self.ollama_ctx_length
+                    }
+                });
+                match effective {
+                    Some(v) => {
+                        let tag = if explicit.is_some() {
+                            "explicit"
+                        } else {
+                            "auto-detected"
+                        };
+                        format!(
+                            "Context window: {} tokens ({}) (usage: /ctx <n> | auto | off)",
+                            v, tag
+                        )
+                    }
+                    None => {
+                        if is_cloud {
+                            "Context window is managed by the cloud provider.".to_string()
+                        } else {
+                            format!(
+                                "Context window: unknown (use /ctx auto or /ctx <n>)"
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     fn slash_model(&mut self, arg: Option<&str>) -> String {
         match arg {
             Some(name) => {
                 if self.available_models.iter().any(|m| m == name) {
                     self.model_name = name.to_string();
                     self.apply_model_params();
+                    self.ollama_ctx_length = None;
+                    self.fetch_ctx_async(self.model_name.clone());
                     format!("Model set to: {}", name)
                 } else if self.cloud_models.iter().any(|m| m.name == name) {
                     self.model_name = name.to_string();
@@ -7216,6 +7394,24 @@ mod tests {
     }
 }
 
+/// Extracts the model's native context window (tokens) from an Ollama
+/// `/api/show` response.
+///
+/// Ollama reports the value under `model_info.<architecture>.context_length`
+/// (e.g. `deepseek2.context_length`), where the architecture prefix comes
+/// from `model_info.general.architecture`. Falls back to the `llama` prefix.
+fn extract_context_length(json: &serde_json::Value) -> Option<u32> {
+    let mi = json.get("model_info")?;
+    let arch = mi
+        .get("general.architecture")
+        .and_then(|a| a.as_str())
+        .unwrap_or("llama");
+    let value = mi
+        .get(format!("{}.context_length", arch))
+        .or_else(|| mi.get("llama.context_length"));
+    value.and_then(|v| v.as_u64()).and_then(|n| u32::try_from(n).ok())
+}
+
 /// Builds the JSON request body for a chat request, translating the
 /// per-model [`ModelParams`] into the dialect the backend speaks:
 /// OpenAI-style top-level fields for cloud models, Ollama `options` map +
@@ -7281,6 +7477,9 @@ fn build_chat_body(
         }
         if let Some(num_predict) = params.max_output_tokens {
             options["num_predict"] = serde_json::json!(num_predict);
+        }
+        if let Some(num_ctx) = params.num_ctx {
+            options["num_ctx"] = serde_json::json!(num_ctx);
         }
         body["options"] = options;
         // Ollama `think`: bool toggle, or a level string for models
@@ -7578,6 +7777,7 @@ mod chat_body_tests {
             max_output_tokens: Some(4096),
             reasoning_effort: Some("high".to_string()),
             seed: Some(42),
+            num_ctx: Some(202752),
         };
         let body = build_chat_body("llama3.2:3b", None, true, &msgs(), &params);
         assert_eq!(body["model"], "llama3.2:3b");
@@ -7589,6 +7789,7 @@ mod chat_body_tests {
         assert_eq!(o["presence_penalty"], -0.5);
         assert_eq!(o["num_predict"], 4096);
         assert_eq!(o["seed"], 42);
+        assert_eq!(o["num_ctx"], 202752);
         assert_eq!(body["think"], "high");
         assert!(body["tools"].is_array(), "agentic attaches tools");
     }
@@ -7605,6 +7806,7 @@ mod chat_body_tests {
         assert!(o.get("presence_penalty").is_none());
         assert!(o.get("seed").is_none());
         assert!(o.get("num_predict").is_none());
+        assert!(o.get("num_ctx").is_none());
         assert!(body.get("think").is_none());
         assert!(body.get("tools").is_none(), "non-agentic: no tools");
     }
@@ -7641,6 +7843,7 @@ mod chat_body_tests {
             max_output_tokens: Some(8192),
             reasoning_effort: Some("medium".to_string()),
             seed: Some(7),
+            num_ctx: Some(9999), // not an OpenAI concept — must not be sent
         };
         let body = build_chat_body("test-cloud", Some(&cloud), true, &msgs(), &params);
         assert_eq!(body["model"], "test-cloud");
@@ -7652,6 +7855,7 @@ mod chat_body_tests {
         assert_eq!(body["seed"], 7);
         assert_eq!(body["reasoning_effort"], "medium");
         assert!(body.get("top_k").is_none());
+        assert!(body.get("num_ctx").is_none());
         assert!(body.get("options").is_none());
         assert!(body.get("think").is_none());
         assert!(body["tools"].is_array());
@@ -7672,5 +7876,37 @@ mod chat_body_tests {
         params.reasoning_effort = Some("off".to_string());
         let body = build_chat_body("test-cloud", Some(&cloud), true, &msgs(), &params);
         assert!(body.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn extract_context_length_from_show_response() {
+        // glm-max reports under deepseek2.context_length.
+        let json = serde_json::json!({
+            "model_info": {
+                "general.architecture": "deepseek2",
+                "deepseek2.context_length": 202752,
+            }
+        });
+        assert_eq!(extract_context_length(&json), Some(202752));
+    }
+
+    #[test]
+    fn extract_context_length_uses_llama_fallback() {
+        // Older models use the llama prefix and no explicit architecture.
+        let json = serde_json::json!({
+            "model_info": {
+                "llama.context_length": 4096,
+            }
+        });
+        assert_eq!(extract_context_length(&json), Some(4096));
+    }
+
+    #[test]
+    fn extract_context_length_missing_returns_none() {
+        assert_eq!(extract_context_length(&serde_json::json!({})), None);
+        assert_eq!(
+            extract_context_length(&serde_json::json!({ "model_info": {} })),
+            None
+        );
     }
 }

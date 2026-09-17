@@ -8,7 +8,8 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Shadow}
 
 /// Midnight Commander's signature turquoise-green (its "cyan" keybar/menu
 /// text, approximated as truecolor). Shared by the keybar and the menu bar.
-pub const MC_GREEN: Color = Color::Rgb(0, 187, 187);
+///pub const MC_GREEN: Color = Color::Rgb(0, 187, 187);
+pub const MC_GREEN: Color = Color::Cyan;
 
 #[derive(Debug, Clone)]
 pub struct Theme {

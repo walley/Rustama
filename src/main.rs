@@ -1166,7 +1166,7 @@ fn render_load_dialog(f: &mut Frame, app: &App, area: Rect) {
 
 fn render_settings_dialog(f: &mut Frame, app: &App, area: Rect) {
     let dialog_w: u16 = 60;
-    let dialog_h: u16 = 28;
+    let dialog_h: u16 = 29;
 
     let popup_area = Rect {
         x: (area.width.saturating_sub(dialog_w)) / 2,
@@ -1192,6 +1192,7 @@ fn render_settings_dialog(f: &mut Frame, app: &App, area: Rect) {
         ("Effort:", SettingsFocus::ReasoningEffort),
         ("Max Rounds:", SettingsFocus::MaxToolRounds),
         ("Max Retries:", SettingsFocus::MaxRetries),
+        ("Num Ctx:", SettingsFocus::NumCtx),
         ("Justify:", SettingsFocus::Justify),
     ];
 
@@ -1248,6 +1249,7 @@ fn render_settings_dialog(f: &mut Frame, app: &App, area: Rect) {
                 SettingsFocus::ReasoningEffort => &app.settings_reasoning_effort,
                 SettingsFocus::MaxToolRounds => &app.settings_max_tool_rounds,
                 SettingsFocus::MaxRetries => &app.settings_max_retries,
+                SettingsFocus::NumCtx => &app.settings_num_ctx,
                 _ => "",
             };
 
@@ -1287,7 +1289,7 @@ fn render_settings_dialog(f: &mut Frame, app: &App, area: Rect) {
         }
     }
 
-    let num_fields = 12u16;
+    let num_fields = 13u16;
     let btn_y = inner.y + num_fields * 2 + 1;
     let save_label = "Save";
     let cancel_label = "Cancel";
