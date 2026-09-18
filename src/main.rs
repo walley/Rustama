@@ -18,6 +18,7 @@ use ratatui::widgets::*;
 
 mod app;
 mod config;
+mod lsp;
 mod primary_selection;
 mod ui;
 use app::{App, ChatMessage, Focus, InputMode, ModelDialogFocus, SaveDialogFocus, SettingsFocus};

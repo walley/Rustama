@@ -1099,6 +1099,19 @@ pub struct App {
     /// Token usage received mid-stream (via `StreamChunk::Stats`) that has not
     /// been committed to `token_stats` yet.
     last_stats: TokenStats,
+    /// rust-analyzer LSP session (compiler feedback for the agentic tools).
+    /// Stopped unless `lsp = on` in the config or `/workspace` starts it.
+    pub lsp: crate::lsp::LspClient,
+    /// Server binary from config (`lsp_server`), remembered for restarts.
+    pub lsp_server: String,
+    /// Whether config asked for LSP at startup (`lsp = on`).
+    pub lsp_enabled: bool,
+    /// Append fresh diagnostics to edit_file/write_file tool results
+    /// (`lsp_auto_diagnostics`).
+    pub lsp_auto_diagnostics: bool,
+    /// Most recent file edited/written by a tool — default target of
+    /// `lsp_diagnostics` when called without a `path`.
+    pub last_edited_file: Option<PathBuf>,
 }
 
 impl App {
@@ -1109,6 +1122,8 @@ impl App {
         let model_params_store = load_model_params();
         let cloud_models = load_cloud_models_with_base(&model_params_store.default);
         let params = params_for_model(&cfg.model, &cloud_models, &model_params_store);
+        // Resolved before `cfg` fields move into the struct below.
+        let lsp_root = resolve_lsp_workspace(&cfg.lsp_workspace, &cfg.save_path);
         let mut app = App {
             messages: vec![ChatMessage::App(
                 "Welcome to Rustama. Start typing your message.".to_string(),
@@ -1227,6 +1242,11 @@ impl App {
             continuation_count: 0,
             auto_continue_count: 0,
             last_stats: TokenStats::default(),
+            lsp: crate::lsp::LspClient::new(),
+            lsp_server: cfg.lsp_server.clone(),
+            lsp_enabled: cfg.lsp,
+            lsp_auto_diagnostics: cfg.lsp_auto_diagnostics,
+            last_edited_file: None,
         };
         app.session_name = app.session_id.clone();
         log_to_file(
@@ -1236,6 +1256,11 @@ impl App {
             "START",
             "Program started",
         );
+        // LSP: opt-in (lsp = on) — rust-analyzer is a heavy process.
+        if app.lsp_enabled {
+            let server = app.lsp_server.clone();
+            app.start_lsp(lsp_root, server);
+        }
         app.fetch_models_async();
         // Kick off auto-detection of the default model's context window so
         // requests can overcome Ollama's default 2048-token limit.
@@ -1618,6 +1643,14 @@ impl App {
                     self.status_message = result;
                 }
             }
+            MenuAction::ToggleHintbar => {
+                self.hintbar = !self.hintbar;
+                self.status_message = if self.hintbar {
+                    "Hintbar: ON".to_string()
+                } else {
+                    "Hintbar: OFF".to_string()
+                };
+            }
             MenuAction::OpenSettingsDialog => self.open_settings_dialog(),
             MenuAction::ShowAbout => self.show_about = true,
         }
@@ -1663,6 +1696,213 @@ impl App {
             "terminal_close" => Some(self.terminal_state.close()),
             _ => None,
         }
+    }
+
+    // ─── LSP (rust-analyzer) ─────────────────────────────────────────
+
+    /// Starts (or restarts) the rust-analyzer LSP server rooted at `root`.
+    /// Warns but continues when the root has no `Cargo.toml` (single-file
+    /// analysis still works); on spawn/handshake failure the client is
+    /// left in `Failed` state and the tools report it.
+    pub fn start_lsp(&mut self, root: PathBuf, server_bin: String) {
+        if !root.join("Cargo.toml").exists() {
+            self.messages.push(ChatMessage::App(format!(
+                "⚠ No Cargo.toml in {} — rust-analyzer will only parse single files.",
+                root.display()
+            )));
+        }
+        match self.lsp.start(root.clone(), &server_bin) {
+            Ok(()) => {
+                self.lsp_enabled = true;
+                self.status_message = format!("LSP: rust-analyzer running ({})", root.display());
+                self.log_event("LSP", &format!("started in {}", root.display()));
+            }
+            Err(e) => {
+                self.status_message = format!("LSP failed: {}", e);
+                self.log_event("LSP", &format!("start failed: {}", e));
+            }
+        }
+    }
+
+    /// Stops the LSP server (`shutdown` + `exit`, then kill).
+    pub fn stop_lsp(&mut self) {
+        self.lsp.shutdown();
+        self.status_message = "LSP: stopped".to_string();
+        self.log_event("LSP", "stopped");
+    }
+
+    /// Executes the LSP-flavored tools; `None` = not an LSP tool (caller
+    /// falls through to the stateless `execute_tool_call`).
+    fn execute_lsp_tool(&mut self, name: &str, args_json: &str) -> Option<String> {
+        if name != "lsp_diagnostics" {
+            return None;
+        }
+        let args: serde_json::Value =
+            serde_json::from_str(args_json).unwrap_or(serde_json::json!({}));
+        Some(self.lsp_diagnostics(
+            args["path"].as_str(),
+            args["severity"].as_str(),
+            crate::lsp::LSP_REQUEST_TIMEOUT,
+        ))
+    }
+
+    /// Core of the `lsp_diagnostics` tool: sync the file into the server,
+    /// wait for fresh analysis, format the results. Shared by the tool,
+    /// the auto-feedback hook, and tests.
+    fn lsp_diagnostics(
+        &mut self,
+        path: Option<&str>,
+        severity: Option<&str>,
+        timeout: std::time::Duration,
+    ) -> String {
+        use crate::lsp::{LspStatus, SeverityFilter};
+
+        let filter = match severity {
+            None => SeverityFilter::All,
+            Some(s) => match SeverityFilter::parse(s) {
+                Some(f) => f,
+                None => {
+                    return format!(
+                        "LSP: unknown severity '{}' (use error|warning|hint|info)",
+                        s
+                    );
+                }
+            },
+        };
+
+        match self.lsp.status() {
+            LspStatus::Running => {}
+            LspStatus::Stopped => {
+                return "LSP: server not running. Enable it with `lsp = on` in rustama.conf \
+                    (or /workspace <dir>) — requires rust-analyzer."
+                    .to_string();
+            }
+            LspStatus::Failed(e) => return format!("LSP: server failed: {}", e),
+            LspStatus::Starting => {} // rare; wait below handles it
+        }
+
+        // No path → workspace summary of everything published so far.
+        let path = match path {
+            Some(p) => PathBuf::from(p),
+            None => match &self.last_edited_file {
+                Some(p) => p.clone(),
+                None => {
+                    let (errors, warnings) = self.lsp.diagnostics_summary();
+                    return format!(
+                        "LSP workspace ({}): {} errors, {} warnings (cached; open a file for details)",
+                        self.lsp.root().display(),
+                        errors,
+                        warnings
+                    );
+                }
+            },
+        };
+
+        if let Err(e) = self.lsp.sync_file(&path) {
+            return format!("LSP: cannot sync {}: {}", path.display(), e);
+        }
+
+        let root = self.lsp.root().to_path_buf();
+        let cancel = AtomicBool::new(false);
+
+        // Pull diagnostics when the server supports it (rust-analyzer
+        // does) — a direct answer beats waiting for a push. The server
+        // *cancels* pulls invalidated by a fresh didChange ("server
+        // cancelled the request"): retry briefly while it re-analyzes.
+        let diags = if self.lsp.pull_supported() {
+            let mut result = None;
+            for _ in 0..10 {
+                match self.lsp.pull_diagnostics(&path, timeout, &cancel) {
+                    Ok(d) => {
+                        result = Some(d);
+                        break;
+                    }
+                    Err(e) if e.contains("cancelled") => {
+                        std::thread::sleep(std::time::Duration::from_millis(300));
+                    }
+                    Err(e) => return format!("LSP: diagnostic request failed: {}", e),
+                }
+            }
+            match result {
+                Some(d) => d,
+                None => {
+                    return format!(
+                        "LSP: diagnostics for {} not ready (server busy re-analyzing — try again)",
+                        path.display()
+                    );
+                }
+            }
+        } else {
+            // Push-only server: wait briefly for fresh analysis, then use
+            // whatever is cached (possibly empty = clean or not ready).
+            let since = self.lsp.diag_version(&path);
+            let waited = std::time::Duration::from_secs(10).min(timeout);
+            let v = self.lsp.wait_for_diagnostics(&path, since, waited, &cancel);
+            if v == since && since == 0 {
+                return format!(
+                    "LSP: no diagnostics for {} yet (analysis still in progress — try again)",
+                    path.display()
+                );
+            }
+            self.lsp.diagnostics_for(&path)
+        };
+
+        let formatted = crate::lsp::format_diagnostics(&diags, &path, &root, filter);
+        if formatted.is_empty() {
+            format!("LSP: no diagnostics for {} ✓", path.display())
+        } else {
+            format!(
+                "LSP diagnostics for {}:\n{}",
+                path.display(),
+                formatted.trim_end()
+            )
+        }
+    }
+
+    /// Auto-feedback hook: after a successful edit_file/write_file tool
+    /// call, append fresh diagnostics so the model sees its own type
+    /// errors immediately. Gated by `lsp_auto_diagnostics`; no-op when the
+    /// server is not running or the edit failed.
+    fn maybe_append_lsp_diagnostics(&mut self, name: &str, args_json: &str, result: &mut String) {
+        if !self.lsp_auto_diagnostics
+            || !matches!(name, "edit_file" | "write_file")
+            || result.starts_with("Error")
+            || self.lsp.status() != crate::lsp::LspStatus::Running
+        {
+            return;
+        }
+        let args: serde_json::Value =
+            serde_json::from_str(args_json).unwrap_or(serde_json::json!({}));
+        let Some(path) = args["path"].as_str() else { return };
+        if std::path::Path::new(path).extension().and_then(|e| e.to_str()) != Some("rs") {
+            return;
+        }
+        // Fresh analysis takes a moment after didChange; give it a
+        // bounded wait so the feedback reflects the edit, not the past.
+        let diag = self.lsp_diagnostics(
+            Some(path),
+            None,
+            std::time::Duration::from_secs(15),
+        );
+        result.push_str(&format!("\n\nDiagnostics: {}", diag));
+    }
+
+    /// Unified tool dispatch: terminal tools → LSP tools → stateless tools,
+    /// then the auto-diagnostics hook for file edits.
+    fn execute_tool(&mut self, name: &str, args: &str) -> String {
+        if matches!(name, "edit_file" | "write_file") {
+            let parsed: serde_json::Value =
+                serde_json::from_str(args).unwrap_or(serde_json::json!({}));
+            if let Some(p) = parsed["path"].as_str() {
+                self.last_edited_file = Some(PathBuf::from(p));
+            }
+        }
+        let mut result = self
+            .execute_terminal_tool(name, args)
+            .or_else(|| self.execute_lsp_tool(name, args))
+            .unwrap_or_else(|| execute_tool_call(name, args, &self.proxy));
+        self.maybe_append_lsp_diagnostics(name, args, &mut result);
+        result
     }
 
     pub fn scroll_up(&mut self) {
@@ -1863,9 +2103,7 @@ impl App {
                                 tool_call_id: tool_call_id.clone(),
                             });
 
-                            let result = self
-                                .execute_terminal_tool(&name, &args)
-                                .unwrap_or_else(|| execute_tool_call(&name, &args, &self.proxy));
+                            let result = self.execute_tool(&name, &args);
                             self.tool_call_count += 1;
                             self.tool_call_log
                                 .push((name.clone(), args.clone(), result.clone()));
@@ -1955,10 +2193,7 @@ impl App {
                                         arguments: args.clone(),
                                         tool_call_id: Some(tc_id.clone()),
                                     });
-                                    let result =
-                                        self.execute_terminal_tool(&name, &args).unwrap_or_else(
-                                            || execute_tool_call(&name, &args, &self.proxy),
-                                        );
+                                    let result = self.execute_tool(&name, &args);
                                     self.tool_call_count += 1;
                                     self.tool_call_log.push((
                                         name.clone(),
@@ -4263,6 +4498,7 @@ impl App {
                 _ => "Usage: /session new | /session save | /session rename <name> | /session load <name>"
                     .to_string(),
             }),
+            "workspace" => Some(self.slash_workspace(arg)),
             "justify" => {
                 self.justify = !self.justify;
                 Some(
@@ -4315,6 +4551,7 @@ impl App {
             ("/session save", "Save current session"),
             ("/session rename <name>", "Rename current session"),
             ("/session load <name>", "Load a session by name"),
+            ("/workspace <dir>", "LSP workspace root (restarts rust-analyzer)"),
             ("/justify", "Toggle paragraph justification"),
             ("/status", "Show app status"),
             ("/usage", "Session token usage & cost estimate"),
@@ -4541,6 +4778,56 @@ impl App {
             format!("Logging enabled. Writing to: {}", self.log_file)
         } else {
             format!("Logging disabled. Last log file: {}", self.log_file)
+        }
+    }
+
+    /// `/workspace` shows or sets the LSP workspace root.
+    /// - `/workspace` → show the current root and server status.
+    /// - `/workspace <dir>` → switch roots; restarts rust-analyzer there
+    ///   (implicitly enables LSP for the session). Missing `Cargo.toml`
+    ///   only warns — single-file analysis still works.
+    /// - `/workspace off` → stop the LSP server.
+    fn slash_workspace(&mut self, arg: Option<&str>) -> String {
+        match arg {
+            None => {
+                let status = match self.lsp.status() {
+                    crate::lsp::LspStatus::Running => {
+                        let (e, w) = self.lsp.diagnostics_summary();
+                        format!("running ({} errors, {} warnings cached)", e, w)
+                    }
+                    crate::lsp::LspStatus::Starting => "starting…".to_string(),
+                    crate::lsp::LspStatus::Stopped => "stopped".to_string(),
+                    crate::lsp::LspStatus::Failed(err) => format!("failed: {}", err),
+                };
+                format!(
+                    "LSP workspace: {}\nLSP server:    {} ({})\nStatus:        {}",
+                    if self.lsp.root().as_os_str().is_empty() {
+                        "(not set)".to_string()
+                    } else {
+                        self.lsp.root().display().to_string()
+                    },
+                    self.lsp_server,
+                    if self.lsp_enabled { "enabled" } else { "disabled" },
+                    status
+                )
+            }
+            Some("off") => {
+                self.stop_lsp();
+                self.lsp_enabled = false;
+                "LSP: server stopped (re-enable with /workspace <dir>)".to_string()
+            }
+            Some(dir) => {
+                let root = PathBuf::from(dir);
+                if !root.is_dir() {
+                    return format!("No such directory: {}", dir);
+                }
+                self.start_lsp(root.clone(), self.lsp_server.clone());
+                if self.lsp.status() == crate::lsp::LspStatus::Running {
+                    format!("LSP workspace: {} (rust-analyzer running)", root.display())
+                } else {
+                    format!("LSP failed to start in {}: {}", root.display(), self.status_message)
+                }
+            }
         }
     }
 
@@ -5184,6 +5471,24 @@ fn dirs_home() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("."))
 }
 
+/// Resolves the LSP workspace root: the configured `lsp_workspace` if set,
+/// else the directory of `save_path`, else the current directory.
+/// Missing `Cargo.toml` is not fatal — rust-analyzer still parses
+/// single files (the caller only warns).
+fn resolve_lsp_workspace(configured: &str, save_path: &str) -> PathBuf {
+    if !configured.trim().is_empty() {
+        return PathBuf::from(configured.trim());
+    }
+    let save_dir = std::path::Path::new(save_path)
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(PathBuf::from);
+    match save_dir {
+        Some(d) if d.is_dir() => d,
+        _ => std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+    }
+}
+
 /// Autogenerated session id: 16 hex chars from the current unix
 /// timestamp in nanoseconds. Also serves as the default session name,
 /// so a session is autosaved under a unique, collision-free file name.
@@ -5523,6 +5828,26 @@ fn get_tool_definitions() -> Vec<serde_json::Value> {
                 "parameters": {
                     "type": "object",
                     "properties": {}
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "lsp_diagnostics",
+                "description": "Get rust-analyzer compiler diagnostics (errors, warnings) for a Rust file via the LSP server. Use after editing .rs files to check that your changes compile. Requires the LSP server to be running (lsp = on in config, or /workspace <dir>).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "The .rs file to check. Default: the most recently edited file, else a workspace-wide summary."
+                        },
+                        "severity": {
+                            "type": "string",
+                            "description": "Optional filter: error | warning | hint | info. Default: all severities."
+                        }
+                    }
                 }
             }
         }),
@@ -6128,6 +6453,7 @@ fn execute_tool_call(name: &str, args_json: &str, proxy: &Option<String>) -> Str
                 "terminal_send",
                 "terminal_read",
                 "terminal_close",
+                "lsp_diagnostics",
             ];
             format!(
                 "Unknown tool: '{}'. Available tools: {}",
@@ -6173,6 +6499,7 @@ const TOOL_NAMES: &[&str] = &[
     "terminal_send",
     "terminal_read",
     "terminal_close",
+    "lsp_diagnostics",
 ];
 
 fn parse_text_tool_calls(text: &str) -> Vec<serde_json::Value> {
@@ -7907,6 +8234,106 @@ mod chat_body_tests {
         assert_eq!(
             extract_context_length(&serde_json::json!({ "model_info": {} })),
             None
+        );
+    }
+}
+
+#[cfg(test)]
+mod lsp_tool_tests {
+    use super::*;
+
+    fn test_app() -> App {
+        let cfg = crate::config::Config {
+            logging: false,
+            logfile: std::env::temp_dir()
+                .join(format!("rustama-test-{}.log", std::process::id()))
+                .to_string_lossy()
+                .to_string(),
+            ..crate::config::Config::default()
+        };
+        App::new(cfg)
+    }
+
+    #[test]
+    fn tool_schema_and_names_include_lsp_diagnostics() {
+        let defs = get_tool_definitions();
+        let names: Vec<&str> = defs
+            .iter()
+            .filter_map(|t| t["function"]["name"].as_str())
+            .collect();
+        assert!(names.contains(&"lsp_diagnostics"));
+        assert!(TOOL_NAMES.contains(&"lsp_diagnostics"));
+    }
+
+    #[test]
+    fn diagnostics_tool_reports_stopped_server() {
+        let mut app = test_app();
+        let out = app.execute_tool("lsp_diagnostics", "{}");
+        assert!(out.contains("not running"), "got: {}", out);
+    }
+
+    #[test]
+    fn diagnostics_tool_rejects_bad_severity() {
+        let mut app = test_app();
+        let out = app.execute_tool("lsp_diagnostics", r#"{"severity": "bogus"}"#);
+        assert!(out.contains("unknown severity"), "got: {}", out);
+    }
+
+    #[test]
+    fn execute_tool_tracks_last_edited_file() {
+        let mut app = test_app();
+        let dir = std::env::temp_dir().join(format!("rustama-lt-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("x.rs");
+        let out = app.execute_tool(
+            "write_file",
+            &serde_json::json!({"path": file, "content": "fn main() {}\n"}).to_string(),
+        );
+        assert!(out.contains("Successfully wrote"), "got: {}", out);
+        assert_eq!(app.last_edited_file.as_deref(), Some(file.as_path()));
+        // Server not running → auto-diagnostics hook stays silent.
+        assert!(!out.contains("Diagnostics:"), "got: {}", out);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn auto_diagnostics_noop_when_server_stopped() {
+        let mut app = test_app();
+        let mut result = "Successfully edited /tmp/x.rs".to_string();
+        app.maybe_append_lsp_diagnostics("edit_file", r#"{"path": "/tmp/x.rs"}"#, &mut result);
+        assert_eq!(result, "Successfully edited /tmp/x.rs");
+    }
+
+    #[test]
+    fn workspace_command_reports_and_validates() {
+        let mut app = test_app();
+        let out = app.slash_workspace(None);
+        assert!(out.contains("(not set)"), "got: {}", out);
+        assert!(out.contains("stopped"), "got: {}", out);
+
+        let out = app.slash_workspace(Some("/definitely/not/a/real/dir"));
+        assert!(out.contains("No such directory"), "got: {}", out);
+
+        let out = app.slash_workspace(Some("off"));
+        assert!(out.contains("stopped"), "got: {}", out);
+    }
+
+    #[test]
+    fn workspace_root_resolution_order() {
+        // Explicit config wins.
+        assert_eq!(
+            resolve_lsp_workspace("/tmp", "output.md"),
+            PathBuf::from("/tmp")
+        );
+        // Else the directory of save_path (when it is a real dir).
+        assert_eq!(
+            resolve_lsp_workspace("", "/tmp/output.md"),
+            PathBuf::from("/tmp")
+        );
+        // Else (relative save_path without a parent dir) the cwd.
+        assert_eq!(
+            resolve_lsp_workspace("  ", "output.md"),
+            std::env::current_dir().unwrap()
         );
     }
 }

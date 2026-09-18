@@ -20,6 +20,16 @@ pub struct Config {
     /// Show the hint bar (key hints / focus indicator) on the
     /// second-to-last terminal line. Default: off.
     pub hintbar: bool,
+    /// Launch a rust-analyzer LSP server for compiler feedback
+    /// (`lsp_diagnostics` tool). Default: off — it is a heavy process.
+    pub lsp: bool,
+    /// Path/name of the LSP server binary.
+    pub lsp_server: String,
+    /// LSP workspace root. Empty = directory of `save_path`, else cwd.
+    pub lsp_workspace: String,
+    /// After edit_file/write_file tool calls, automatically append fresh
+    /// LSP diagnostics to the tool result.
+    pub lsp_auto_diagnostics: bool,
 }
 
 /// Per-model sampling / generation parameters.
@@ -245,6 +255,10 @@ impl Default for Config {
             terminal_width_pct: 40,
             justify: false,
             hintbar: false,
+            lsp: false,
+            lsp_server: "rust-analyzer".to_string(),
+            lsp_workspace: String::new(),
+            lsp_auto_diagnostics: true,
         }
     }
 }
@@ -260,19 +274,19 @@ impl Config {
             if let Ok(content) = fs::read_to_string(&conf_path) {
                 let cfg = Self::parse(&content);
                 let dflt = Config::default();
-                let missing: Vec<(&str, String)> = vec![
+                let missing: Vec<(String, String)> = vec![
                     (
-                        "logging",
+                        "logging".to_string(),
                         if dflt.logging {
                             "true".to_string()
                         } else {
                             "false".to_string()
                         },
                     ),
-                    ("logfile", dflt.logfile.clone()),
-                    ("system_prompt", dflt.system_prompt.clone()),
+                    ("logfile".to_string(), dflt.logfile.clone()),
+                    ("system_prompt".to_string(), dflt.system_prompt.clone()),
                     (
-                        "justify",
+                        "justify".to_string(),
                         if dflt.justify {
                             "true".to_string()
                         } else {
@@ -280,12 +294,19 @@ impl Config {
                         },
                     ),
                     (
-                        "hintbar",
+                        "hintbar".to_string(),
                         if dflt.hintbar {
                             "on".to_string()
                         } else {
                             "off".to_string()
                         },
+                    ),
+                    ("lsp".to_string(), if dflt.lsp { "on" } else { "off" }.to_string()),
+                    ("lsp_server".to_string(), dflt.lsp_server.clone()),
+                    ("lsp_workspace".to_string(), dflt.lsp_workspace.clone()),
+                    (
+                        "lsp_auto_diagnostics".to_string(),
+                        if dflt.lsp_auto_diagnostics { "on" } else { "off" }.to_string(),
                     ),
                 ];
 
@@ -342,6 +363,16 @@ impl Config {
              justify = {}\n\n\
              # Show the hint bar above the keybar (on/off, default: off)\n\
              hintbar = {}\n\n\
+             # Launch rust-analyzer LSP for compiler feedback (on/off,\n\
+             # default: off — it is a heavy process)\n\
+             lsp = {}\n\n\
+             # LSP server binary (default: rust-analyzer)\n\
+             lsp_server = {}\n\n\
+             # LSP workspace root (default: dir of save_path, else cwd)\n\
+             lsp_workspace = {}\n\n\
+             # Append LSP diagnostics to edit_file/write_file results\n\
+             # (on/off, default: on)\n\
+             lsp_auto_diagnostics = {}\n\n\
              # NOTE: model parameters (temperature, top_p, top_k,\n\
              # frequency_penalty, presence_penalty, max_output_tokens,\n\
              # reasoning_effort, seed) are per-model now — see\n\
@@ -358,6 +389,10 @@ impl Config {
             self.max_retries,
             self.justify,
             if self.hintbar { "on" } else { "off" },
+            if self.lsp { "on" } else { "off" },
+            self.lsp_server,
+            self.lsp_workspace,
+            if self.lsp_auto_diagnostics { "on" } else { "off" },
         )
     }
 
@@ -427,6 +462,18 @@ impl Config {
         if let Some(v) = values.get("hintbar") {
             cfg.hintbar = parse_bool(v);
         }
+        if let Some(v) = values.get("lsp") {
+            cfg.lsp = parse_bool(v);
+        }
+        if let Some(v) = values.get("lsp_server") {
+            cfg.lsp_server = v.clone();
+        }
+        if let Some(v) = values.get("lsp_workspace") {
+            cfg.lsp_workspace = v.clone();
+        }
+        if let Some(v) = values.get("lsp_auto_diagnostics") {
+            cfg.lsp_auto_diagnostics = parse_bool(v);
+        }
 
         cfg
     }
@@ -492,6 +539,13 @@ impl Config {
         lines.push(format!(
             "hintbar = {}",
             if self.hintbar { "on" } else { "off" }
+        ));
+        lines.push(format!("lsp = {}", if self.lsp { "on" } else { "off" }));
+        lines.push(format!("lsp_server = {}", self.lsp_server));
+        lines.push(format!("lsp_workspace = {}", self.lsp_workspace));
+        lines.push(format!(
+            "lsp_auto_diagnostics = {}",
+            if self.lsp_auto_diagnostics { "on" } else { "off" }
         ));
         fs::write(&conf_path, lines.join("\n")).map_err(|e| e.to_string())?;
         Ok(())
@@ -1007,6 +1061,39 @@ fn parse_ini(content: &str) -> HashMap<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lsp_keys_parse_and_default() {
+        // Defaults: off, rust-analyzer, empty workspace, auto-diagnostics on.
+        let cfg = Config::parse("model = x\n");
+        assert!(!cfg.lsp);
+        assert_eq!(cfg.lsp_server, "rust-analyzer");
+        assert_eq!(cfg.lsp_workspace, "");
+        assert!(cfg.lsp_auto_diagnostics);
+
+        let cfg = Config::parse(
+            "lsp = igen\n\
+             lsp_server = /opt/ra/rust-analyzer\n\
+             lsp_workspace = /home/user/project\n\
+             lsp_auto_diagnostics = off\n",
+        );
+        assert!(cfg.lsp);
+        assert_eq!(cfg.lsp_server, "/opt/ra/rust-analyzer");
+        assert_eq!(cfg.lsp_workspace, "/home/user/project");
+        assert!(!cfg.lsp_auto_diagnostics);
+    }
+
+    #[test]
+    fn lsp_keys_roundtrip_through_default_conf() {
+        // default_conf() (fresh installs) must carry parseable lsp_* keys.
+        let cfg = Config::default();
+        let text = cfg.default_conf();
+        let back = Config::parse(&text);
+        assert_eq!(back.lsp, cfg.lsp);
+        assert_eq!(back.lsp_server, cfg.lsp_server);
+        assert_eq!(back.lsp_workspace, cfg.lsp_workspace);
+        assert_eq!(back.lsp_auto_diagnostics, cfg.lsp_auto_diagnostics);
+    }
 
     #[test]
     fn placeholder_keys_are_skipped() {

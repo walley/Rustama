@@ -715,6 +715,7 @@ pub enum MenuAction {
     OpenModelDialog,
     ToggleAgenticMode(bool),
     ToggleTerminal,
+    ToggleHintbar,
     OpenSettingsDialog,
     ShowAbout,
 }
@@ -749,7 +750,7 @@ impl MainMenu {
         match self.active {
             ActiveMenu::File => vec!["New", "Load", "Save", "Export...", "\u{2500}", "Exit"],
             ActiveMenu::Edit => vec!["Set Model", "Agentic Mode", "\u{2500}", "Settings..."],
-            ActiveMenu::View => vec!["Terminal"],
+            ActiveMenu::View => vec!["Terminal", "Hintbar"],
             ActiveMenu::Help => vec!["About"],
             ActiveMenu::None => vec![],
         }
@@ -841,6 +842,7 @@ impl MainMenu {
             (ActiveMenu::Edit, 1) => MenuAction::ToggleAgenticMode(true),
             (ActiveMenu::Edit, 3) => MenuAction::OpenSettingsDialog,
             (ActiveMenu::View, 0) => MenuAction::ToggleTerminal,
+            (ActiveMenu::View, 1) => MenuAction::ToggleHintbar,
             (ActiveMenu::Help, 0) => MenuAction::ShowAbout,
             _ => MenuAction::None,
         }
@@ -1425,6 +1427,16 @@ mod tests {
         assert_eq!(MainMenu::next_menu(ActiveMenu::Help), ActiveMenu::File);
         assert_eq!(MainMenu::prev_menu(ActiveMenu::File), ActiveMenu::Help);
         assert_eq!(MainMenu::next_menu(ActiveMenu::None), ActiveMenu::File);
+    }
+
+    #[test]
+    fn view_menu_maps_hintbar_action() {
+        let mut menu = MainMenu::new();
+        menu.open(ActiveMenu::View);
+        // View menu has Terminal then Hintbar.
+        assert_eq!(menu.item_names(), vec!["Terminal", "Hintbar"]);
+        assert_eq!(menu.action_for(ActiveMenu::View, 0), MenuAction::ToggleTerminal);
+        assert_eq!(menu.action_for(ActiveMenu::View, 1), MenuAction::ToggleHintbar);
     }
 
     #[test]
