@@ -1734,16 +1734,111 @@ impl App {
     /// Executes the LSP-flavored tools; `None` = not an LSP tool (caller
     /// falls through to the stateless `execute_tool_call`).
     fn execute_lsp_tool(&mut self, name: &str, args_json: &str) -> Option<String> {
-        if name != "lsp_diagnostics" {
-            return None;
+        if name == "lsp_diagnostics" {
+            let args: serde_json::Value =
+                serde_json::from_str(args_json).unwrap_or(serde_json::json!({}));
+            return Some(self.lsp_diagnostics(
+                args["path"].as_str(),
+                args["severity"].as_str(),
+                crate::lsp::LSP_REQUEST_TIMEOUT,
+            ));
         }
-        let args: serde_json::Value =
-            serde_json::from_str(args_json).unwrap_or(serde_json::json!({}));
-        Some(self.lsp_diagnostics(
-            args["path"].as_str(),
-            args["severity"].as_str(),
-            crate::lsp::LSP_REQUEST_TIMEOUT,
-        ))
+        if name == "go_to_definition" {
+            let args: serde_json::Value =
+                serde_json::from_str(args_json).unwrap_or(serde_json::json!({}));
+            return Some(self.lsp_goto_definition(
+                args["path"].as_str(),
+                args["line"].as_u64(),
+                args["column"].as_u64(),
+                crate::lsp::LSP_REQUEST_TIMEOUT,
+            ));
+        }
+        None
+    }
+
+    /// Core of the `go_to_definition` tool: sync the file into the server,
+    /// resolve the symbol at (line, column), format the target location(s).
+    /// `line`/`column` are 1-based in the tool interface (matching how
+    /// diagnostics are reported) but are converted to LSP's 0-based
+    /// positions internally.
+    fn lsp_goto_definition(
+        &mut self,
+        path: Option<&str>,
+        line: Option<u64>,
+        column: Option<u64>,
+        timeout: std::time::Duration,
+    ) -> String {
+        use crate::lsp::LspStatus;
+
+        // A definition needs a concrete symbol position, so a path is
+        // mandatory (unlike lsp_diagnostics which can fall back to a
+        // workspace summary).
+        let Some(path) = path else {
+            return "go_to_definition: `path` is required (the file to search in) and \
+                `line`/`column` (1-based) must point at the symbol."
+                .to_string();
+        };
+        let Some(line) = line else {
+            return "go_to_definition: `line` (1-based) is required.".to_string();
+        };
+        let Some(column) = column else {
+            return "go_to_definition: `column` (1-based) is required.".to_string();
+        };
+        if line == 0 || column == 0 {
+            return "go_to_definition: `line` and `column` are 1-based (>= 1).".to_string();
+        }
+
+        match self.lsp.status() {
+            LspStatus::Running => {}
+            LspStatus::Stopped => {
+                return "go_to_definition: server not running. Enable it with `lsp = on` in \
+                    rustama.conf (or /workspace <dir>) — requires rust-analyzer."
+                    .to_string();
+            }
+            LspStatus::Failed(e) => return format!("go_to_definition: server failed: {}", e),
+            LspStatus::Starting => {} // rare; request below waits for analysis
+        }
+
+        let path = PathBuf::from(path);
+        if let Err(e) = self.lsp.sync_file(&path) {
+            return format!("go_to_definition: cannot sync {}: {}", path.display(), e);
+        }
+
+        let root = self.lsp.root().to_path_buf();
+        let cancel = AtomicBool::new(false);
+        let locs = match self.lsp.goto_definition(
+            &path,
+            (line - 1) as u32,
+            (column - 1) as u32,
+            timeout,
+            &cancel,
+        ) {
+            Ok(locs) => locs,
+            Err(e) if e.contains("cancelled") => {
+                return format!(
+                    "go_to_definition: {} not analyzed yet (server busy re-analyzing — try again)",
+                    path.display()
+                );
+            }
+            Err(e) => return format!("go_to_definition: request failed: {}", e),
+        };
+
+        if locs.is_empty() {
+            return format!(
+                "go_to_definition: no definition found for {}:{}:{}",
+                path.display(),
+                line,
+                column
+            );
+        }
+        let formatted = crate::lsp::format_locations(&locs, &root);
+        format!(
+            "Definition of {}:{}:{}:\n{}",
+            path.display(),
+            line,
+            column,
+            formatted.trim_end()
+        )
     }
 
     /// Core of the `lsp_diagnostics` tool: sync the file into the server,
@@ -5851,6 +5946,31 @@ fn get_tool_definitions() -> Vec<serde_json::Value> {
                 }
             }
         }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "go_to_definition",
+                "description": "Jump to the definition of the symbol at a given position in a Rust file via the LSP server (rust-analyzer). Returns the target file, line, column, and a source excerpt for each definition. Use to navigate the codebase / understand what a call site refers to. Requires the LSP server to be running (lsp = on in config, or /workspace <dir>).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "The .rs file containing the symbol reference (absolute path)."
+                        },
+                        "line": {
+                            "type": "integer",
+                            "description": "1-based line number of the symbol."
+                        },
+                        "column": {
+                            "type": "integer",
+                            "description": "1-based column number of the symbol."
+                        }
+                    },
+                    "required": ["path", "line", "column"]
+                }
+            }
+        }),
     ]
 }
 
@@ -6454,6 +6574,7 @@ fn execute_tool_call(name: &str, args_json: &str, proxy: &Option<String>) -> Str
                 "terminal_read",
                 "terminal_close",
                 "lsp_diagnostics",
+                "go_to_definition",
             ];
             format!(
                 "Unknown tool: '{}'. Available tools: {}",
@@ -6500,6 +6621,7 @@ const TOOL_NAMES: &[&str] = &[
     "terminal_read",
     "terminal_close",
     "lsp_diagnostics",
+    "go_to_definition",
 ];
 
 fn parse_text_tool_calls(text: &str) -> Vec<serde_json::Value> {
@@ -8263,6 +8385,56 @@ mod lsp_tool_tests {
             .collect();
         assert!(names.contains(&"lsp_diagnostics"));
         assert!(TOOL_NAMES.contains(&"lsp_diagnostics"));
+    }
+
+    #[test]
+    fn tool_schema_and_names_include_go_to_definition() {
+        let defs = get_tool_definitions();
+        let names: Vec<&str> = defs
+            .iter()
+            .filter_map(|t| t["function"]["name"].as_str())
+            .collect();
+        assert!(names.contains(&"go_to_definition"));
+        assert!(TOOL_NAMES.contains(&"go_to_definition"));
+        // required args present
+        let def = defs
+            .iter()
+            .find(|t| t["function"]["name"].as_str() == Some("go_to_definition"))
+            .unwrap();
+        assert_eq!(
+            def["function"]["parameters"]["required"],
+            serde_json::json!(["path", "line", "column"])
+        );
+    }
+
+    #[test]
+    fn goto_definition_tool_reports_stopped_server() {
+        let mut app = test_app();
+        let out = app.execute_tool(
+            "go_to_definition",
+            r#"{"path": "/tmp/x.rs", "line": 3, "column": 5}"#,
+        );
+        assert!(out.contains("not running"), "got: {}", out);
+    }
+
+    #[test]
+    fn goto_definition_tool_validates_args() {
+        let mut app = test_app();
+        // Missing path.
+        let out = app.execute_tool("go_to_definition", r#"{"line": 3, "column": 5}"#);
+        assert!(out.contains("is required"), "got: {}", out);
+        // Missing line.
+        let out = app.execute_tool(
+            "go_to_definition",
+            r#"{"path": "/tmp/x.rs", "column": 5}"#,
+        );
+        assert!(out.contains("line"), "got: {}", out);
+        // Zero-based line rejected.
+        let out = app.execute_tool(
+            "go_to_definition",
+            r#"{"path": "/tmp/x.rs", "line": 0, "column": 5}"#,
+        );
+        assert!(out.contains("1-based"), "got: {}", out);
     }
 
     #[test]
