@@ -202,7 +202,8 @@ fn ui(f: &mut Frame, app: &mut App) {
     }
 
     if app.show_about {
-        let mb = ui::MessageBox::new("About", &app.about_message);
+        let mb = ui::MessageBox::new("About", &app.about_message)
+            .with_header(ui::rustama_logo_lines());
         mb.render(f, area, true, &app.theme);
     }
 
@@ -2764,6 +2765,101 @@ mod about_dialog_tests {
             full_url_line.trim().starts_with("GitHub:") || full_url_line.contains("GitHub:"),
             "URL should follow the GitHub: prefix: {}",
             full_url_line
+        );
+    }
+}
+
+#[cfg(test)]
+mod about_logo_tests {
+    use super::ui;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::layout::Rect;
+
+    #[test]
+    fn logo_lines_match_rustama_sh_art() {
+        let logo = ui::rustama_logo_lines();
+        assert_eq!(logo.len(), 3, "three art rows");
+        // Plain text of the logo matches rustama.sh's echo payloads.
+        let plain = |l: &ratatui::text::Line| -> String {
+            l.spans.iter().map(|s| s.content.to_string()).collect()
+        };
+        assert_eq!(plain(&logo[0]), "▀█▀█ ▀█ █ ▀█▀▀ ▀██▀ ▀█▀█ ▀█▄ ▄█ ▀█▀█");
+        assert_eq!(plain(&logo[1]), "██▄▀ ██ █  ▀▀█  ██  ██▄█ ██ █ █ ██▄█");
+        assert_eq!(plain(&logo[2]), "██ █ ██▄█ ██▄█  ██  ██ █ ██   █ ██ █");
+    }
+
+    #[test]
+    fn about_renders_centered_logo() {
+        // Render the About box the way ui() does and check the logo is
+        // there, horizontally centered in the popup.
+        let backend = TestBackend::new(100, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                let mb = ui::MessageBox::new("About", "msg")
+                    .with_header(ui::rustama_logo_lines());
+                mb.render(f, area, true, &ui::Theme::default());
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let lines: Vec<String> = (0..buf.area.height)
+            .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect())
+            .collect();
+        // Find the popup top border to derive the popup geometry.
+        let top = lines
+            .iter()
+            .position(|l| l.contains("┌") && l.contains("About"))
+            .expect("About popup missing") as u16;
+        let top_row = lines[top as usize].clone();
+        let border = &lines[top as usize];
+        // ┌/┐/▀ are multi-byte UTF-8 and `find`/`char_indices` return
+        // BYTE offsets — column math needs CHAR positions.
+        let char_col = |s: &str, needle: char, from_end: bool| -> u16 {
+            let chars: Vec<char> = s.chars().collect();
+            if from_end {
+                chars.iter().rposition(|c| *c == needle).unwrap() as u16
+            } else {
+                chars.iter().position(|c| *c == needle).unwrap() as u16
+            }
+        };
+        let left = char_col(border, '┌', false);
+        // The title " About " sits in the top border; the top-right
+        // corner is the rightmost '┐'.
+        let right = char_col(border, '┐', true);
+        let inner_w = right - left - 2; // ┌ + 2 borders
+        // The logo's first row, centered: first non-space col of the
+        // logo row vs the inner area.
+        // inner.y = top + 1 (Margin::new(2, 1) insets 1 row), so the
+        // first header row is directly below the top border.
+        let logo_row = &lines[(top + 1) as usize];
+        assert!(
+            logo_row.contains("▀█▀█ ▀█ █ ▀█▀▀ ▀██▀"),
+            "logo row must hold the art: {:?}",
+            logo_row
+        );
+        // First logo cell = char position of the first art char.
+        let logo_start = char_col(logo_row, '▀', false);
+        // Centering: logo occupies [logo_start, logo_start+36) and the
+        // inner area starts at left+2 with width inner_w-2; center
+        // means equal slack on both sides.
+        // The MessageBox inner area = popup inset by Margin(2, 1):
+        // x from left+2 to left+2+inner_width-1 where inner_width =
+        // popup_w - 4. Derive popup width from the border span.
+        let popup_w = right - left + 1;
+        let inner_x = left + 2;
+        let inner_width = popup_w - 4;
+        let slack_left = logo_start - inner_x;
+        let slack_right = inner_x + inner_width - (logo_start + 36);
+        // Centering allows at most 1 column of asymmetry (integer math).
+        assert!(
+            (slack_left as i16 - slack_right as i16).abs() <= 1,
+            "logo must be centered: left slack {} vs right slack {} (top: {:?}, logo: {:?})",
+            slack_left,
+            slack_right,
+            top_row,
+            logo_row
         );
     }
 }

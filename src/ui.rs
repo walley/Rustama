@@ -1192,9 +1192,91 @@ impl MainMenu {
     }
 }
 
+/// The Rustama ASCII-art logo (from `rustama.sh` in the repo root),
+/// as styled ratatui lines: red block letters, light-red-on-red
+/// highlight blocks, and white separators.
+pub fn rustama_logo_lines() -> Vec<Line<'static>> {
+    vec![
+        Line::from(vec![
+            Span::styled("▀", Style::default().fg(Color::LightRed).bg(Color::Red)),
+            Span::styled("█▀█", Style::default().fg(Color::Red)),
+            Span::styled(" ", Style::default().fg(Color::White)),
+            Span::styled("▀", Style::default().fg(Color::LightRed).bg(Color::Red)),
+            Span::styled("█", Style::default().fg(Color::Red)),
+            Span::styled(" ", Style::default().fg(Color::White)),
+            Span::styled("█", Style::default().fg(Color::Red)),
+            Span::styled(" ", Style::default().fg(Color::White)),
+            Span::styled("▀", Style::default().fg(Color::LightRed).bg(Color::Red)),
+            Span::styled("█▀▀", Style::default().fg(Color::Red)),
+            Span::styled(" ", Style::default().fg(Color::White)),
+            Span::styled("▀", Style::default().fg(Color::LightRed)),
+            Span::styled("██▀", Style::default().fg(Color::Red)),
+            Span::styled(" ", Style::default().fg(Color::White)),
+            Span::styled("▀", Style::default().fg(Color::LightRed).bg(Color::Red)),
+            Span::styled("█▀█", Style::default().fg(Color::Red)),
+            Span::styled(" ", Style::default().fg(Color::White)),
+            Span::styled("▀", Style::default().fg(Color::LightRed).bg(Color::Red)),
+            Span::styled("█▄", Style::default().fg(Color::Red)),
+            Span::styled(" ", Style::default().fg(Color::White)),
+            Span::styled("▄█", Style::default().fg(Color::Red)),
+            Span::styled(" ", Style::default().fg(Color::White)),
+            Span::styled("▀", Style::default().fg(Color::LightRed).bg(Color::Red)),
+            Span::styled("█▀█", Style::default().fg(Color::Red)),
+        ]),
+        Line::from(vec![
+            Span::styled("██▄▀", Style::default().fg(Color::Red)),
+            Span::styled(" ", Style::default().fg(Color::White)),
+            Span::styled("██", Style::default().fg(Color::Red)),
+            Span::styled(" ", Style::default().fg(Color::White)),
+            Span::styled("█", Style::default().fg(Color::Red)),
+            Span::styled("  ", Style::default().fg(Color::White)),
+            Span::styled("▀▀█", Style::default().fg(Color::Red)),
+            Span::styled("  ", Style::default().fg(Color::White)),
+            Span::styled("██", Style::default().fg(Color::Red)),
+            Span::styled("  ", Style::default().fg(Color::White)),
+            Span::styled("██▄█", Style::default().fg(Color::Red)),
+            Span::styled(" ", Style::default().fg(Color::White)),
+            Span::styled("██", Style::default().fg(Color::Red)),
+            Span::styled(" ", Style::default().fg(Color::White)),
+            Span::styled("█", Style::default().fg(Color::Red)),
+            Span::styled(" ", Style::default().fg(Color::White)),
+            Span::styled("█", Style::default().fg(Color::Red)),
+            Span::styled(" ", Style::default().fg(Color::White)),
+            Span::styled("██▄█", Style::default().fg(Color::Red)),
+        ]),
+        Line::from(vec![
+            Span::styled("██", Style::default().fg(Color::Red)),
+            Span::styled(" ", Style::default().fg(Color::White)),
+            Span::styled("█", Style::default().fg(Color::Red)),
+            Span::styled(" ", Style::default().fg(Color::White)),
+            Span::styled("██▄█", Style::default().fg(Color::Red)),
+            Span::styled(" ", Style::default().fg(Color::White)),
+            Span::styled("██▄█", Style::default().fg(Color::Red)),
+            Span::styled("  ", Style::default().fg(Color::White)),
+            Span::styled("██", Style::default().fg(Color::Red)),
+            Span::styled("  ", Style::default().fg(Color::White)),
+            Span::styled("██", Style::default().fg(Color::Red)),
+            Span::styled(" ", Style::default().fg(Color::White)),
+            Span::styled("█", Style::default().fg(Color::Red)),
+            Span::styled(" ", Style::default().fg(Color::White)),
+            Span::styled("██", Style::default().fg(Color::Red)),
+            Span::styled("   ", Style::default().fg(Color::White)),
+            Span::styled("█", Style::default().fg(Color::Red)),
+            Span::styled(" ", Style::default().fg(Color::White)),
+            Span::styled("██", Style::default().fg(Color::Red)),
+            Span::styled(" ", Style::default().fg(Color::White)),
+            Span::styled("█", Style::default().fg(Color::Red)),
+        ]),
+    ]
+}
+
 pub struct MessageBox {
     pub title: String,
     pub message: String,
+    /// Optional centered ASCII-art header (styled lines), rendered
+    /// above the message with one blank row between them. The About
+    /// box uses this for the Rustama logo (see [`rustama_logo_lines`]).
+    pub header: Vec<Line<'static>>,
 }
 
 impl MessageBox {
@@ -1202,7 +1284,14 @@ impl MessageBox {
         MessageBox {
             title: title.to_string(),
             message: message.to_string(),
+            header: Vec::new(),
         }
+    }
+
+    /// Attaches a centered styled header above the message.
+    pub fn with_header(mut self, header: Vec<Line<'static>>) -> Self {
+        self.header = header;
+        self
     }
 
     /// Word-wrap `message` to `width` columns. Explicit newlines are kept,
@@ -1259,9 +1348,26 @@ impl MessageBox {
             .map(|l| l.chars().count() + 2) // 2-column text indent
             .max()
             .unwrap_or(0);
-        let inner_w = content_w.min(46).min(max_inner_w).max(10);
+        // The dialog must be wide enough for the centered header too.
+        let header_w = self
+            .header
+            .iter()
+            .map(|l| l.width() as usize)
+            .max()
+            .unwrap_or(0);
+        let inner_w = content_w
+            .min(46)
+            .max(header_w)
+            .min(max_inner_w)
+            .max(10);
         let lines = Self::wrap_message(&self.message, inner_w.saturating_sub(2).max(1));
-        let msg_height = lines.len() as u16;
+        // Header rows + one blank separator row (when a header exists).
+        let msg_height = lines.len() as u16
+            + if self.header.is_empty() {
+                0
+            } else {
+                self.header.len() as u16 + 1
+            };
         let dialog_w = (inner_w as u16 + 4)
             .min(area.width.saturating_sub(4))
             .max(16);
@@ -1291,6 +1397,26 @@ impl MessageBox {
         f.render_widget(dialog_block(&self.title, theme), popup_area);
 
         let inner = popup_area.inner(Margin::new(2, 1));
+
+        // Centered styled header (e.g. the Rustama logo in the About
+        // box), one blank row between it and the message text.
+        let mut y = inner.y;
+        if !self.header.is_empty() {
+            for line in &self.header {
+                let line_w = line.width() as u16;
+                let x = inner.x + inner.width.saturating_sub(line_w) / 2;
+                let area = Rect {
+                    x,
+                    y,
+                    width: line_w,
+                    height: 1,
+                };
+                f.render_widget(Paragraph::new(line.clone()), area);
+                y += 1;
+            }
+            y += 1; // blank separator row
+        }
+
         for (i, line) in lines.iter().enumerate() {
             let para = Paragraph::new(Line::from(Span::styled(
                 format!("  {}", line),
@@ -1298,7 +1424,7 @@ impl MessageBox {
             )));
             let line_area = Rect {
                 x: inner.x,
-                y: inner.y + i as u16,
+                y: y + i as u16,
                 width: inner.width,
                 height: 1,
             };
