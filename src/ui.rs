@@ -99,6 +99,53 @@ pub fn dialog_block(title: &str, theme: &Theme) -> Block<'static> {
         .shadow(Shadow::new(dimmed()).offset(Offset::new(1, 1)))
 }
 
+// ── Settings dialog geometry (shared by render + hit test) ────────────
+
+/// Settings dialog popup size (width × height).
+pub const SETTINGS_DIALOG_W: u16 = 60;
+pub const SETTINGS_DIALOG_H: u16 = 29;
+/// Number of label+value rows in the dialog (drives the button row).
+pub const SETTINGS_FIELD_COUNT: u16 = 13;
+
+/// Shared geometry of the Settings dialog: the renderer (main.rs
+/// `render_settings_dialog`) and the mouse hit-test (app.rs
+/// `handle_settings_dialog_click`) both go through here, so the
+/// Save/Cancel button row can never drift between what is drawn and
+/// what is clickable. The button row is the **last row inside the
+/// dialog** — one blank row below the last field, never on the bottom
+/// border.
+pub struct SettingsDialogLayout {
+    /// The centered popup rect.
+    pub popup: Rect,
+    /// Inner content origin (popup inset by `Margin(2, 1)`).
+    pub inner_x: u16,
+    pub inner_y: u16,
+    /// Inner content width.
+    pub inner_w: u16,
+    /// Absolute row of the Save/Cancel buttons (inside the dialog).
+    pub btn_y: u16,
+}
+
+/// Computes the Settings dialog layout for a terminal of `area`.
+pub fn settings_dialog_layout(area: Rect) -> SettingsDialogLayout {
+    let popup = Rect {
+        x: area.width.saturating_sub(SETTINGS_DIALOG_W) / 2,
+        y: area.height.saturating_sub(SETTINGS_DIALOG_H) / 2,
+        width: SETTINGS_DIALOG_W,
+        height: SETTINGS_DIALOG_H,
+    };
+    SettingsDialogLayout {
+        inner_x: popup.x + 2,
+        inner_y: popup.y + 1,
+        inner_w: SETTINGS_DIALOG_W.saturating_sub(4),
+        // Fields occupy inner_y + i*2 for i in 0..FIELD_COUNT (last at
+        // +24); one blank spacer row follows; the buttons sit on the
+        // last inner row (+26), one above the bottom border (+27).
+        btn_y: popup.y + 1 + SETTINGS_FIELD_COUNT * 2,
+        popup,
+    }
+}
+
 pub struct Button {
     pub name: String,
     pub x: u16,
@@ -112,7 +159,10 @@ pub struct Button {
 
 impl Button {
     pub fn new(name: &str, x: u16, y: u16, active: bool, fg: Color, bg: Color) -> Self {
-        let width = name.len() as u16 + 4;
+        // Char count, not byte length — labels may hold non-ASCII
+        // symbols (arrows) that are multi-byte in UTF-8. The +2 over
+        // the `[name]` display is the inter-button gap convention.
+        let width = name.chars().count() as u16 + 4;
         Button {
             name: name.to_string(),
             x,
@@ -1470,6 +1520,22 @@ impl ConfirmationBox {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn settings_dialog_buttons_inside_border() {
+        // 100x40 terminal: popup 60x29 centered at (20, 5).
+        let l = settings_dialog_layout(Rect::new(0, 0, 100, 40));
+        assert_eq!(l.popup, Rect::new(20, 5, 60, 29));
+        assert_eq!(l.inner_x, 22);
+        assert_eq!(l.inner_y, 6);
+        assert_eq!(l.inner_w, 56);
+        // Fields: inner_y + i*2, last of 13 at +24; one blank row (+25);
+        // buttons on the last inner row (+26) — strictly above the
+        // bottom border (popup.y + 28).
+        assert_eq!(l.btn_y, l.inner_y + 26);
+        assert!(l.btn_y < l.popup.y + l.popup.height - 1);
+        assert!(l.btn_y > l.inner_y + (SETTINGS_FIELD_COUNT - 1) * 2);
+    }
 
     #[test]
     fn theme_uses_mc_dialog_colors() {

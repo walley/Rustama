@@ -246,7 +246,16 @@ fn ui(f: &mut Frame, app: &mut App) {
 /// hits, …). Every other tool renders plain dim lines for now; add a
 /// new arm here (with its own `*_result_line_style` helper) when a
 /// tool needs its own result markup.
-fn tool_result_line_style(tool: &str, line: &str) -> Style {
+///
+/// The auto-appended LSP diagnostics section (everything from the
+/// `"Diagnostics: "` marker to the end of the result, see
+/// `App::maybe_append_lsp_diagnostics`) renders **magenta** in any
+/// tool's result — `lsp_section` tells whether the line is inside it
+/// (the caller tracks the marker while walking the lines).
+fn tool_result_line_style(tool: &str, line: &str, lsp_section: bool) -> Style {
+    if lsp_section {
+        return Style::default().fg(Color::Magenta);
+    }
     match tool {
         "edit_file" => edit_file_result_line_style(line),
         _ => Style::default().fg(Color::DarkGray),
@@ -473,11 +482,18 @@ fn render_output(f: &mut Frame, app: &mut App, area: Rect) {
                     } else {
                         20
                     };
+                    // Auto-appended LSP diagnostics ("Diagnostics: "
+                    // marker to the end of the result) render magenta.
+                    let mut in_lsp_section = false;
                     for result_line in preview.lines().take(max_lines) {
+                        if result_line.starts_with("Diagnostics: ") {
+                            in_lsp_section = true;
+                        }
                         // Per-tool result styling: diff colors only in
-                        // edit_file's embedded unified diff; other tools
+                        // edit_file's embedded unified diff; the LSP
+                        // diagnostics section is magenta; other tools
                         // render plain dim lines.
-                        let style = tool_result_line_style(name, result_line);
+                        let style = tool_result_line_style(name, result_line, in_lsp_section);
                         hist.push(Line::from(Span::styled(
                             format!("    {}", result_line),
                             style,
@@ -758,23 +774,30 @@ fn vt100_color(c: vt100::Color, default: Color) -> Color {
 
 fn render_send_button(f: &mut Frame, app: &App, area: Rect) {
     let has_text = !app.textarea.lines().join("").trim().is_empty();
-    let btn_x = area.x + area.width.saturating_sub(13);
-    let btn_y = area.y + area.height.saturating_sub(1);
-
+    // 15-char mc-style button: centered label + a ► arrow. The padding
+    // lives in the name so `Button::render` brackets it into
+    // "[   send  ►   ]".
     let send_btn = Button::new(
-        "send",
-        btn_x,
-        btn_y,
+        "   send  ►   ",
+        0,
+        0,
         has_text,
         Color::DarkGray,
         Color::Green,
     );
-
     let (btn_text, btn_style) = send_btn.render();
+    let display_width = btn_text.chars().count() as u16; // 15
+
+    // Flush against the bottom-right corner of the input box — the
+    // border line resumes right after the "]" (no wiped gap after the
+    // button; buttons have no shadow).
+    let btn_x = area.x + area.width.saturating_sub(1 + display_width);
+    let btn_y = area.y + area.height.saturating_sub(1);
+
     let btn_area = Rect {
         x: btn_x,
         y: btn_y,
-        width: send_btn.width,
+        width: display_width,
         height: 1,
     };
 
@@ -917,9 +940,10 @@ fn render_hintbar(f: &mut Frame, app: &App, area: Rect) {
 }
 
 /// Midnight-Commander style key strip, always the last terminal line.
-/// Shows all the F-keys currently unused are empty
-/// — with white-on-black numbers and MC's turquoise-green bg labels,
-/// stretched to fill the whole terminal width.
+/// Shows all the F-keys; currently unused ones are empty green fields
+/// — with white-on-black numbers and MC's turquoise-green bg labels.
+/// The ten fields fill the terminal width exactly and stay as close
+/// to equal as the labels allow (see [`keybar_field_widths`]).
 fn render_keybar(f: &mut Frame, app: &App, area: Rect) {
     const NUM_STYLE: Style = Style::new().fg(Color::White).bg(Color::Black);
     const LABEL_STYLE: Style = Style::new().fg(Color::Black).bg(MC_GREEN);
@@ -931,49 +955,109 @@ fn render_keybar(f: &mut Frame, app: &App, area: Rect) {
     } else {
         "Term"
     };
-    // F7 "Stop" is only offered while a request is in flight.
-    let f7_label = if app.is_loading { "Stop" } else { " " };
+    // F7 "Stop" is always shown — it is a no-op when nothing is in
+    // flight ("Nothing to stop"), and hiding the key while idle made
+    // the keybar layout appear/disappear between requests.
+    let f7_label = "Stop";
     let labels: [(&str, &str); 10] = if app.focus == Focus::Terminal {
         [("1", "Help"), ("2", " "),("3", " "),("4", " "),("5", " "), ("6", " "),("7", f7_label),("8", f8_label), ("9", "PullDn"), ("10", "Exit")]
     } else {
         [("1", "Help"), ("2", " "),("3", " "),("4", " "),("5", " "), ("6", "t"),("7", f7_label),("8", f8_label), ("9", "PullDn"), ("10", "Exit")]
     };
 
-    // Slot layout: two cells per F-key ("10" needs two for its number).
-    // Slots are stretched evenly across the full width, MC-style.
-    let slot_count: u16 = labels.iter().map(|(n, _)| n.len() as u16 + 1).sum();
-    let width = area.width;
-    let base = width / slot_count;
-    let extra = width % slot_count;
+    let widths = keybar_field_widths(&labels, area.width);
 
     let mut spans: Vec<Span<'static>> = Vec::new();
-    let mut offset: u16 = 0;
-    for (num, label) in labels {
-        let cells = num.len() as u16 + 1;
-        let end = offset + cells * base + extra.min(offset + cells) - extra.min(offset);
-        let slot_w = end.saturating_sub(offset) as usize;
-        offset = end;
+    for (i, (num, label)) in labels.iter().enumerate() {
+        // Number part: keys 1-9 keep their leading space (" 1"), but
+        // "10" sits flush at the field edge ("10") — so every label
+        // starts at the same cell within its field.
+        let num_part = if *num == "10" {
+            "10".to_string()
+        } else {
+            format!(" {}", num)
+        };
+        spans.push(Span::styled(num_part, NUM_STYLE));
 
-        let text = format!("{}{}", num, label);
-        let text_w = text.chars().count();
-        let left_pad = 1;
-        let right_pad = slot_w.saturating_sub(text_w + left_pad);
-
-        if !label.is_empty() {
-            spans.push(Span::styled(
-                " ".repeat(left_pad),
-                Style::default().bg(Color::Black),
-            ));
-        }
-        spans.push(Span::styled(num.to_string(), NUM_STYLE));
-        spans.push(Span::styled(
-            format!("{}{}", label, " ".repeat(right_pad)),
-            LABEL_STYLE,
-        ));
+        // Label padded (or, in absurdly narrow terminals, truncated)
+        // to the rest of the field.
+        let label_space = widths[i].saturating_sub(2) as usize;
+        let label_w = label.chars().count();
+        let label_part = if label_w < label_space {
+            format!("{}{}", label, " ".repeat(label_space - label_w))
+        } else {
+            label.chars().take(label_space).collect()
+        };
+        spans.push(Span::styled(label_part, LABEL_STYLE));
     }
 
     let keybar = Paragraph::new(Line::from(spans)).style(Style::default().bg(Color::Black));
     f.render_widget(keybar, area);
+}
+
+/// Widths of the ten keybar fields, filling `width` columns exactly and
+/// keeping the fields as equal as the labels allow:
+///
+/// 1. Every field starts at its even share (`width / 10`, the first
+///    `width % 10` fields get the spare column), but never below its
+///    content minimum — 2 cells for the number part (" 1".." 9"/"10")
+///    plus the label.
+/// 2. Single-cell water-filling then makes the sum exact: surplus
+///    columns go to the currently smallest fields, deficits are taken
+///    from the largest fields that still fit their content. If the
+///    terminal is too narrow for every label (sum of minimums exceeds
+///    the width) the fields stay at their minimums and the strip is
+///    clipped by the renderer.
+fn keybar_field_widths(labels: &[(&str, &str)], width: u16) -> Vec<u16> {
+    let n = labels.len();
+    let even = width / n as u16;
+    let rem = width % n as u16;
+    // Content minimum: " N"/"10" (2 cells) + label.
+    let need: Vec<u16> = labels
+        .iter()
+        .map(|(_, label)| 2 + label.chars().count() as u16)
+        .collect();
+    let mut widths: Vec<u16> = (0..n)
+        .map(|i| even + if (i as u16) < rem { 1 } else { 0 })
+        .collect();
+    for i in 0..n {
+        if widths[i] < need[i] {
+            widths[i] = need[i];
+        }
+    }
+    loop {
+        let total: u16 = widths.iter().sum();
+        if total == width {
+            break;
+        }
+        if total < width {
+            // Grow the first smallest field.
+            let mut min_i = 0;
+            for i in 1..n {
+                if widths[i] < widths[min_i] {
+                    min_i = i;
+                }
+            }
+            widths[min_i] += 1;
+        } else {
+            // Shrink the first largest field that still fits its label.
+            let mut shrink_i: Option<usize> = None;
+            for i in 0..n {
+                if widths[i] > need[i]
+                    && (shrink_i.is_none() || widths[i] > widths[shrink_i.unwrap()])
+                {
+                    shrink_i = Some(i);
+                }
+            }
+            match shrink_i {
+                Some(i) => widths[i] -= 1,
+                // Over-constrained (terminal narrower than the labels):
+                // keep minimums, let the renderer clip.
+                None => break,
+            }
+        }
+    }
+    widths
 }
 
 fn render_model_dialog(f: &mut Frame, app: &App, area: Rect) {
@@ -1244,20 +1328,15 @@ fn render_load_dialog(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_settings_dialog(f: &mut Frame, app: &App, area: Rect) {
-    let dialog_w: u16 = 60;
-    let dialog_h: u16 = 29;
-
-    let popup_area = Rect {
-        x: (area.width.saturating_sub(dialog_w)) / 2,
-        y: (area.height.saturating_sub(dialog_h)) / 2,
-        width: dialog_w,
-        height: dialog_h,
-    };
+    // Shared geometry: the click hit-test (app.rs) uses the same
+    // layout, so the buttons are clickable exactly where they draw —
+    // on the last row INSIDE the dialog, not on its border.
+    let layout = crate::ui::settings_dialog_layout(area);
+    let popup_area = layout.popup;
+    let inner = popup_area.inner(Margin::new(2, 1));
 
     f.render_widget(Clear, popup_area);
     f.render_widget(dialog_block("Settings", &app.theme), popup_area);
-
-    let inner = popup_area.inner(Margin::new(2, 1));
 
     let field_labels = [
         ("Proxy URL:", SettingsFocus::Proxy),
@@ -1378,8 +1457,7 @@ fn render_settings_dialog(f: &mut Frame, app: &App, area: Rect) {
         }
     }
 
-    let num_fields = 13u16;
-    let btn_y = inner.y + num_fields * 2 + 1;
+    let btn_y = layout.btn_y;
     let save_label = "Save";
     let cancel_label = "Cancel";
     let save_w = save_label.len() as u16 + 4;
@@ -2036,40 +2114,76 @@ mod tool_result_tests {
     #[test]
     fn edit_file_diff_lines_colored() {
         assert_eq!(
-            tool_result_line_style("edit_file", "+ added line").fg,
+            tool_result_line_style("edit_file", "+ added line", false).fg,
             Some(Color::Green)
         );
         assert_eq!(
-            tool_result_line_style("edit_file", "- removed line").fg,
+            tool_result_line_style("edit_file", "- removed line", false).fg,
             Some(Color::Red)
         );
         assert_eq!(
-            tool_result_line_style("edit_file", "@@ -1,3 +1,4 @@").fg,
+            tool_result_line_style("edit_file", "@@ -1,3 +1,4 @@", false).fg,
             Some(Color::Cyan)
         );
         // Context lines stay dim.
         assert_eq!(
-            tool_result_line_style("edit_file", "  context line").fg,
+            tool_result_line_style("edit_file", "  context line", false).fg,
             Some(Color::DarkGray)
         );
         // --- / +++ file headers are not content changes — stay dim.
         assert_eq!(
-            tool_result_line_style("edit_file", "--- a/src/app.rs").fg,
+            tool_result_line_style("edit_file", "--- a/src/app.rs", false).fg,
             Some(Color::DarkGray)
         );
         assert_eq!(
-            tool_result_line_style("edit_file", "+++ b/src/app.rs").fg,
+            tool_result_line_style("edit_file", "+++ b/src/app.rs", false).fg,
             Some(Color::DarkGray)
         );
         // The "Successfully edited" banner and auto-appended
         // diagnostics lines render dim like context.
         assert_eq!(
-            tool_result_line_style("edit_file", "Successfully edited src/x.rs").fg,
+            tool_result_line_style("edit_file", "Successfully edited src/x.rs", false).fg,
             Some(Color::DarkGray)
         );
         assert_eq!(
-            tool_result_line_style("edit_file", "src/x.rs:3:9: [error] boom").fg,
+            tool_result_line_style("edit_file", "src/x.rs:3:9: [error] boom", false).fg,
             Some(Color::DarkGray)
+        );
+    }
+
+    #[test]
+    fn lsp_diagnostics_section_renders_magenta() {
+        // From the "Diagnostics: " marker on, every line is magenta —
+        // in any tool's result (edit_file AND write_file both get the
+        // section auto-appended).
+        assert_eq!(
+            tool_result_line_style("edit_file", "Diagnostics: LSP diagnostics for /tmp/x.rs:", true)
+                .fg,
+            Some(Color::Magenta)
+        );
+        assert_eq!(
+            tool_result_line_style("edit_file", "/tmp/x.rs:2:5: [error] boom", true).fg,
+            Some(Color::Magenta)
+        );
+        assert_eq!(
+            tool_result_line_style("write_file", "LSP: no diagnostics for /tmp/x.rs \u{2713}", true)
+                .fg,
+            Some(Color::Magenta)
+        );
+        assert_eq!(
+            tool_result_line_style("write_file", "LSP workspace (/ws): 2 errors, 1 warnings", true)
+                .fg,
+            Some(Color::Magenta)
+        );
+        // Before the marker the same lines keep their normal styling
+        // (dim outside a diff, diff colors inside one).
+        assert_eq!(
+            tool_result_line_style("edit_file", "/tmp/x.rs:2:5: [error] boom", false).fg,
+            Some(Color::DarkGray)
+        );
+        assert_eq!(
+            tool_result_line_style("edit_file", "+ new line", false).fg,
+            Some(Color::Green)
         );
     }
 
@@ -2087,19 +2201,19 @@ mod tool_result_tests {
             "unknown_tool",
         ] {
             assert_eq!(
-                tool_result_line_style(tool, "+ Add trait impl").fg,
+                tool_result_line_style(tool, "+ Add trait impl", false).fg,
                 Some(Color::DarkGray),
                 "{}: + line mis-colored",
                 tool
             );
             assert_eq!(
-                tool_result_line_style(tool, "- operand").fg,
+                tool_result_line_style(tool, "- operand", false).fg,
                 Some(Color::DarkGray),
                 "{}: - line mis-colored",
                 tool
             );
             assert_eq!(
-                tool_result_line_style(tool, "@decorator").fg,
+                tool_result_line_style(tool, "@decorator", false).fg,
                 Some(Color::DarkGray),
                 "{}: @ line mis-colored",
                 tool
@@ -2115,6 +2229,7 @@ mod tool_result_full_tests {
     use crate::config::Config;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use ratatui::style::Color;
 
     fn test_app() -> App {
         App::new(Config {
@@ -2153,6 +2268,48 @@ mod tool_result_full_tests {
             .map(|i| format!("+ added line {i}"))
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn lsp_section_colored_magenta_in_render() {
+        // An edit_file result: diff first, then the auto-appended LSP
+        // diagnostics section. The diff keeps its colors; everything
+        // from "Diagnostics: " on renders magenta.
+        let content = "Successfully edited /tmp/x.rs\n@@ -1,2 +1,2 @@\n-old line\n+new line\n\nDiagnostics: LSP diagnostics for /tmp/x.rs:\n/tmp/x.rs:2:5: [error] boom\n";
+        let mut app = test_app();
+        app.messages = vec![ChatMessage::ToolResult {
+            name: "edit_file".to_string(),
+            content: content.to_string(),
+            tool_call_id: None,
+        }];
+        let backend = TestBackend::new(120, 60);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                render_output(f, &mut app, area);
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let lines: Vec<String> = (0..buf.area.height)
+            .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .collect();
+        let find_row = |needle: &str| -> u16 {
+            lines
+                .iter()
+                .position(|l| l.contains(needle))
+                .expect(needle) as u16
+        };
+
+        // Diff lines keep their colors (text starts at col 4: "    " prefix).
+        assert_eq!(buf[(4, find_row("+new line"))].fg, Color::Green);
+        assert_eq!(buf[(4, find_row("-old line"))].fg, Color::Red);
+        // The LSP section — marker and diagnostic lines — is magenta.
+        assert_eq!(
+            buf[(4, find_row("Diagnostics: LSP diagnostics"))].fg,
+            Color::Magenta
+        );
+        assert_eq!(buf[(4, find_row("[error] boom"))].fg, Color::Magenta);
     }
 
     #[test]
@@ -2280,5 +2437,333 @@ mod tool_call_id_tests {
         assert!(view.contains("#1 RESULT: bash"), "got:\n{}", view);
         assert!(view.contains("#2 TOOL CALL: read_file"), "got:\n{}", view);
         assert!(view.contains("#2 RESULT: read_file"), "got:\n{}", view);
+    }
+}
+
+#[cfg(test)]
+mod send_button_tests {
+    use super::render_send_button;
+    use crate::app::App;
+    use crate::config::Config;
+    use crate::ui::Button;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::widgets::Paragraph;
+
+    fn test_app() -> App {
+        App::new(Config {
+            logging: false,
+            logfile: std::env::temp_dir()
+                .join(format!("rustama-test-{}.log", std::process::id()))
+                .to_string_lossy()
+                .to_string(),
+            ..Config::default()
+        })
+    }
+
+    #[test]
+    fn button_width_counts_chars_not_bytes() {
+        // ASCII labels: unchanged (display + 2-col gap convention).
+        assert_eq!(Button::new("OK", 0, 0, true, crate::ui::MC_GREEN, crate::ui::MC_GREEN).width, 6);
+        // Multi-byte symbols: "►" is 3 UTF-8 bytes but ONE column.
+        let arrow = Button::new("►", 0, 0, true, crate::ui::MC_GREEN, crate::ui::MC_GREEN);
+        assert_eq!(arrow.width, 5); // 1 char + 4, not 3 bytes + 4
+        assert_eq!(arrow.render().0.chars().count(), 3); // [►]
+    }
+
+    #[test]
+    fn send_button_is_15_chars_with_arrow() {
+        let app = test_app();
+        let backend = TestBackend::new(40, 3);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                // Simulate the input box border row: fill with ─ first,
+                // then draw the button over it.
+                f.render_widget(Paragraph::new("─".repeat(40)), f.area());
+                render_send_button(f, &app, f.area());
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let bottom: String = (0..buf.area.width)
+            .map(|x| buf[(x, 2)].symbol())
+            .collect();
+        // Exactly 15 chars, centered "send" + ►.
+        let btn = "[   send  ►   ]";
+        assert_eq!(btn.chars().count(), 15);
+        assert!(bottom.contains(btn), "got: {}", bottom);
+        // Flush against the corner: the line resumes immediately after
+        // the "]" — no double-space gap (button has no shadow).
+        let after = bottom
+            .strip_suffix('┘')
+            .and_then(|l| l.strip_suffix(btn))
+            .unwrap_or("");
+        assert!(
+            after.chars().all(|c| c == '─'),
+            "line must resume right after the button, got: {}",
+            bottom
+        );
+    }
+}
+
+#[cfg(test)]
+mod keybar_tests {
+    use super::{keybar_field_widths, render_keybar};
+    use crate::app::App;
+    use crate::config::Config;
+    use crate::ui::MC_GREEN;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::style::Color;
+
+    fn test_app() -> App {
+        App::new(Config {
+            logging: false,
+            logfile: std::env::temp_dir()
+                .join(format!("rustama-test-{}.log", std::process::id()))
+                .to_string_lossy()
+                .to_string(),
+            ..Config::default()
+        })
+    }
+
+    /// Keybar labels as render_keybar builds them (F7 always "Stop",
+    /// F8 = "Term"/"CloseTerm").
+    fn labels(f8: &'static str) -> Vec<(&'static str, &'static str)> {
+        vec![
+            ("1", "Help"), ("2", " "), ("3", " "), ("4", " "), ("5", " "),
+            ("6", "t"), ("7", "Stop"), ("8", f8), ("9", "PullDn"), ("10", "Exit"),
+        ]
+    }
+
+    #[test]
+    fn fields_fill_width_exactly() {
+        for width in [20u16, 30, 40, 49, 60, 80, 81, 100, 120, 132, 160, 200, 500] {
+            for f8 in ["Term", "CloseTerm"] {
+                let need: Vec<u16> = labels(f8)
+                    .iter()
+                    .map(|(_, l)| 2 + l.chars().count() as u16)
+                    .collect();
+                let min_total: u16 = need.iter().sum();
+                let widths = keybar_field_widths(&labels(f8), width);
+                let total: u16 = widths.iter().sum();
+                if width >= min_total {
+                    // Feasible: the fields fill the width exactly.
+                    assert_eq!(total, width, "w={} f8={}: {:?}", width, f8, widths);
+                } else {
+                    // Over-constrained: fields stay at their content
+                    // minimums (the strip clips).
+                    assert_eq!(
+                        widths, need,
+                        "w={} f8={}: expected minimums",
+                        width,
+                        f8
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fields_as_close_to_equal_as_labels_allow() {
+        // Wide terminal, short labels: perfectly equal (plus at most the
+        // one spare column from width % 10).
+        let widths = keybar_field_widths(&labels("Term"), 80);
+        assert_eq!(widths, vec![8; 10]);
+
+        // width % 10 spare columns go to the first fields.
+        let widths = keybar_field_widths(&labels("Term"), 85);
+        assert_eq!(widths, vec![9, 9, 9, 9, 9, 8, 8, 8, 8, 8]);
+
+        // A long label takes what it needs; the difference is taken
+        // back evenly — all other fields stay within one cell of each
+        // other and the total is exact.
+        let widths = keybar_field_widths(&labels("CloseTerm"), 80);
+        assert_eq!(widths[7], 11, "CloseTerm needs 2+9");
+        let others = widths.iter().enumerate().filter(|(i, _)| *i != 7).map(|(_, w)| *w).collect::<Vec<_>>();
+        assert!(
+            others.iter().max().unwrap() - others.iter().min().unwrap() <= 1,
+            "fields must stay nearly equal: {:?}",
+            widths
+        );
+        assert_eq!(widths.iter().sum::<u16>(), 80);
+    }
+
+    #[test]
+    fn narrow_terminal_keeps_label_minimums() {
+        // Width narrower than the sum of minimums: fields stay at their
+        // content minimums (renderer clips) — no field goes below it.
+        let widths = keybar_field_widths(&labels("CloseTerm"), 20);
+        let need: Vec<u16> = labels("CloseTerm")
+            .iter()
+            .map(|(_, l)| 2 + l.chars().count() as u16)
+            .collect();
+        for (w, n) in widths.iter().zip(need.iter()) {
+            assert!(w >= n, "field {} below minimum {}", w, n);
+        }
+    }
+
+    #[test]
+    fn keybar_renders_flush_10_and_fills_row() {
+        let app = test_app();
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                render_keybar(
+                    f,
+                    &app,
+                    ratatui::layout::Rect::new(0, 23, area.width, 1),
+                );
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let row: String = (0..80).map(|x| buf[(x, 23)].symbol()).collect();
+
+        // Keys 1-9 keep " N"; "10" has NO leading space and its label
+        // starts at the same cell offset as the others.
+        assert!(row.contains(" 1Help"), "got: {}", row);
+        assert!(row.contains("10Exit"), "got: {}", row);
+        assert!(!row.contains(" 10Exit"), "10 must not have a leading space: {}", row);
+        // F7 "Stop" is shown even while idle (no request in flight).
+        assert!(row.contains(" 7Stop"), "got: {}", row);
+
+        // The whole row is keybar-colored (black numbers / green
+        // labels) — the strip fills the terminal width with no gap.
+        for x in 0..80 {
+            let bg = buf[(x, 23)].bg;
+            assert!(
+                bg == Color::Black || bg == MC_GREEN,
+                "unfilled keybar cell at x={} (bg={:?}): {}",
+                x,
+                bg,
+                row
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod settings_dialog_tests {
+    use super::render_settings_dialog;
+    use crate::app::App;
+    use crate::config::Config;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::layout::Rect;
+
+    fn test_app() -> App {
+        App::new(Config {
+            logging: false,
+            logfile: std::env::temp_dir()
+                .join(format!("rustama-test-{}.log", std::process::id()))
+                .to_string_lossy()
+                .to_string(),
+            ..Config::default()
+        })
+    }
+
+    #[test]
+    fn save_cancel_buttons_render_inside_dialog() {
+        let app = test_app();
+        let layout = crate::ui::settings_dialog_layout(Rect::new(0, 0, 100, 40));
+        let backend = TestBackend::new(100, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                render_settings_dialog(f, &app, area);
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let line = |y: u16| -> String {
+            (0..buf.area.width)
+                .map(|x| buf[(x, y)].symbol())
+                .collect::<String>()
+        };
+
+        let border_row = line(layout.popup.y + layout.popup.height - 1);
+        let btn_row = line(layout.btn_y);
+
+        // Bottom border is intact: corners present, no buttons on it.
+        // (The row is rendered on the default background, so the
+        // border line starts at popup.x — trim before comparing.)
+        let border_trimmed = border_row.trim();
+        assert!(
+            border_trimmed.starts_with('└') && border_trimmed.ends_with('┘'),
+            "got: {}",
+            border_row
+        );
+        assert!(
+            !border_row.contains("[Save]") && !border_row.contains("[Cancel]"),
+            "buttons must not sit on the border: {}",
+            border_row
+        );
+
+        // Buttons draw on the last row INSIDE the dialog.
+        assert!(btn_row.contains("[Save]"), "got: {}", btn_row);
+        assert!(btn_row.contains("[Cancel]"), "got: {}", btn_row);
+    }
+}
+
+#[cfg(test)]
+mod about_dialog_tests {
+    use crate::app::App;
+    use crate::config::Config;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use crate::ui::MessageBox;
+
+    fn test_app() -> App {
+        App::new(Config {
+            logging: false,
+            logfile: std::env::temp_dir()
+                .join(format!("rustama-test-{}.log", std::process::id()))
+                .to_string_lossy()
+                .to_string(),
+            ..Config::default()
+        })
+    }
+
+    #[test]
+    fn about_message_contains_github_url() {
+        let app = test_app();
+        assert!(
+            app.about_message.contains("https://github.com/walley/Rustama"),
+            "got: {}",
+            app.about_message
+        );
+    }
+
+    #[test]
+    fn about_url_renders_unsplit() {
+        // The URL must render as one line (not wrapped) in the About
+        // box, so it stays copyable/readable.
+        let app = test_app();
+        let backend = TestBackend::new(100, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                let mb = MessageBox::new("About", &app.about_message);
+                mb.render(f, area, true, &app.theme);
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let lines: Vec<String> = (0..buf.area.height)
+            .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect())
+            .collect();
+        let full_url_line = lines
+            .iter()
+            .find(|l| l.contains("https://github.com/walley/Rustama"))
+            .expect("URL missing from About render");
+        // URL intact on a single line (the "GitHub:" prefix and the
+        // full URL together, unsplit).
+        assert!(
+            full_url_line.trim().starts_with("GitHub:") || full_url_line.contains("GitHub:"),
+            "URL should follow the GitHub: prefix: {}",
+            full_url_line
+        );
     }
 }

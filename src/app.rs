@@ -1140,7 +1140,7 @@ impl App {
             main_menu: MainMenu::new(),
             show_about: false,
             about_message: format!(
-                "Rustama v{}\n\nA terminal AI coding agent for Ollama LLMs.\nSupports markdown rendering, agentic tools, and saving.\n\nBuilt with ratatui + crossterm",
+                "Rustama v{}\n\nA terminal AI coding agent for Ollama LLMs.\nSupports markdown rendering, agentic tools, and saving.\n\nBuilt with ratatui + crossterm\n\nGitHub: https://github.com/walley/Rustama",
                 env!("CARGO_PKG_VERSION")
             ),
             show_quit_confirm: false,
@@ -4231,13 +4231,16 @@ impl App {
     }
 
     fn handle_settings_dialog_click(&mut self, col: u16, row: u16, width: u16, height: u16) {
-        let dialog_w: u16 = 60;
-        let dialog_h: u16 = 28;
-        let dialog_x = (width.saturating_sub(dialog_w)) / 2;
-        let dialog_y = (height.saturating_sub(dialog_h)) / 2;
-        let inner_x = dialog_x + 2;
-        let inner_y = dialog_y + 1;
-        let inner_w = dialog_w.saturating_sub(4);
+        // Shared geometry: must agree with render_settings_dialog
+        // (main.rs) — same popup size, same field rows, same button row.
+        let layout = crate::ui::settings_dialog_layout(Rect::new(0, 0, width, height));
+        let dialog_x = layout.popup.x;
+        let dialog_y = layout.popup.y;
+        let dialog_w = layout.popup.width;
+        let dialog_h = layout.popup.height;
+        let inner_x = layout.inner_x;
+        let inner_y = layout.inner_y;
+        let inner_w = layout.inner_w;
 
         if col < dialog_x
             || col >= dialog_x + dialog_w
@@ -4279,8 +4282,7 @@ impl App {
             }
         }
 
-        let num_fields = 13u16;
-        let btn_y = inner_y + num_fields * 2 + 1;
+        let btn_y = layout.btn_y;
         let save_label = "Save";
         let cancel_label = "Cancel";
         let save_w = save_label.len() as u16 + 4;
