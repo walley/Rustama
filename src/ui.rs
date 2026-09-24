@@ -4,7 +4,10 @@ use ratatui::layout::{Margin, Offset, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::dimmed;
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Shadow};
+use ratatui::widgets::{
+    Block, Borders, Clear, List, ListItem, Paragraph, Scrollbar, ScrollbarOrientation,
+    ScrollbarState, Shadow,
+};
 
 /// Midnight Commander's signature turquoise-green (its "cyan" keybar/menu
 /// text, approximated as truecolor). Shared by the keybar and the menu bar.
@@ -12,16 +15,26 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Shadow}
 pub const MC_GREEN: Color = Color::Cyan;
 
 #[derive(Debug, Clone)]
+/// mc-style dialog colors (observed from mc's "Configuration options"
+/// dialog): white background, black text, blue titles/hotkeys, cyan
+/// focus highlight, gray-on-cyan input fields.
 pub struct Theme {
     pub dialog_border: Color,
     pub dialog_bg: Color,
+    /// Dialog body text (black).
+    pub dialog_fg: Color,
+    /// Dialog title (blue, like mc's " Configure options ").
+    pub dialog_title_fg: Color,
+    /// Focused row / input / button background (cyan).
+    pub dialog_focus_bg: Color,
+    /// Input field text on the cyan background (gray).
+    pub dialog_input_fg: Color,
     pub list_selected_bg: Color,
     pub list_selected_fg: Color,
     pub dir_fg: Color,
     pub file_fg: Color,
     pub path_fg: Color,
-    pub focus_fg: Color,
-    pub accent: Color,
+    /// Thinking-block text in the chat output (not dialog-related).
     pub thinking_fg: Color,
     /// Menu bar / submenu item when selected (highlighted).
     pub menu_selected_bg: Color,
@@ -35,15 +48,17 @@ impl Theme {
     #[cfg(test)]
     pub fn default() -> Self {
         Theme {
-            dialog_border: Color::Cyan,
-            dialog_bg: Color::DarkGray,
-            list_selected_bg: Color::White,
+            dialog_border: Color::Black,
+            dialog_bg: Color::White,
+            dialog_fg: Color::Black,
+            dialog_title_fg: Color::Blue,
+            dialog_focus_bg: Color::Cyan,
+            dialog_input_fg: Color::DarkGray,
+            list_selected_bg: Color::Cyan,
             list_selected_fg: Color::Black,
             dir_fg: Color::Blue,
-            file_fg: Color::White,
+            file_fg: Color::Black,
             path_fg: Color::DarkGray,
-            focus_fg: Color::Yellow,
-            accent: Color::Cyan,
             thinking_fg: Color::Yellow,
             menu_selected_bg: Color::Black,
             menu_selected_fg: Color::White,
@@ -54,15 +69,17 @@ impl Theme {
 
     pub fn dark() -> Self {
         Theme {
-            dialog_border: Color::Cyan,
-            dialog_bg: Color::Rgb(20, 20, 20),
-            list_selected_bg: Color::White,
+            dialog_border: Color::Black,
+            dialog_bg: Color::White,
+            dialog_fg: Color::Black,
+            dialog_title_fg: Color::Blue,
+            dialog_focus_bg: Color::Cyan,
+            dialog_input_fg: Color::DarkGray,
+            list_selected_bg: Color::Cyan,
             list_selected_fg: Color::Black,
-            dir_fg: Color::LightBlue,
-            file_fg: Color::White,
+            dir_fg: Color::Blue,
+            file_fg: Color::Black,
             path_fg: Color::DarkGray,
-            focus_fg: Color::Yellow,
-            accent: Color::Cyan,
             thinking_fg: Color::Yellow,
             menu_selected_bg: Color::Black,
             menu_selected_fg: Color::White,
@@ -76,6 +93,7 @@ pub fn dialog_block(title: &str, theme: &Theme) -> Block<'static> {
     Block::default()
         .borders(Borders::ALL)
         .title(format!(" {} ", title))
+        .title_style(Style::default().fg(theme.dialog_title_fg))
         .border_style(Style::default().fg(theme.dialog_border))
         .style(Style::default().bg(theme.dialog_bg))
         .shadow(Shadow::new(dimmed()).offset(Offset::new(1, 1)))
@@ -160,6 +178,172 @@ pub struct DialogDropdownState {
     pub selected: usize,
 }
 
+/// Maximum visible file rows inside a [`FileListBox`] (the mc-like
+/// fixed height cap; the box grows up to this many rows + 2 borders).
+pub const FILE_LIST_MAX_VISIBLE: usize = 12;
+
+/// A bordered, scrollable file list (mc-style): `(name, is_dir)` entries
+/// with a selection and a scroll offset, plus an optional focus flag.
+/// Renders itself — border, rows, and a scrollbar when the entries
+/// overflow the visible area — and answers hit tests. [`FileActionDialog`]
+/// embeds it via [`DialogItem::FileList`]; it is a standalone widget, so
+/// any other dialog (or screen) needing a file picker can reuse it
+/// directly.
+#[derive(Debug, Clone)]
+pub struct FileListBox {
+    pub entries: Vec<(String, bool)>,
+    pub selection: usize,
+    pub scroll: usize,
+    pub focused: bool,
+}
+
+impl FileListBox {
+    pub fn new(
+        entries: Vec<(String, bool)>,
+        selection: usize,
+        scroll: usize,
+        focused: bool,
+    ) -> Self {
+        FileListBox {
+            entries,
+            selection,
+            scroll,
+            focused,
+        }
+    }
+
+    /// Height the box would take with no space constraints
+    /// (visible rows + 2 border lines).
+    pub fn natural_height(&self) -> u16 {
+        self.entries.len().min(FILE_LIST_MAX_VISIBLE) as u16 + 2
+    }
+
+    /// Geometry of the box placed in a space `available` rows tall:
+    /// `(box_height, visible_rows, first_visible_entry)`. The box is
+    /// clamped to the available space; the scroll offset is clamped to
+    /// the entries and adjusted so the selection stays visible.
+    pub fn geometry(&self, available: u16) -> (u16, usize, usize) {
+        let entries_len = self.entries.len();
+        let box_h = self.natural_height().min(available.max(2));
+        let visible = (box_h - 2) as usize;
+        if visible == 0 || entries_len == 0 {
+            return (box_h, visible, 0);
+        }
+        let max_start = entries_len.saturating_sub(visible);
+        let mut start = self.scroll.min(max_start);
+        if self.selection < start {
+            start = self.selection;
+        }
+        if self.selection >= start + visible {
+            start = self.selection + 1 - visible;
+        }
+        (box_h, visible, start)
+    }
+
+    /// Renders the box into `area`: border (blue when focused), rows
+    /// (dirs blue+bold, selected row black-on-cyan padded to full
+    /// width), and — when the entries overflow — a scrollbar in the
+    /// last inner column.
+    pub fn render(&self, f: &mut Frame, area: Rect, theme: &Theme) {
+        let (_, visible, start) = self.geometry(area.height);
+        let border_color = if self.focused {
+            theme.dialog_title_fg
+        } else {
+            theme.dialog_border
+        };
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(border_color))
+            .style(Style::default().bg(theme.dialog_bg));
+        f.render_widget(block, area);
+
+        let mut rows_area = area.inner(Margin::new(1, 1));
+        let show_scrollbar = visible > 0 && self.entries.len() > visible;
+        if show_scrollbar {
+            rows_area.width = rows_area.width.saturating_sub(1);
+        }
+
+        let end = (start + visible).min(self.entries.len());
+        let mut list_items: Vec<ListItem> = self.entries[start..end]
+            .iter()
+            .enumerate()
+            .map(|(i, (name, is_dir))| {
+                let real_idx = start + i;
+                let is_sel = real_idx == self.selection;
+                let display = if *is_dir && name != ".." {
+                    format!("{}/", name)
+                } else {
+                    name.clone()
+                };
+                let name_style = if is_sel {
+                    Style::default()
+                        .fg(theme.list_selected_fg)
+                        .bg(theme.list_selected_bg)
+                        .add_modifier(Modifier::BOLD)
+                } else if *is_dir {
+                    Style::default()
+                        .fg(theme.dir_fg)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(theme.file_fg)
+                };
+                // Pad the selected row so the highlight spans the full width.
+                let text = if is_sel {
+                    let pad = (rows_area.width as usize).saturating_sub(display.chars().count());
+                    format!("{}{}", display, " ".repeat(pad))
+                } else {
+                    display
+                };
+                ListItem::new(Line::from(Span::styled(text, name_style)))
+            })
+            .collect();
+
+        list_items.resize_with(visible, || ListItem::new(Line::from(Span::raw(""))));
+        let list = ratatui::widgets::List::new(list_items);
+        f.render_widget(list, rows_area);
+
+        if show_scrollbar {
+            let track = Rect {
+                x: area.x + area.width.saturating_sub(2),
+                y: area.y + 1,
+                width: 1,
+                height: area.height.saturating_sub(2),
+            };
+            let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(Some("▲"))
+                .end_symbol(Some("▼"))
+                .track_symbol(Some("│"))
+                .thumb_style(
+                    Style::default()
+                        .fg(theme.dialog_fg)
+                        .add_modifier(Modifier::BOLD),
+                )
+                .track_style(Style::default().fg(theme.dialog_input_fg));
+            let max_scroll = self.entries.len().saturating_sub(visible);
+            let mut state = ScrollbarState::new(max_scroll).position(start);
+            f.render_stateful_widget(scrollbar, track, &mut state);
+        }
+    }
+
+    /// Entry index at absolute `row` inside the box `area`, if that row
+    /// is a visible list row. Border rows and rows outside the box (or
+    /// past the entries) yield `None`.
+    pub fn hit_test(&self, row: u16, area: Rect) -> Option<usize> {
+        let (_, visible, start) = self.geometry(area.height);
+        if visible == 0 || self.entries.is_empty() {
+            return None;
+        }
+        let first = area.y + 1;
+        if row >= first && row < first + visible as u16 {
+            let idx = start + (row - first) as usize;
+            if idx < self.entries.len() {
+                return Some(idx);
+            }
+        }
+        None
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum DialogItem {
     Label(DialogLabel),
@@ -169,12 +353,7 @@ pub enum DialogItem {
         items: Vec<String>,
         state: DialogDropdownState,
     },
-    FileList {
-        entries: Vec<(String, bool)>,
-        selection: usize,
-        scroll: usize,
-        focused: bool,
-    },
+    FileList(FileListBox),
     Buttons(Vec<DialogButton>),
 }
 
@@ -238,12 +417,10 @@ impl FileActionDialog {
         scroll: usize,
         focused: bool,
     ) {
-        self.items.push(DialogItem::FileList {
-            entries,
-            selection,
-            scroll,
-            focused,
-        });
+        self.items
+            .push(DialogItem::FileList(FileListBox::new(
+                entries, selection, scroll, focused,
+            )));
     }
 
     pub fn add_button(&mut self, label: &str, focused: bool) {
@@ -274,7 +451,7 @@ impl FileActionDialog {
                     1
                 }
             }
-            DialogItem::FileList { entries, .. } => entries.len().min(12) as u16 + 2, // +2 for borders
+            DialogItem::FileList(list) => list.natural_height(),
             DialogItem::Buttons(_) => 1,
         }
     }
@@ -282,34 +459,6 @@ impl FileActionDialog {
     /// Popup dimensions shared by `render` and `hit_test` so they always agree.
     pub fn dialog_size(area: Rect) -> (u16, u16) {
         ((area.width * 2 / 3).max(40), (area.height * 2 / 3).max(10))
-    }
-
-    /// Geometry of a bordered file list placed at `y_cursor` with the button
-    /// row at `btn_bottom_y`. Returns `(box_height, visible_rows, first_entry)`.
-    /// The box is clamped to the space above the button row, and the scroll
-    /// offset is adjusted so the selection is always visible.
-    fn file_list_geometry(
-        entries_len: usize,
-        selection: usize,
-        scroll: usize,
-        y_cursor: u16,
-        btn_bottom_y: u16,
-    ) -> (u16, usize, usize) {
-        let max_box = btn_bottom_y.saturating_sub(y_cursor).max(2);
-        let box_h = (entries_len.min(12) as u16 + 2).min(max_box).max(2);
-        let visible = (box_h - 2) as usize;
-        if visible == 0 || entries_len == 0 {
-            return (box_h, visible, 0);
-        }
-        let max_start = entries_len.saturating_sub(visible);
-        let mut start = scroll.min(max_start);
-        if selection < start {
-            start = selection;
-        }
-        if selection >= start + visible {
-            start = selection + 1 - visible;
-        }
-        (box_h, visible, start)
     }
 
     pub fn render(&self, f: &mut Frame, area: Rect, theme: &Theme) {
@@ -350,7 +499,7 @@ impl FileActionDialog {
                     f.render_widget(
                         Paragraph::new(Line::from(Span::styled(
                             &label.text,
-                            Style::default().fg(label.fg.unwrap_or(Color::White)),
+                            Style::default().fg(label.fg.unwrap_or(theme.dialog_fg)),
                         ))),
                         item_area,
                     );
@@ -365,15 +514,20 @@ impl FileActionDialog {
                     f.render_widget(
                         Paragraph::new(Line::from(Span::styled(
                             format!("  {}", ti.label),
-                            Style::default().fg(Color::White),
+                            Style::default().fg(theme.dialog_fg),
                         ))),
                         label_area,
                     );
 
+                    // mc-style input field: always on the cyan background;
+                    // focused fields get brighter text (the terminal
+                    // cursor marks focus), unfocused ones stay gray.
                     let path_style = if ti.focused {
-                        Style::default().fg(Color::White).bg(Color::Black)
+                        Style::default().fg(theme.dialog_fg).bg(theme.dialog_focus_bg)
                     } else {
-                        Style::default().fg(Color::White).bg(Color::Rgb(40, 40, 40))
+                        Style::default()
+                            .fg(theme.dialog_input_fg)
+                            .bg(theme.dialog_focus_bg)
                     };
                     let input_area = Rect {
                         x: inner.x,
@@ -408,10 +562,11 @@ impl FileActionDialog {
                         };
                         let style = if state.focused {
                             Style::default()
-                                .fg(theme.focus_fg)
+                                .fg(theme.dialog_fg)
+                                .bg(theme.dialog_focus_bg)
                                 .add_modifier(Modifier::BOLD)
                         } else {
-                            Style::default().fg(theme.accent)
+                            Style::default().fg(theme.dialog_fg)
                         };
                         let item_area = Rect {
                             x: inner.x,
@@ -434,7 +589,9 @@ impl FileActionDialog {
                         f.render_widget(
                             Paragraph::new(Line::from(Span::styled(
                                 header,
-                                Style::default().fg(theme.focus_fg),
+                                Style::default()
+                                    .fg(theme.dialog_fg)
+                                    .bg(theme.dialog_focus_bg),
                             ))),
                             header_area,
                         );
@@ -448,10 +605,11 @@ impl FileActionDialog {
                             let display = format!("    {}{}", prefix, item_name);
                             let style = if i == state.selected {
                                 Style::default()
-                                    .fg(theme.focus_fg)
+                                    .fg(theme.dialog_fg)
+                                    .bg(theme.dialog_focus_bg)
                                     .add_modifier(Modifier::BOLD)
                             } else {
-                                Style::default().fg(Color::White)
+                                Style::default().fg(theme.dialog_fg)
                             };
                             let item_area = Rect {
                                 x: inner.x,
@@ -466,77 +624,16 @@ impl FileActionDialog {
                         }
                     }
                 }
-                DialogItem::FileList {
-                    entries,
-                    selection,
-                    scroll,
-                    focused,
-                } => {
-                    let (box_h, visible, start) = Self::file_list_geometry(
-                        entries.len(),
-                        *selection,
-                        *scroll,
-                        y_cursor,
-                        btn_bottom_y,
-                    );
+                DialogItem::FileList(list) => {
+                    let available = btn_bottom_y.saturating_sub(y_cursor);
+                    let (box_h, _, _) = list.geometry(available);
                     let box_area = Rect {
                         x: inner.x,
                         y: y_cursor,
                         width: inner.width,
                         height: box_h,
                     };
-
-                    let border_color = if *focused {
-                        theme.focus_fg
-                    } else {
-                        theme.dialog_border
-                    };
-                    let block = Block::default()
-                        .borders(Borders::ALL)
-                        .border_style(Style::default().fg(border_color))
-                        .style(Style::default().bg(theme.dialog_bg));
-                    f.render_widget(block, box_area);
-
-                    let list_inner = box_area.inner(Margin::new(1, 1));
-                    let end = (start + visible).min(entries.len());
-                    let mut list_items: Vec<ListItem> = entries[start..end]
-                        .iter()
-                        .enumerate()
-                        .map(|(i, (name, is_dir))| {
-                            let real_idx = start + i;
-                            let is_sel = real_idx == *selection;
-                            let display = if *is_dir && name != ".." {
-                                format!("{}/", name)
-                            } else {
-                                name.clone()
-                            };
-                            let name_style = if is_sel {
-                                Style::default()
-                                    .fg(theme.list_selected_fg)
-                                    .bg(theme.list_selected_bg)
-                                    .add_modifier(Modifier::BOLD)
-                            } else if *is_dir {
-                                Style::default()
-                                    .fg(theme.dir_fg)
-                                    .add_modifier(Modifier::BOLD)
-                            } else {
-                                Style::default().fg(theme.file_fg)
-                            };
-                            // Pad the selected row so the highlight spans the full width.
-                            let text = if is_sel {
-                                let pad = (list_inner.width as usize)
-                                    .saturating_sub(display.chars().count());
-                                format!("{}{}", display, " ".repeat(pad))
-                            } else {
-                                display
-                            };
-                            ListItem::new(Line::from(Span::styled(text, name_style)))
-                        })
-                        .collect();
-
-                    list_items.resize_with(visible, || ListItem::new(Line::from(Span::raw(""))));
-                    let list = ratatui::widgets::List::new(list_items);
-                    f.render_widget(list, list_inner);
+                    list.render(f, box_area, theme);
                 }
                 DialogItem::Buttons(_) => unreachable!(),
             }
@@ -561,11 +658,11 @@ impl FileActionDialog {
                 let display = format!("[{}]", btn.label);
                 let style = if btn.focused {
                     Style::default()
-                        .fg(Color::Black)
-                        .bg(Color::Green)
+                        .fg(theme.dialog_fg)
+                        .bg(theme.dialog_focus_bg)
                         .add_modifier(Modifier::BOLD)
                 } else {
-                    Style::default().fg(Color::Green)
+                    Style::default().fg(theme.dialog_fg)
                 };
                 spans.push(Span::styled(display, style));
             }
@@ -640,24 +737,17 @@ impl FileActionDialog {
                         }
                     }
                 }
-                DialogItem::FileList {
-                    entries,
-                    selection,
-                    scroll,
-                    ..
-                } => {
-                    let (_box_h, visible, start) = Self::file_list_geometry(
-                        entries.len(),
-                        *selection,
-                        *scroll,
-                        y_cursor,
-                        btn_bottom_y,
-                    );
-                    if row > y_cursor && row <= y_cursor + visible as u16 {
-                        let list_idx = start + (row - y_cursor - 1) as usize;
-                        if list_idx < entries.len() {
-                            return DialogHit::FileListItem(list_idx);
-                        }
+                DialogItem::FileList(list) => {
+                    let available = btn_bottom_y.saturating_sub(y_cursor);
+                    let (box_h, _, _) = list.geometry(available);
+                    let box_area = Rect {
+                        x: inner.x,
+                        y: y_cursor,
+                        width: inner.width,
+                        height: box_h,
+                    };
+                    if let Some(list_idx) = list.hit_test(row, box_area) {
+                        return DialogHit::FileListItem(list_idx);
                     }
                 }
                 DialogItem::Buttons(_) => unreachable!(),
@@ -1154,7 +1244,7 @@ impl MessageBox {
         for (i, line) in lines.iter().enumerate() {
             let para = Paragraph::new(Line::from(Span::styled(
                 format!("  {}", line),
-                Style::default().fg(Color::White),
+                Style::default().fg(theme.dialog_fg),
             )));
             let line_area = Rect {
                 x: inner.x,
@@ -1170,8 +1260,8 @@ impl MessageBox {
             btn_area.x,
             btn_area.y,
             focused,
-            Color::Green,
-            Color::Green,
+            theme.dialog_fg,
+            theme.dialog_focus_bg,
         );
         let (display, style) = ok_btn.render();
         let btn_para = Paragraph::new(Line::from(Span::styled(display, style)));
@@ -1305,7 +1395,7 @@ impl ConfirmationBox {
         for (i, line) in lines.iter().enumerate() {
             let para = Paragraph::new(Line::from(Span::styled(
                 format!("  {}", line),
-                Style::default().fg(Color::White),
+                Style::default().fg(theme.dialog_fg),
             )));
             let line_area = Rect {
                 x: inner.x,
@@ -1321,16 +1411,16 @@ impl ConfirmationBox {
             confirm_area.x,
             confirm_area.y,
             focus == ConfirmFocus::Yes,
-            Color::Green,
-            Color::Green,
+            theme.dialog_fg,
+            theme.dialog_focus_bg,
         );
         let no_btn = Button::new(
             &self.cancel_label,
             cancel_area.x,
             cancel_area.y,
             focus == ConfirmFocus::No,
-            Color::Red,
-            Color::Red,
+            theme.dialog_fg,
+            theme.dialog_focus_bg,
         );
 
         let (yes_display, yes_style) = yes_btn.render();
@@ -1380,6 +1470,23 @@ impl ConfirmationBox {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn theme_uses_mc_dialog_colors() {
+        // The dialog palette mirrors mc's "Configuration options"
+        // dialog: white bg, black text/frame, blue titles, cyan focus.
+        for theme in [Theme::default(), Theme::dark()] {
+            assert_eq!(theme.dialog_bg, Color::White);
+            assert_eq!(theme.dialog_fg, Color::Black);
+            assert_eq!(theme.dialog_border, Color::Black);
+            assert_eq!(theme.dialog_title_fg, Color::Blue);
+            assert_eq!(theme.dialog_focus_bg, Color::Cyan);
+            assert_eq!(theme.dialog_input_fg, Color::DarkGray);
+            // Selected rows use the mc focus convention: black on cyan.
+            assert_eq!(theme.list_selected_bg, Color::Cyan);
+            assert_eq!(theme.list_selected_fg, Color::Black);
+        }
+    }
 
     #[test]
     fn menu_offsets_computed_from_titles() {
@@ -1504,37 +1611,78 @@ mod tests {
 
     #[test]
     fn file_list_geometry_fits_above_buttons() {
-        // 20 entries, tall terminal: capped at 12 visible rows + 2 border rows.
-        let (box_h, visible, start) = FileActionDialog::file_list_geometry(20, 0, 0, 5, 40);
-        assert_eq!(visible, 12);
-        assert_eq!(box_h, 14);
-        assert_eq!(start, 0);
+        // 20 entries, 40 rows available: capped at 12 visible rows + 2 border rows.
+        let list = FileListBox::new(test_entries(20), 0, 0, true);
+        assert_eq!(list.geometry(40), (14, 12, 0));
     }
 
     #[test]
     fn file_list_geometry_clamps_to_available_space() {
-        // List starts at row 10, buttons at row 15 -> box can be at most 5 rows.
-        let (box_h, visible, _start) = FileActionDialog::file_list_geometry(20, 0, 0, 10, 15);
-        assert_eq!(box_h, 5);
-        assert_eq!(visible, 3);
+        // Only 5 rows available -> box can be at most 5 rows.
+        let list = FileListBox::new(test_entries(20), 0, 0, true);
+        assert_eq!(list.geometry(5), (5, 3, 0));
     }
 
     #[test]
     fn file_list_geometry_keeps_selection_visible() {
         // Scroll hint is stale; selection beyond the window must scroll into view.
-        let (_box_h, visible, start) = FileActionDialog::file_list_geometry(20, 10, 0, 0, 30);
+        let list = FileListBox::new(test_entries(20), 10, 0, true);
+        let (_, visible, start) = list.geometry(30);
         assert!(start <= 10 && 10 < start + visible);
         // Selection above the window pulls scroll up.
-        let (_b, visible2, start2) = FileActionDialog::file_list_geometry(20, 2, 15, 0, 30);
+        let list = FileListBox::new(test_entries(20), 2, 15, true);
+        let (_, visible2, start2) = list.geometry(30);
         assert!(start2 <= 2 && 2 < start2 + visible2);
     }
 
     #[test]
     fn file_list_geometry_empty_entries() {
-        let (box_h, visible, start) = FileActionDialog::file_list_geometry(0, 0, 0, 0, 30);
-        assert_eq!(box_h, 2); // just the borders
-        assert_eq!(visible, 0);
-        assert_eq!(start, 0);
+        let list = FileListBox::new(Vec::new(), 0, 0, true);
+        assert_eq!(list.geometry(30), (2, 0, 0)); // just the borders
+    }
+
+    /// `n` plain file entries for the geometry tests.
+    fn test_entries(n: usize) -> Vec<(String, bool)> {
+        (0..n).map(|i| (format!("file{}.txt", i), false)).collect()
+    }
+
+    #[test]
+    fn file_list_scrollbar_only_when_overflow() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let theme = Theme::default();
+        let render = |entries: Vec<(String, bool)>| {
+            let list = FileListBox::new(entries, 0, 0, true);
+            let backend = TestBackend::new(40, 10);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal
+                .draw(|f| {
+                    list.render(f, Rect::new(2, 2, 36, 8), &theme);
+                })
+                .unwrap();
+            let buf = terminal.backend().buffer().clone();
+            // The last inner column (x = 2 + 36 - 2 = 36), rows 3..8.
+            (3..8)
+                .map(|r| buf[(36, r)].symbol().to_string())
+                .collect::<Vec<_>>()
+        };
+
+        // 5 entries fit in the 6 visible rows -> no scrollbar (empty column).
+        let fitting = render(test_entries(5));
+        assert!(
+            fitting.iter().all(|s| s.trim().is_empty()),
+            "scrollbar rendered though entries fit: {:?}",
+            fitting
+        );
+
+        // 20 entries overflow -> track + thumb in the reserved column.
+        let overflowing = render(test_entries(20));
+        assert!(
+            overflowing.iter().any(|s| s == "│" || s == "█" || s == "▲" || s == "▼"),
+            "scrollbar missing on overflow: {:?}",
+            overflowing
+        );
     }
 
     #[test]
@@ -1654,9 +1802,12 @@ mod tests {
         );
 
         // Selection is row index 3 -> first visible file row; highlight spans
-        // the full inner width of the box.
+        // the full row width of the box. The 18 entries overflow the visible
+        // rows (9), so the last inner column is reserved for the scrollbar —
+        // it must NOT be part of the row highlight.
         let sel_row = lt + 1 + 3;
-        for col in (lx + 1)..(lx + dw - 3) {
+        let scroll_col = lx + dw - 4; // last inner column, next to the border
+        for col in (lx + 1)..scroll_col {
             assert_eq!(
                 buf[(col, sel_row)].bg,
                 theme.list_selected_bg,
@@ -1664,6 +1815,27 @@ mod tests {
                 col
             );
         }
+
+        // Scrollbar: the overflow must render a track (│) with arrows
+        // (▲/▼) in the reserved column, and a thumb (█) somewhere.
+        let track_symbols: Vec<&str> = ((lt + 1)..lb)
+            .map(|r| buf[(scroll_col, r)].symbol())
+            .collect();
+        assert!(
+            track_symbols.contains(&"│"),
+            "scrollbar track missing: {:?}",
+            track_symbols
+        );
+        assert!(
+            track_symbols.contains(&"▲") && track_symbols.contains(&"▼"),
+            "scrollbar arrows missing: {:?}",
+            track_symbols
+        );
+        assert!(
+            track_symbols.contains(&"█"),
+            "scrollbar thumb missing: {:?}",
+            track_symbols
+        );
 
         // Buttons on the last-but-two inner row, right-aligned: [Cancel]  [Load].
         let btn_row = &lines[(dy + dh - 3) as usize];

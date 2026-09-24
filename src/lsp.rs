@@ -482,6 +482,106 @@ impl LspClient {
         })
     }
 
+    /// Resolves the hover info for the symbol at `(line, character)`
+    /// (0-based) in `path` via `textDocument/hover`. Returns the rendered
+    /// hover text, or an empty string if the server has nothing at that
+    /// position. The caller must `sync_file` first.
+    pub fn hover(
+        &self,
+        path: &Path,
+        line: u32,
+        character: u32,
+        timeout: Duration,
+        cancel: &AtomicBool,
+    ) -> Result<String, String> {
+        let uri = path_to_uri(path)?;
+        let result = self.request_value(
+            "textDocument/hover",
+            serde_json::json!({
+                "textDocument": { "uri": uri },
+                "position": { "line": line, "character": character },
+            }),
+            timeout,
+            cancel,
+        )?;
+        // A null result means "no hover here".
+        if result.is_null() {
+            return Ok(String::new());
+        }
+        let hover: lsp_types::Hover = serde_json::from_value(result)
+            .map_err(|e| format!("bad hover response: {}", e))?;
+        Ok(format_hover_contents(&hover.contents))
+    }
+
+    /// Finds all references to the symbol at `(line, character)` (0-based)
+    /// in `path` via `textDocument/references`. Returns the locations as a
+    /// flat list. The caller must `sync_file` first.
+    pub fn references(
+        &self,
+        path: &Path,
+        line: u32,
+        character: u32,
+        include_declaration: bool,
+        timeout: Duration,
+        cancel: &AtomicBool,
+    ) -> Result<Vec<lsp_types::Location>, String> {
+        let uri = path_to_uri(path)?;
+        let result = self.request_value(
+            "textDocument/references",
+            serde_json::json!({
+                "textDocument": { "uri": uri },
+                "position": { "line": line, "character": character },
+                "context": { "includeDeclaration": include_declaration },
+            }),
+            timeout,
+            cancel,
+        )?;
+        let locs: Vec<lsp_types::Location> = serde_json::from_value(result)
+            .map_err(|e| format!("bad references response: {}", e))?;
+        Ok(locs)
+    }
+
+    /// Requests completions at `(line, character)` (0-based) in `path` via
+    /// `textDocument/completion`. Returns a compact list of
+    /// `label — detail` strings (detail optional). The caller must
+    /// `sync_file` first.
+    pub fn completion(
+        &self,
+        path: &Path,
+        line: u32,
+        character: u32,
+        timeout: Duration,
+        cancel: &AtomicBool,
+    ) -> Result<Vec<String>, String> {
+        let uri = path_to_uri(path)?;
+        let result = self.request_value(
+            "textDocument/completion",
+            serde_json::json!({
+                "textDocument": { "uri": uri },
+                "position": { "line": line, "character": character },
+            }),
+            timeout,
+            cancel,
+        )?;
+        // Null result → no completions.
+        if result.is_null() {
+            return Ok(Vec::new());
+        }
+        let resp: lsp_types::CompletionResponse = serde_json::from_value(result)
+            .map_err(|e| format!("bad completion response: {}", e))?;
+        let items: Vec<lsp_types::CompletionItem> = match resp {
+            lsp_types::CompletionResponse::Array(items) => items,
+            lsp_types::CompletionResponse::List(list) => list.items,
+        };
+        Ok(items
+            .into_iter()
+            .map(|i| match i.detail {
+                Some(d) => format!("{} — {}", i.label, d),
+                None => i.label,
+            })
+            .collect())
+    }
+
     /// Blocks until the server's published diagnostics for `path` reach a
     /// version newer than `since` (i.e. fresh analysis arrived), the
     /// timeout elapses, or `cancel` is raised. Returns the current version
@@ -757,6 +857,23 @@ pub fn format_locations(
     out
 }
 
+/// Formats the `contents` of an LSP `Hover` response into plain text,
+/// collapsing the three possible shapes (markup, single marked string,
+/// or an array of marked strings) into readable lines.
+fn format_hover_contents(contents: &lsp_types::HoverContents) -> String {
+    fn marked(ms: &lsp_types::MarkedString) -> String {
+        match ms {
+            lsp_types::MarkedString::String(s) => s.clone(),
+            lsp_types::MarkedString::LanguageString(ls) => ls.value.clone(),
+        }
+    }
+    match contents {
+        lsp_types::HoverContents::Markup(m) => m.value.clone(),
+        lsp_types::HoverContents::Scalar(ms) => marked(ms),
+        lsp_types::HoverContents::Array(arr) => arr.iter().map(marked).collect::<Vec<_>>().join("\n"),
+    }
+}
+
 /// Builds the `initialize` params: minimal capabilities + pull-diagnostic
 /// support; workspace folders set to the root.
 fn build_initialize_params(root_uri: String) -> Result<serde_json::Value, String> {
@@ -956,6 +1073,44 @@ mod lsp_tests {
                                 }
                             }]),
                         ),
+                        "textDocument/hover" => Response::new_ok(
+                            req.id,
+                            serde_json::json!({
+                                "contents": {
+                                    "kind": "markdown",
+                                    "value": "```rust\nfn foo(x: i32) -> i32\n```\n\nReturns `x` unchanged."
+                                }
+                            }),
+                        ),
+                        "textDocument/references" => Response::new_ok(
+                            req.id,
+                            serde_json::json!([
+                                {
+                                    "uri": "file:///tmp/fake.rs",
+                                    "range": {
+                                        "start": {"line": 0, "character": 0},
+                                        "end": {"line": 0, "character": 3}
+                                    }
+                                },
+                                {
+                                    "uri": "file:///tmp/fake.rs",
+                                    "range": {
+                                        "start": {"line": 10, "character": 2},
+                                        "end": {"line": 10, "character": 5}
+                                    }
+                                }
+                            ]),
+                        ),
+                        "textDocument/completion" => Response::new_ok(
+                            req.id,
+                            serde_json::json!({
+                                "isIncomplete": false,
+                                "items": [
+                                    { "label": "println!", "detail": "macro_rules" },
+                                    { "label": "push" }
+                                ]
+                            }),
+                        ),
                         "shutdown" => Response::new_ok(req.id, serde_json::Value::Null),
                         _ => Response::new_err(req.id, -32601, "method not found".to_string()),
                     };
@@ -1091,6 +1246,67 @@ mod lsp_tests {
     }
 
     #[test]
+    fn hover_returns_rendered_text() {
+        let mut client = start_mock_client();
+        *client.shared.status.lock().unwrap() = LspStatus::Running;
+        let text = client
+            .hover(
+                Path::new("/tmp/fake.rs"),
+                0,
+                4,
+                Duration::from_secs(10),
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        assert!(
+            text.contains("fn foo(x: i32) -> i32"),
+            "got: {}",
+            text
+        );
+        assert!(text.contains("Returns `x` unchanged"));
+        client.shutdown();
+    }
+
+    #[test]
+    fn references_returns_locations() {
+        let mut client = start_mock_client();
+        *client.shared.status.lock().unwrap() = LspStatus::Running;
+        let locs = client
+            .references(
+                Path::new("/tmp/fake.rs"),
+                1,
+                4,
+                true,
+                Duration::from_secs(10),
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        assert_eq!(locs.len(), 2);
+        assert_eq!(locs[0].range.start.line, 0);
+        assert_eq!(locs[1].range.start.line, 10);
+        client.shutdown();
+    }
+
+    #[test]
+    fn completion_returns_labels_with_detail() {
+        let mut client = start_mock_client();
+        *client.shared.status.lock().unwrap() = LspStatus::Running;
+        let items = client
+            .completion(
+                Path::new("/tmp/fake.rs"),
+                1,
+                4,
+                Duration::from_secs(10),
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0], "println! — macro_rules");
+        assert_eq!(items[1], "push");
+        client.shutdown();
+    }
+
+    #[test]
     fn request_times_out_and_cancel_works() {
         let mut client = start_mock_client();
         *client.shared.status.lock().unwrap() = LspStatus::Running;
@@ -1167,19 +1383,18 @@ fn lsp_real_rust_analyzer() {
     // First load runs `cargo metadata` + indexes the crate graph — pull
     // requests answered during that window come back empty, so retry
     // until the real analysis shows up.
-    let mut diags = Vec::new();
     let deadline = std::time::Instant::now() + Duration::from_secs(90);
-    loop {
-        diags = client
+    let diags = loop {
+        let diags = client
             .pull_diagnostics(&main_rs, Duration::from_secs(30), &cancel)
             .unwrap();
         if diags.iter().any(|d| d.severity == Some(lsp_types::DiagnosticSeverity::ERROR))
             || std::time::Instant::now() > deadline
         {
-            break;
+            break diags;
         }
         std::thread::sleep(Duration::from_secs(2));
-    }
+    };
     assert!(
         diags.iter().any(|d| d.severity == Some(lsp_types::DiagnosticSeverity::ERROR)
             && d.message.contains("expected i32")),
@@ -1232,6 +1447,67 @@ fn lsp_real_rust_analyzer() {
         main_rs,
         "definition of main should be in main.rs"
     );
+
+    // lsp_hover: hover over `main` (the identifier at 0-based char 3 of
+    // `fn main() {`) → should show the fn signature. NB: hovering the
+    // `fn` keyword (char 0) yields keyword docs, not the signature.
+    let mut hover = String::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while hover.trim().is_empty() && std::time::Instant::now() < deadline {
+        match client.hover(&main_rs, 0, 4, Duration::from_secs(30), &cancel) {
+            Ok(h) => hover = h,
+            Err(e) if e.contains("cancelled") => {}
+            Err(e) => panic!("unexpected hover error: {}", e),
+        }
+        if hover.trim().is_empty() {
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    }
+    assert!(
+        hover.contains("fn main()"),
+        "expected hover to contain 'fn main()', got: {}",
+        hover
+    );
+
+    // lsp_references: `main` in this scratch project is referenced once
+    // (its own definition); rust-analyzer reports the declaration when
+    // includeDeclaration is set. Position on the identifier, not the
+    // `fn` keyword.
+    let mut refs = Vec::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while refs.is_empty() && std::time::Instant::now() < deadline {
+        match client.references(&main_rs, 0, 4, true, Duration::from_secs(30), &cancel) {
+            Ok(r) => refs = r,
+            Err(e) if e.contains("cancelled") => {}
+            Err(e) => panic!("unexpected references error: {}", e),
+        }
+        if refs.is_empty() {
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    }
+    assert!(!refs.is_empty(), "expected at least the declaration ref");
+
+    // lsp_completion: complete at the end of `let x: i32 = ` (after the
+    // fix, `42`) — asking for completions on an identifier position.
+    // Position: end of line 2 (`    let x: i32 = 42;` → after "42").
+    let line_text = "    let x: i32 = 42;";
+    let char_pos = line_text.len() as u32;
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let mut got_completion_reply = false;
+    while !got_completion_reply && std::time::Instant::now() < deadline {
+        match client.completion(&main_rs, 1, char_pos, Duration::from_secs(30), &cancel) {
+            Ok(_) => got_completion_reply = true,
+            Err(e) if e.contains("cancelled") => {}
+            Err(e) => panic!("unexpected completion error: {}", e),
+        }
+        if !got_completion_reply {
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    }
+    // Empty is acceptable in this edge position, but a real rust-analyzer
+    // normally offers something (keywords like `if`, method calls, …).
+    // Only assert the server answered; the hermetic mock covers content.
+    assert!(got_completion_reply, "expected a completion reply from rust-analyzer");
 
     client.shutdown();
     assert_eq!(client.status(), LspStatus::Stopped);

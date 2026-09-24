@@ -10,7 +10,7 @@ use ratatui::text::Line;
 use ratatui_textarea::TextArea;
 use serde::{Deserialize, Serialize};
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
@@ -1753,6 +1753,37 @@ impl App {
                 crate::lsp::LSP_REQUEST_TIMEOUT,
             ));
         }
+        if name == "lsp_hover" {
+            let args: serde_json::Value =
+                serde_json::from_str(args_json).unwrap_or(serde_json::json!({}));
+            return Some(self.lsp_hover(
+                args["path"].as_str(),
+                args["line"].as_u64(),
+                args["column"].as_u64(),
+                crate::lsp::LSP_REQUEST_TIMEOUT,
+            ));
+        }
+        if name == "lsp_references" {
+            let args: serde_json::Value =
+                serde_json::from_str(args_json).unwrap_or(serde_json::json!({}));
+            return Some(self.lsp_references(
+                args["path"].as_str(),
+                args["line"].as_u64(),
+                args["column"].as_u64(),
+                args["include_declaration"].as_bool(),
+                crate::lsp::LSP_REQUEST_TIMEOUT,
+            ));
+        }
+        if name == "lsp_completion" {
+            let args: serde_json::Value =
+                serde_json::from_str(args_json).unwrap_or(serde_json::json!({}));
+            return Some(self.lsp_completion(
+                args["path"].as_str(),
+                args["line"].as_u64(),
+                args["column"].as_u64(),
+                crate::lsp::LSP_REQUEST_TIMEOUT,
+            ));
+        }
         None
     }
 
@@ -1839,6 +1870,225 @@ impl App {
             column,
             formatted.trim_end()
         )
+    }
+
+    /// Shared arg validation for the position-based LSP tools
+    /// (`lsp_hover`, `lsp_references`, `lsp_completion`): all need a
+    /// `path` plus 1-based `line`/`column`. Returns `Ok((path, line,
+    /// column))` or an error string describing the missing/invalid arg.
+    fn lsp_position_args(
+        &self,
+        tool: &str,
+        path: Option<&str>,
+        line: Option<u64>,
+        column: Option<u64>,
+    ) -> Result<(PathBuf, u64, u64), String> {
+        let Some(path) = path else {
+            return Err(format!(
+                "{}: `path` is required (the file to search in) and \
+                `line`/`column` (1-based) must point at the symbol.",
+                tool
+            ));
+        };
+        let Some(line) = line else {
+            return Err(format!("{}: `line` (1-based) is required.", tool));
+        };
+        let Some(column) = column else {
+            return Err(format!("{}: `column` (1-based) is required.", tool));
+        };
+        if line == 0 || column == 0 {
+            return Err(format!("{}: `line` and `column` are 1-based (>= 1).", tool));
+        }
+        Ok((PathBuf::from(path), line, column))
+    }
+
+    /// Shared preflight for the position-based LSP tools: checks the
+    /// server status and syncs the file. On success returns `()`;
+    /// on failure returns a ready-to-return error string.
+    fn lsp_position_preflight(
+        &self,
+        tool: &str,
+        path: &Path,
+    ) -> Result<(), String> {
+        use crate::lsp::LspStatus;
+        match self.lsp.status() {
+            LspStatus::Running => {}
+            LspStatus::Stopped => {
+                return Err(format!(
+                    "{}: server not running. Enable it with `lsp = on` in \
+                    rustama.conf (or /workspace <dir>) — requires rust-analyzer.",
+                    tool
+                ));
+            }
+            LspStatus::Failed(e) => return Err(format!("{}: server failed: {}", tool, e)),
+            LspStatus::Starting => {} // rare; request below waits for analysis
+        }
+        if let Err(e) = self.lsp.sync_file(path) {
+            return Err(format!("{}: cannot sync {}: {}", tool, path.display(), e));
+        }
+        Ok(())
+    }
+
+    /// Core of the `lsp_hover` tool: sync the file, fetch hover info for
+    /// the symbol at (line, column), return the rendered text.
+    fn lsp_hover(
+        &mut self,
+        path: Option<&str>,
+        line: Option<u64>,
+        column: Option<u64>,
+        timeout: std::time::Duration,
+    ) -> String {
+        let (path, line, column) = match self.lsp_position_args("lsp_hover", path, line, column)
+        {
+            Ok(t) => t,
+            Err(e) => return e,
+        };
+        if let Err(e) = self.lsp_position_preflight("lsp_hover", &path) {
+            return e;
+        }
+        let cancel = AtomicBool::new(false);
+        let text = match self.lsp.hover(
+            &path,
+            (line - 1) as u32,
+            (column - 1) as u32,
+            timeout,
+            &cancel,
+        ) {
+            Ok(t) => t,
+            Err(e) if e.contains("cancelled") => {
+                return format!(
+                    "lsp_hover: {} not analyzed yet (server busy re-analyzing — try again)",
+                    path.display()
+                );
+            }
+            Err(e) => return format!("lsp_hover: request failed: {}", e),
+        };
+        if text.trim().is_empty() {
+            format!(
+                "lsp_hover: no hover information for {}:{}:{}",
+                path.display(),
+                line,
+                column
+            )
+        } else {
+            format!(
+                "Hover for {}:{}:{}:\n{}",
+                path.display(),
+                line,
+                column,
+                text.trim_end()
+            )
+        }
+    }
+
+    /// Core of the `lsp_references` tool: sync the file, find all
+    /// references to the symbol at (line, column), format the locations.
+    fn lsp_references(
+        &mut self,
+        path: Option<&str>,
+        line: Option<u64>,
+        column: Option<u64>,
+        include_declaration: Option<bool>,
+        timeout: std::time::Duration,
+    ) -> String {
+        let (path, line, column) =
+            match self.lsp_position_args("lsp_references", path, line, column) {
+                Ok(t) => t,
+                Err(e) => return e,
+            };
+        if let Err(e) = self.lsp_position_preflight("lsp_references", &path) {
+            return e;
+        }
+        let cancel = AtomicBool::new(false);
+        let locs = match self.lsp.references(
+            &path,
+            (line - 1) as u32,
+            (column - 1) as u32,
+            include_declaration.unwrap_or(true),
+            timeout,
+            &cancel,
+        ) {
+            Ok(l) => l,
+            Err(e) if e.contains("cancelled") => {
+                return format!(
+                    "lsp_references: {} not analyzed yet (server busy re-analyzing — try again)",
+                    path.display()
+                );
+            }
+            Err(e) => return format!("lsp_references: request failed: {}", e),
+        };
+        if locs.is_empty() {
+            return format!(
+                "lsp_references: no references found for {}:{}:{}",
+                path.display(),
+                line,
+                column
+            );
+        }
+        let root = self.lsp.root().to_path_buf();
+        let formatted = crate::lsp::format_locations(&locs, &root);
+        format!(
+            "References to {}:{}:{} ({}):\n{}",
+            path.display(),
+            line,
+            column,
+            locs.len(),
+            formatted.trim_end()
+        )
+    }
+
+    /// Core of the `lsp_completion` tool: sync the file, request
+    /// completions at (line, column), return the list.
+    fn lsp_completion(
+        &mut self,
+        path: Option<&str>,
+        line: Option<u64>,
+        column: Option<u64>,
+        timeout: std::time::Duration,
+    ) -> String {
+        let (path, line, column) = match self.lsp_position_args("lsp_completion", path, line, column)
+        {
+            Ok(t) => t,
+            Err(e) => return e,
+        };
+        if let Err(e) = self.lsp_position_preflight("lsp_completion", &path) {
+            return e;
+        }
+        let cancel = AtomicBool::new(false);
+        let items = match self.lsp.completion(
+            &path,
+            (line - 1) as u32,
+            (column - 1) as u32,
+            timeout,
+            &cancel,
+        ) {
+            Ok(items) => items,
+            Err(e) if e.contains("cancelled") => {
+                return format!(
+                    "lsp_completion: {} not analyzed yet (server busy re-analyzing — try again)",
+                    path.display()
+                );
+            }
+            Err(e) => return format!("lsp_completion: request failed: {}", e),
+        };
+        if items.is_empty() {
+            return format!(
+                "lsp_completion: no completions for {}:{}:{}",
+                path.display(),
+                line,
+                column
+            );
+        }
+        let mut out = format!(
+            "Completions at {}:{}:{}:\n",
+            path.display(),
+            line,
+            column
+        );
+        for item in items {
+            out.push_str(&format!("- {}\n", item));
+        }
+        out.trim_end().to_string()
     }
 
     /// Core of the `lsp_diagnostics` tool: sync the file into the server,
@@ -2001,11 +2251,21 @@ impl App {
     }
 
     pub fn scroll_up(&mut self) {
+        // Mouse wheel over the file dialog drives the selection bar (mc
+        // panel convention); the viewport follows via adjust_scroll.
+        if self.show_file_dialog {
+            self.file_dialog_select_prev();
+            return;
+        }
         self.auto_scroll = false;
         self.scroll_offset = self.scroll_offset.saturating_sub(1);
     }
 
     pub fn scroll_down(&mut self) {
+        if self.show_file_dialog {
+            self.file_dialog_select_next();
+            return;
+        }
         self.scroll_offset = self.scroll_offset.saturating_add(1);
     }
 
@@ -4238,6 +4498,26 @@ impl App {
         self.show_file_dialog = false;
     }
 
+    /// Moves the file-dialog selection up one entry (clamped at the top)
+    /// and keeps it in view. Shared by the Up key and the mouse wheel.
+    fn file_dialog_select_prev(&mut self) {
+        if !self.file_dialog_entries.is_empty() {
+            self.file_dialog_selection = self.file_dialog_selection.saturating_sub(1);
+            self.adjust_scroll();
+        }
+    }
+
+    /// Moves the file-dialog selection down one entry (clamped at the
+    /// bottom) and keeps it in view. Shared by the Down key and the
+    /// mouse wheel.
+    fn file_dialog_select_next(&mut self) {
+        let max = self.file_dialog_entries.len();
+        if max > 0 && self.file_dialog_selection < max - 1 {
+            self.file_dialog_selection += 1;
+            self.adjust_scroll();
+        }
+    }
+
     fn handle_file_dialog_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Esc => {
@@ -4261,20 +4541,13 @@ impl App {
                 }
             }
             KeyCode::Up => {
-                if self.file_dialog_focus == FileDialogFocus::List
-                    && !self.file_dialog_entries.is_empty()
-                {
-                    self.file_dialog_selection = self.file_dialog_selection.saturating_sub(1);
-                    self.adjust_scroll();
+                if self.file_dialog_focus == FileDialogFocus::List {
+                    self.file_dialog_select_prev();
                 }
             }
             KeyCode::Down => {
                 if self.file_dialog_focus == FileDialogFocus::List {
-                    let max = self.file_dialog_entries.len();
-                    if max > 0 && self.file_dialog_selection < max - 1 {
-                        self.file_dialog_selection += 1;
-                        self.adjust_scroll();
-                    }
+                    self.file_dialog_select_next();
                 }
             }
             KeyCode::Enter => match self.file_dialog_focus {
@@ -4305,7 +4578,7 @@ impl App {
     }
 
     fn adjust_scroll(&mut self) {
-        let visible = 12;
+        let visible = crate::ui::FILE_LIST_MAX_VISIBLE;
         if self.file_dialog_selection < self.file_dialog_scroll {
             self.file_dialog_scroll = self.file_dialog_selection;
         }
@@ -4819,11 +5092,11 @@ impl App {
 
     fn slash_tools(&self) -> String {
         let tools = get_tool_definitions();
-        let mut out = format!("Agentic tools ({}):\n", tools.len());
+        let mut out = format!("Agentic tools ({}):\n\n", tools.len());
         for t in &tools {
             let name = t["function"]["name"].as_str().unwrap_or("?");
             let desc = t["function"]["description"].as_str().unwrap_or("");
-            out.push_str(&format!("  {:<16} {}\n", name, desc));
+            out.push_str(&format!("{}\n{}\n\n", name, desc));
         }
         out
     }
@@ -5971,6 +6244,85 @@ fn get_tool_definitions() -> Vec<serde_json::Value> {
                 }
             }
         }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "lsp_hover",
+                "description": "Fetch hover documentation for the symbol at a given position in a Rust file via the LSP server (rust-analyzer). Returns the type signature and doc comment as plain text. Use to understand what a symbol does. Requires the LSP server to be running (lsp = on in config, or /workspace <dir>).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "The .rs file containing the symbol (absolute path)."
+                        },
+                        "line": {
+                            "type": "integer",
+                            "description": "1-based line number of the symbol."
+                        },
+                        "column": {
+                            "type": "integer",
+                            "description": "1-based column number of the symbol."
+                        }
+                    },
+                    "required": ["path", "line", "column"]
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "lsp_references",
+                "description": "Find all references to the symbol at a given position in a Rust file via the LSP server (rust-analyzer). Returns each reference's file, line, column, and a source excerpt. Use to find where a symbol is used across the codebase. Requires the LSP server to be running (lsp = on in config, or /workspace <dir>).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "The .rs file containing the symbol (absolute path)."
+                        },
+                        "line": {
+                            "type": "integer",
+                            "description": "1-based line number of the symbol."
+                        },
+                        "column": {
+                            "type": "integer",
+                            "description": "1-based column number of the symbol."
+                        },
+                        "include_declaration": {
+                            "type": "boolean",
+                            "description": "Whether to include the declaration site itself in the results. Default: true."
+                        }
+                    },
+                    "required": ["path", "line", "column"]
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "lsp_completion",
+                "description": "Request code completions at a given position in a Rust file via the LSP server (rust-analyzer). Returns a list of candidate labels (with optional type detail). Use to discover available members, methods, and identifiers at a cursor position. Requires the LSP server to be running (lsp = on in config, or /workspace <dir>).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "The .rs file to complete in (absolute path)."
+                        },
+                        "line": {
+                            "type": "integer",
+                            "description": "1-based line number of the cursor position."
+                        },
+                        "column": {
+                            "type": "integer",
+                            "description": "1-based column number of the cursor position."
+                        }
+                    },
+                    "required": ["path", "line", "column"]
+                }
+            }
+        }),
     ]
 }
 
@@ -6559,27 +6911,12 @@ fn execute_tool_call(name: &str, args_json: &str, proxy: &Option<String>) -> Str
             }
         }
         _ => {
-            let tools: Vec<&str> = vec![
-                "read_file",
-                "write_file",
-                "edit_file",
-                "bash",
-                "list_files",
-                "search_files",
-                "search_content",
-                "fetch_url",
-                "web_search",
-                "terminal_open",
-                "terminal_send",
-                "terminal_read",
-                "terminal_close",
-                "lsp_diagnostics",
-                "go_to_definition",
-            ];
+            // Single source of truth: the unknown-tool error lists the
+            // same names the parser/dispatcher accept.
             format!(
                 "Unknown tool: '{}'. Available tools: {}",
                 name,
-                tools.join(", ")
+                TOOL_NAMES.join(", ")
             )
         }
     }
@@ -6622,6 +6959,9 @@ const TOOL_NAMES: &[&str] = &[
     "terminal_close",
     "lsp_diagnostics",
     "go_to_definition",
+    "lsp_hover",
+    "lsp_references",
+    "lsp_completion",
 ];
 
 fn parse_text_tool_calls(text: &str) -> Vec<serde_json::Value> {
@@ -8408,6 +8748,53 @@ mod lsp_tool_tests {
     }
 
     #[test]
+    fn tool_schema_and_names_include_hover_references_completion() {
+        let defs = get_tool_definitions();
+        let names: Vec<&str> = defs
+            .iter()
+            .filter_map(|t| t["function"]["name"].as_str())
+            .collect();
+        for tool in ["lsp_hover", "lsp_references", "lsp_completion"] {
+            assert!(names.contains(&tool), "schema missing {}", tool);
+            assert!(TOOL_NAMES.contains(&tool), "TOOL_NAMES missing {}", tool);
+            let def = defs
+                .iter()
+                .find(|t| t["function"]["name"].as_str() == Some(tool))
+                .unwrap();
+            assert_eq!(
+                def["function"]["parameters"]["required"],
+                serde_json::json!(["path", "line", "column"])
+            );
+        }
+    }
+
+    #[test]
+    fn lsp_stretch_tools_report_stopped_server() {
+        let mut app = test_app();
+        let base = r#"{"path": "/tmp/x.rs", "line": 3, "column": 5}"#;
+        for tool in ["lsp_hover", "lsp_references", "lsp_completion"] {
+            let out = app.execute_tool(tool, base);
+            assert!(out.contains("not running"), "{}: got: {}", tool, out);
+        }
+    }
+
+    #[test]
+    fn lsp_stretch_tools_validate_args() {
+        let mut app = test_app();
+        for tool in ["lsp_hover", "lsp_references", "lsp_completion"] {
+            // Missing path.
+            let out = app.execute_tool(tool, r#"{"line": 3, "column": 5}"#);
+            assert!(out.contains("is required"), "{}: got: {}", tool, out);
+            // Missing column.
+            let out = app.execute_tool(tool, r#"{"path": "/tmp/x.rs", "line": 3}"#);
+            assert!(out.contains("column"), "{}: got: {}", tool, out);
+            // Zero-based rejected.
+            let out = app.execute_tool(tool, r#"{"path": "/tmp/x.rs", "line": 0, "column": 5}"#);
+            assert!(out.contains("1-based"), "{}: got: {}", tool, out);
+        }
+    }
+
+    #[test]
     fn goto_definition_tool_reports_stopped_server() {
         let mut app = test_app();
         let out = app.execute_tool(
@@ -8477,6 +8864,26 @@ mod lsp_tool_tests {
     }
 
     #[test]
+    fn tools_command_formats_name_paragraph_blank_line() {
+        let app = test_app();
+        let out = app.slash_tools();
+        // Header announces the count.
+        assert!(out.starts_with("Agentic tools (18):"), "got: {}", out);
+        // Every tool: `name\ndescription\n\n` blocks separated by one
+        // blank line.
+        for t in get_tool_definitions() {
+            let name = t["function"]["name"].as_str().unwrap();
+            let desc = t["function"]["description"].as_str().unwrap();
+            assert!(
+                out.contains(&format!("{}\n{}\n\n", name, desc)),
+                "missing block for {}: got: {}",
+                name,
+                out
+            );
+        }
+    }
+
+    #[test]
     fn workspace_command_reports_and_validates() {
         let mut app = test_app();
         let out = app.slash_workspace(None);
@@ -8507,5 +8914,81 @@ mod lsp_tool_tests {
             resolve_lsp_workspace("  ", "output.md"),
             std::env::current_dir().unwrap()
         );
+    }
+}
+
+#[cfg(test)]
+mod file_dialog_tests {
+    use super::*;
+
+    fn test_app() -> App {
+        let cfg = crate::config::Config {
+            logging: false,
+            logfile: std::env::temp_dir()
+                .join(format!("rustama-test-{}.log", std::process::id()))
+                .to_string_lossy()
+                .to_string(),
+            ..crate::config::Config::default()
+        };
+        App::new(cfg)
+    }
+
+    /// App with the file dialog open over `n` plain file entries.
+    fn app_with_entries(n: usize) -> App {
+        let mut app = test_app();
+        app.show_file_dialog = true;
+        app.file_dialog_entries = (0..n).map(|i| (format!("file{i}.txt"), false)).collect();
+        app
+    }
+
+    #[test]
+    fn mouse_wheel_drives_selection_and_viewport() {
+        let mut app = app_with_entries(30);
+        // 15 wheel-downs -> selection 15; the viewport snaps so the
+        // selection stays visible: scroll = 15 - 12 + 1 = 4.
+        for _ in 0..15 {
+            app.scroll_down();
+        }
+        assert_eq!(app.file_dialog_selection, 15);
+        assert_eq!(app.file_dialog_scroll, 4);
+        // 3 wheel-ups -> selection 12, still inside 4..16 -> scroll unchanged.
+        for _ in 0..3 {
+            app.scroll_up();
+        }
+        assert_eq!(app.file_dialog_selection, 12);
+        assert_eq!(app.file_dialog_scroll, 4);
+    }
+
+    #[test]
+    fn mouse_wheel_clamps_at_list_ends() {
+        let mut app = app_with_entries(5);
+        for _ in 0..10 {
+            app.scroll_up();
+        }
+        assert_eq!(app.file_dialog_selection, 0, "clamped at top");
+        for _ in 0..10 {
+            app.scroll_down();
+        }
+        assert_eq!(app.file_dialog_selection, 4, "clamped at bottom");
+    }
+
+    #[test]
+    fn mouse_wheel_ignored_when_dialog_closed() {
+        let mut app = app_with_entries(5);
+        app.show_file_dialog = false;
+        app.scroll_down();
+        assert_eq!(
+            app.file_dialog_selection, 0,
+            "wheel must not touch a closed dialog"
+        );
+    }
+
+    #[test]
+    fn mouse_wheel_empty_list_is_noop() {
+        let mut app = app_with_entries(0);
+        app.scroll_down();
+        app.scroll_up();
+        assert_eq!(app.file_dialog_selection, 0);
+        assert_eq!(app.file_dialog_scroll, 0);
     }
 }

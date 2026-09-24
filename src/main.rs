@@ -237,6 +237,49 @@ fn ui(f: &mut Frame, app: &mut App) {
     }
 }
 
+/// Style for one line of a tool result in the chat output.
+///
+/// **Per-tool dispatch**: only `edit_file` embeds a unified diff as its
+/// result, so only there do `+`/`-`/`@@` lines get diff colors — the old
+/// global heuristic mis-colored other tools' output (a `read_file` of
+/// Rust code with `+ Add` lines, Python `@decorator`s, `lsp_diagnostics`
+/// hits, …). Every other tool renders plain dim lines for now; add a
+/// new arm here (with its own `*_result_line_style` helper) when a
+/// tool needs its own result markup.
+fn tool_result_line_style(tool: &str, line: &str) -> Style {
+    match tool {
+        "edit_file" => edit_file_result_line_style(line),
+        _ => Style::default().fg(Color::DarkGray),
+    }
+}
+
+/// Diff coloring for `edit_file` results: `+` added lines green,
+/// `-` removed lines red, `@@` hunk headers cyan; `---`/`+++` file
+/// headers and context lines stay dim.
+fn edit_file_result_line_style(line: &str) -> Style {
+    if line.starts_with('+') && !line.starts_with("+++") {
+        Style::default().fg(Color::Green)
+    } else if line.starts_with('-') && !line.starts_with("---") {
+        Style::default().fg(Color::Red)
+    } else if line.starts_with('@') {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    }
+}
+
+/// Whether a tool's result renders in full — bypassing the 500-byte
+/// preview and the 20-line cap. `edit_file` results are unified diffs:
+/// the whole change must stay visible (no shortening), so it renders
+/// untruncated. Other tools keep the compact preview; add arms here
+/// when a tool needs its full output shown.
+fn tool_result_renders_full(name: &str) -> bool {
+    match name {
+        "edit_file" => true,
+        _ => false,
+    }
+}
+
 fn render_output(f: &mut Frame, app: &mut App, area: Rect) {
     let streaming_len = if app.is_loading {
         app.streaming_text.len()
@@ -259,6 +302,12 @@ fn render_output(f: &mut Frame, app: &mut App, area: Rect) {
     if history_changed {
         let mut hist: Vec<Line<'static>> = Vec::new();
         let mut tool_call_num: usize = 0;
+        // tool_call_id → "#N TOOL CALL" number, so results pair with
+        // their call even when a round pushes results out of order.
+        let mut call_numbers: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        // Positional fallback for id-less results (text-parsed calls).
+        let mut result_num: usize = 0;
 
         for msg in &app.messages {
             match msg {
@@ -339,9 +388,14 @@ fn render_output(f: &mut Frame, app: &mut App, area: Rect) {
                     hist.push(Line::from(""));
                 }
                 ChatMessage::ToolCall {
-                    name, arguments, ..
+                    name,
+                    arguments,
+                    tool_call_id,
                 } => {
                     tool_call_num += 1;
+                    if let Some(id) = tool_call_id {
+                        call_numbers.insert(id.clone(), tool_call_num);
+                    }
                     hist.push(Line::from(vec![
                         Span::styled(
                             " \u{2699} ",
@@ -368,7 +422,25 @@ fn render_output(f: &mut Frame, app: &mut App, area: Rect) {
                     }
                     hist.push(Line::from(""));
                 }
-                ChatMessage::ToolResult { name, content, .. } => {
+                ChatMessage::ToolResult {
+                    name,
+                    content,
+                    tool_call_id,
+                } => {
+                    // Pair the result with its tool call's #id: match by
+                    // tool_call_id when present (results may arrive out
+                    // of order in a multi-call round); fall back to the
+                    // result's position for id-less calls.
+                    let num = match tool_call_id
+                        .as_ref()
+                        .and_then(|id| call_numbers.get(id.as_str()).copied())
+                    {
+                        Some(n) => n,
+                        None => {
+                            result_num += 1;
+                            result_num
+                        }
+                    };
                     hist.push(Line::from(vec![
                         Span::styled(
                             " \u{2714} ",
@@ -377,44 +449,41 @@ fn render_output(f: &mut Frame, app: &mut App, area: Rect) {
                                 .add_modifier(Modifier::BOLD),
                         ),
                         Span::styled(
-                            format!("RESULT: {}", name),
+                            format!("#{} RESULT: {}", num, name),
                             Style::default()
                                 .fg(Color::Green)
                                 .add_modifier(Modifier::BOLD),
                         ),
                     ]));
-                    let preview = if content.len() > 500 {
+                    // edit_file results (diffs) render in full — no
+                    // byte/line shortening; other tools keep the
+                    // compact preview.
+                    let full = tool_result_renders_full(name);
+                    let preview = if full || content.len() <= 500 {
+                        content.to_string()
+                    } else {
                         format!(
                             "{}... ({} bytes total)",
                             crate::app::safe_prefix(content, 500),
                             content.len()
                         )
-                    } else {
-                        content.to_string()
                     };
-                    for result_line in preview.lines().take(20) {
-                        // Unified-diff lines (edit_file results) get
-                        // diff colors: + green, - red, @@ headers cyan;
-                        // --- / +++ file headers stay dim like context.
-                        let style = if result_line.starts_with('+')
-                            && !result_line.starts_with("+++")
-                        {
-                            Style::default().fg(Color::Green)
-                        } else if result_line.starts_with('-')
-                            && !result_line.starts_with("---")
-                        {
-                            Style::default().fg(Color::Red)
-                        } else if result_line.starts_with('@') {
-                            Style::default().fg(Color::Cyan)
-                        } else {
-                            Style::default().fg(Color::DarkGray)
-                        };
+                    let max_lines = if full {
+                        usize::MAX
+                    } else {
+                        20
+                    };
+                    for result_line in preview.lines().take(max_lines) {
+                        // Per-tool result styling: diff colors only in
+                        // edit_file's embedded unified diff; other tools
+                        // render plain dim lines.
+                        let style = tool_result_line_style(name, result_line);
                         hist.push(Line::from(Span::styled(
                             format!("    {}", result_line),
                             style,
                         )));
                     }
-                    if content.lines().count() > 20 {
+                    if !full && content.lines().count() > 20 {
                         hist.push(Line::from(Span::styled(
                             format!("    ... ({} more lines)", content.lines().count() - 20),
                             Style::default().fg(Color::DarkGray),
@@ -927,7 +996,7 @@ fn render_model_dialog(f: &mut Frame, app: &App, area: Rect) {
         let loading = Paragraph::new(Line::from(Span::styled(
             "  Loading models...",
             Style::default()
-                .fg(Color::Yellow)
+                .fg(app.theme.dialog_title_fg)
                 .add_modifier(Modifier::SLOW_BLINK),
         )));
         f.render_widget(loading, inner);
@@ -966,15 +1035,15 @@ fn render_model_dialog(f: &mut Frame, app: &App, area: Rect) {
 
             let name_style = if is_current {
                 Style::default()
-                    .fg(Color::Green)
+                    .fg(app.theme.dialog_title_fg)
                     .add_modifier(Modifier::BOLD)
             } else if is_selected {
                 Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::White)
+                    .fg(app.theme.list_selected_fg)
+                    .bg(app.theme.list_selected_bg)
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::White)
+                Style::default().fg(app.theme.dialog_fg)
             };
 
             let display_name = if name.len() > 46 {
@@ -989,7 +1058,7 @@ fn render_model_dialog(f: &mut Frame, app: &App, area: Rect) {
                 spans.push(Span::styled(
                     " (current)",
                     Style::default()
-                        .fg(Color::Green)
+                        .fg(app.theme.dialog_title_fg)
                         .add_modifier(Modifier::ITALIC),
                 ));
             }
@@ -1007,16 +1076,16 @@ fn render_model_dialog(f: &mut Frame, app: &App, area: Rect) {
         inner.x + 10,
         btn_y,
         app.model_dialog_focus == ModelDialogFocus::Confirm,
-        Color::Green,
-        Color::Green,
+        app.theme.dialog_fg,
+        app.theme.dialog_focus_bg,
     );
     let cancel_btn = Button::new(
         "Cancel",
         inner.x + 24,
         btn_y,
         app.model_dialog_focus == ModelDialogFocus::Cancel,
-        Color::Red,
-        Color::Red,
+        app.theme.dialog_fg,
+        app.theme.dialog_focus_bg,
     );
 
     let (confirm_text, confirm_style) = confirm_btn.render();
@@ -1109,7 +1178,7 @@ fn render_load_dialog(f: &mut Frame, app: &App, area: Rect) {
 
     let label = Paragraph::new(Line::from(Span::styled(
         "  Session file path:",
-        Style::default().fg(Color::White),
+        Style::default().fg(app.theme.dialog_fg),
     )));
     let label_area = Rect {
         x: inner.x,
@@ -1121,7 +1190,9 @@ fn render_load_dialog(f: &mut Frame, app: &App, area: Rect) {
 
     let path_line = Paragraph::new(Line::from(Span::styled(
         format!("  {}", app.load_dialog_path),
-        Style::default().fg(Color::White).bg(Color::Rgb(40, 40, 40)),
+        Style::default()
+            .fg(app.theme.dialog_fg)
+            .bg(app.theme.dialog_focus_bg),
     )));
     let path_area = Rect {
         x: inner.x,
@@ -1140,10 +1211,17 @@ fn render_load_dialog(f: &mut Frame, app: &App, area: Rect) {
         inner.x + 10,
         btn_y,
         true,
-        Color::Green,
-        Color::Green,
+        app.theme.dialog_fg,
+        app.theme.dialog_focus_bg,
     );
-    let cancel_btn = Button::new("Cancel", inner.x + 22, btn_y, true, Color::Red, Color::Red);
+    let cancel_btn = Button::new(
+        "Cancel",
+        inner.x + 22,
+        btn_y,
+        true,
+        app.theme.dialog_fg,
+        app.theme.dialog_focus_bg,
+    );
 
     let (load_text, load_style) = load_btn.render();
     let (cancel_text, cancel_style) = cancel_btn.render();
@@ -1201,9 +1279,11 @@ fn render_settings_dialog(f: &mut Frame, app: &App, area: Rect) {
         let field_y = inner.y + i as u16 * 2;
 
         let label_style = if *focus == app.settings_focus {
-            Style::default().fg(Color::Yellow)
+            Style::default()
+                .fg(app.theme.dialog_fg)
+                .bg(app.theme.dialog_focus_bg)
         } else {
-            Style::default().fg(Color::White)
+            Style::default().fg(app.theme.dialog_fg)
         };
 
         let label_para = Paragraph::new(Line::from(Span::styled(
@@ -1222,9 +1302,13 @@ fn render_settings_dialog(f: &mut Frame, app: &App, area: Rect) {
             let checked = app.settings_justify;
             let toggle_text = if checked { "[X]" } else { "[ ]" };
             let toggle_style = if *focus == app.settings_focus {
-                Style::default().fg(Color::Black).bg(Color::White)
+                Style::default()
+                    .fg(app.theme.dialog_fg)
+                    .bg(app.theme.dialog_focus_bg)
             } else {
-                Style::default().fg(Color::White).bg(Color::Rgb(40, 40, 40))
+                Style::default()
+                    .fg(app.theme.dialog_input_fg)
+                    .bg(app.theme.dialog_focus_bg)
             };
             let toggle_para = Paragraph::new(Line::from(Span::styled(
                 format!(" {:<5} ", toggle_text),
@@ -1255,9 +1339,13 @@ fn render_settings_dialog(f: &mut Frame, app: &App, area: Rect) {
             };
 
             let value_style = if *focus == app.settings_focus {
-                Style::default().fg(Color::Black).bg(Color::White)
+                Style::default()
+                    .fg(app.theme.dialog_fg)
+                    .bg(app.theme.dialog_focus_bg)
             } else {
-                Style::default().fg(Color::White).bg(Color::Rgb(40, 40, 40))
+                Style::default()
+                    .fg(app.theme.dialog_input_fg)
+                    .bg(app.theme.dialog_focus_bg)
             };
 
             let max_w = inner.width.saturating_sub(16);
@@ -1305,16 +1393,16 @@ fn render_settings_dialog(f: &mut Frame, app: &App, area: Rect) {
         btn_start_x,
         btn_y,
         app.settings_focus == SettingsFocus::Save,
-        Color::Green,
-        Color::Green,
+        app.theme.dialog_fg,
+        app.theme.dialog_focus_bg,
     );
     let cancel_btn = Button::new(
         cancel_label,
         btn_start_x + save_w + gap,
         btn_y,
         app.settings_focus == SettingsFocus::Cancel,
-        Color::Red,
-        Color::Red,
+        app.theme.dialog_fg,
+        app.theme.dialog_focus_bg,
     );
 
     let (save_text, save_style) = save_btn.render();
@@ -1937,5 +2025,260 @@ mod throbber_tests {
             std::thread::sleep(std::time::Duration::from_millis(120));
             assert_ne!(a, throbber(&app), "spinner must rotate");
         }
+    }
+}
+
+#[cfg(test)]
+mod tool_result_tests {
+    use super::tool_result_line_style;
+    use ratatui::style::Color;
+
+    #[test]
+    fn edit_file_diff_lines_colored() {
+        assert_eq!(
+            tool_result_line_style("edit_file", "+ added line").fg,
+            Some(Color::Green)
+        );
+        assert_eq!(
+            tool_result_line_style("edit_file", "- removed line").fg,
+            Some(Color::Red)
+        );
+        assert_eq!(
+            tool_result_line_style("edit_file", "@@ -1,3 +1,4 @@").fg,
+            Some(Color::Cyan)
+        );
+        // Context lines stay dim.
+        assert_eq!(
+            tool_result_line_style("edit_file", "  context line").fg,
+            Some(Color::DarkGray)
+        );
+        // --- / +++ file headers are not content changes — stay dim.
+        assert_eq!(
+            tool_result_line_style("edit_file", "--- a/src/app.rs").fg,
+            Some(Color::DarkGray)
+        );
+        assert_eq!(
+            tool_result_line_style("edit_file", "+++ b/src/app.rs").fg,
+            Some(Color::DarkGray)
+        );
+        // The "Successfully edited" banner and auto-appended
+        // diagnostics lines render dim like context.
+        assert_eq!(
+            tool_result_line_style("edit_file", "Successfully edited src/x.rs").fg,
+            Some(Color::DarkGray)
+        );
+        assert_eq!(
+            tool_result_line_style("edit_file", "src/x.rs:3:9: [error] boom").fg,
+            Some(Color::DarkGray)
+        );
+    }
+
+    #[test]
+    fn other_tools_stay_plain() {
+        // Content that merely looks diff-ish in other tools' results
+        // must NOT get diff colors.
+        for tool in [
+            "read_file",
+            "bash",
+            "lsp_diagnostics",
+            "search_content",
+            "web_search",
+            "write_file",
+            "unknown_tool",
+        ] {
+            assert_eq!(
+                tool_result_line_style(tool, "+ Add trait impl").fg,
+                Some(Color::DarkGray),
+                "{}: + line mis-colored",
+                tool
+            );
+            assert_eq!(
+                tool_result_line_style(tool, "- operand").fg,
+                Some(Color::DarkGray),
+                "{}: - line mis-colored",
+                tool
+            );
+            assert_eq!(
+                tool_result_line_style(tool, "@decorator").fg,
+                Some(Color::DarkGray),
+                "{}: @ line mis-colored",
+                tool
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tool_result_full_tests {
+    use super::{render_output, tool_result_renders_full};
+    use crate::app::{App, ChatMessage};
+    use crate::config::Config;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    fn test_app() -> App {
+        App::new(Config {
+            logging: false,
+            logfile: std::env::temp_dir()
+                .join(format!("rustama-test-{}.log", std::process::id()))
+                .to_string_lossy()
+                .to_string(),
+            ..Config::default()
+        })
+    }
+
+    /// Renders `messages` into a TestBackend and returns the joined view.
+    fn render_view(messages: Vec<ChatMessage>) -> String {
+        let mut app = test_app();
+        app.messages = messages;
+        let backend = TestBackend::new(120, 60);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                render_output(f, &mut app, area);
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        (0..buf.area.height)
+            .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// A 30-line diff-ish content (short lines, under the 500-byte
+    /// preview cap, over the 20-line cap).
+    fn long_diff() -> String {
+        (0..30)
+            .map(|i| format!("+ added line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn edit_file_renders_in_full() {
+        assert!(tool_result_renders_full("edit_file"));
+        let view = render_view(vec![ChatMessage::ToolResult {
+            name: "edit_file".to_string(),
+            content: long_diff(),
+            tool_call_id: None,
+        }]);
+        // Every diff line is visible — including the last one…
+        assert!(view.contains("+ added line 29"), "diff truncated:\n{}", view);
+        // …and there is no "more lines" shortening note.
+        assert!(!view.contains("more lines"), "unexpected truncation note:\n{}", view);
+    }
+
+    #[test]
+    fn other_tools_keep_the_compact_preview() {
+        assert!(!tool_result_renders_full("read_file"));
+        let view = render_view(vec![ChatMessage::ToolResult {
+            name: "read_file".to_string(),
+            content: long_diff(),
+            tool_call_id: None,
+        }]);
+        // First 20 lines visible, the tail cut with the note.
+        assert!(view.contains("+ added line 19"), "first lines missing:\n{}", view);
+        assert!(!view.contains("+ added line 29"), "result not truncated:\n{}", view);
+        assert!(view.contains("more lines"), "truncation note missing:\n{}", view);
+    }
+}
+
+#[cfg(test)]
+mod tool_call_id_tests {
+    use super::render_output;
+    use crate::app::{App, ChatMessage};
+    use crate::config::Config;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    fn test_app() -> App {
+        App::new(Config {
+            logging: false,
+            logfile: std::env::temp_dir()
+                .join(format!("rustama-test-{}.log", std::process::id()))
+                .to_string_lossy()
+                .to_string(),
+            ..Config::default()
+        })
+    }
+
+    fn render_view(messages: Vec<ChatMessage>) -> String {
+        let mut app = test_app();
+        app.messages = messages;
+        let backend = TestBackend::new(120, 60);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                render_output(f, &mut app, area);
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        (0..buf.area.height)
+            .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn tool_call(id: Option<&str>, name: &str) -> ChatMessage {
+        ChatMessage::ToolCall {
+            name: name.to_string(),
+            arguments: "{}".to_string(),
+            tool_call_id: id.map(|s| s.to_string()),
+        }
+    }
+
+    fn tool_result(id: Option<&str>, name: &str) -> ChatMessage {
+        ChatMessage::ToolResult {
+            name: name.to_string(),
+            content: "ok".to_string(),
+            tool_call_id: id.map(|s| s.to_string()),
+        }
+    }
+
+    #[test]
+    fn result_shows_paired_call_number() {
+        let view = render_view(vec![
+            tool_call(Some("call_a"), "bash"),
+            tool_result(Some("call_a"), "bash"),
+            tool_call(Some("call_b"), "read_file"),
+            tool_result(Some("call_b"), "read_file"),
+        ]);
+        assert!(view.contains("#1 TOOL CALL: bash"), "got:\n{}", view);
+        assert!(view.contains("#1 RESULT: bash"), "got:\n{}", view);
+        assert!(view.contains("#2 TOOL CALL: read_file"), "got:\n{}", view);
+        assert!(view.contains("#2 RESULT: read_file"), "got:\n{}", view);
+        // The old un-numbered header is gone.
+        assert!(!view.contains("RESULT: bash\n"), "got:\n{}", view);
+    }
+
+    #[test]
+    fn out_of_order_results_pair_by_id() {
+        // Two calls, then results pushed in reverse order — the #id must
+        // follow the call, not the result's position.
+        let view = render_view(vec![
+            tool_call(Some("a"), "bash"),
+            tool_call(Some("b"), "read_file"),
+            tool_result(Some("b"), "read_file"),
+            tool_result(Some("a"), "bash"),
+        ]);
+        assert!(view.contains("#1 TOOL CALL: bash"), "got:\n{}", view);
+        assert!(view.contains("#2 RESULT: read_file"), "got:\n{}", view);
+        assert!(view.contains("#1 RESULT: bash"), "got:\n{}", view);
+    }
+
+    #[test]
+    fn id_less_results_fall_back_to_position() {
+        let view = render_view(vec![
+            tool_call(None, "bash"),
+            tool_result(None, "bash"),
+            tool_call(None, "read_file"),
+            tool_result(None, "read_file"),
+        ]);
+        assert!(view.contains("#1 TOOL CALL: bash"), "got:\n{}", view);
+        assert!(view.contains("#1 RESULT: bash"), "got:\n{}", view);
+        assert!(view.contains("#2 TOOL CALL: read_file"), "got:\n{}", view);
+        assert!(view.contains("#2 RESULT: read_file"), "got:\n{}", view);
     }
 }

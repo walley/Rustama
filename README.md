@@ -100,6 +100,20 @@ terminal_width_pct = 40
 
 # Justify paragraphs in output (true/false, default: false)
 justify = false
+
+# Enable the LSP client (rust-analyzer) for the agentic LSP tools (default: false)
+lsp = false
+
+# LSP server binary — a name on $PATH or an absolute path (default: rust-analyzer)
+lsp_server = rust-analyzer
+
+# LSP workspace root. Leave empty to auto-detect: the directory containing
+# save_path (when it has one), else the directory Rustama was launched from.
+lsp_workspace =
+
+# Append fresh rust-analyzer diagnostics to edit_file/write_file results on
+# .rs files (default: true)
+lsp_auto_diagnostics = true
 ```
 
 > **Note:** Sampling parameters (`temperature`, `top_p`, `top_k`, etc.) are **per-model** now — see `model_params.conf` and `cloud_models.conf` below. Legacy global values left in `rustama.conf` are migrated into the `[default]` section of `model_params.conf` automatically.
@@ -121,6 +135,10 @@ justify = false
 | `max_retries` | integer | `10` | Maximum API retries on rate-limit errors (1–50) |
 | `terminal_width_pct` | integer | `40` | Percentage of terminal width for the output panel (20–80) |
 | `justify` | bool | `false` | Justify text paragraphs in the output pane |
+| `lsp` | bool | `false` | Enable the LSP client (rust-analyzer) powering the LSP agentic tools |
+| `lsp_server` | string | `rust-analyzer` | LSP server binary — a name on `$PATH` or an absolute path |
+| `lsp_workspace` | string | _(empty)_ | LSP workspace root. **Resolution order when empty:** the directory containing `save_path` (when `save_path` includes one that exists), else **the directory Rustama was executed from** |
+| `lsp_auto_diagnostics` | bool | `true` | Append fresh rust-analyzer diagnostics to `edit_file`/`write_file` tool results for `.rs` files |
 
 Boolean values accept: `true`, `yes`, `on`, `1` (and `false`, `no`, `off` for false).
 
@@ -221,12 +239,17 @@ Many settings can be viewed or changed at runtime using slash commands:
 | `/maxtokens <n>` | Set max output tokens (or `/maxtokens off`) |
 | `/seed <n>` | Set sampling seed (or `/seed off`) |
 | `/maxrounds <n>` | Set max agentic tool rounds (1–100) |
+| `/ctx <n>` | Set context window / `num_ctx` for Ollama models (`auto` to auto-detect, `off` to disable) |
 | `/proxy <url>` | Set HTTP proxy (`/proxy off` disables) |
 | `/log` | Toggle logging on/off |
 | `/justify` | Toggle paragraph justification |
+| `/session new` | Start a new session (autosaves the current one) |
 | `/session save` | Save current session |
 | `/session rename <name>` | Rename current session |
 | `/session load <name>` | Load a saved session |
+| `/workspace <dir>` | Show or set the LSP workspace root (restarts rust-analyzer); `/workspace off` stops the server |
+| `/status` | Show app status |
+| `/usage` | Session token usage and cost estimate |
 | `/quit` | Exit Rustama (aliases: `/q`, `/exit`) |
 
 Parameter changes made at runtime apply to the currently selected model and are persisted to its section in `model_params.conf` / `cloud_models.conf`.
@@ -324,6 +347,28 @@ You can also drive the terminal yourself:
 | Click panel | Grab terminal focus |
 
 While focused, the panel border turns green and every key (letters, arrows, F-keys, Ctrl/Alt combos, PgUp/PgDn…) is forwarded to the program running in the terminal.
+
+### LSP Tools (rust-analyzer)
+
+These tools give the model real IDE code intelligence via the [rust-analyzer](https://rust-analyzer.github.io/) language server — compiler feedback, navigation, and completion for Rust code.
+
+**Setup:** requires `lsp = true` in `rustama.conf` and a rust-analyzer binary installed (`lsp_server` selects it; it must be on `$PATH` or an absolute path). The server is rooted at the **LSP workspace**:
+
+1. `lsp_workspace` in the config (when set), else
+2. the directory containing `save_path` (when it has one that exists), else
+3. **the directory Rustama was launched from** (with the default `save_path = output.md`, the workspace is simply the launch directory).
+
+Switch at runtime with `/workspace <dir>` (restarts the server on the new root) or stop it with `/workspace off`.
+
+| Tool | Description |
+|------|-------------|
+| `lsp_diagnostics` | Compiler diagnostics for a `.rs` file (`path`, optional `severity` filter: error/warning/hint/info). No `path` → workspace-wide summary. **Auto-feedback:** a successful `edit_file`/`write_file` on a `.rs` file automatically appends fresh diagnostics to the tool result, so the model sees and fixes its own type errors |
+| `go_to_definition` | Jump to the definition of the symbol at `path`/`line`/`column` (1-based) — returns the target file, line, column, and a source excerpt |
+| `lsp_hover` | Hover info for the symbol at a position — type signature and doc comment |
+| `lsp_references` | All references to the symbol at a position (optional `include_declaration`, default true) — file/line/column plus a source excerpt per hit |
+| `lsp_completion` | Code completions at a cursor position — candidate labels with type detail |
+
+> **Scope note:** rust-analyzer only analyzes files inside the workspace root that belong to its crate graph — a scratch file elsewhere (e.g. in `/tmp`) returns no diagnostics. For compile feedback on out-of-workspace files use the `bash` tool with `cargo check`/`rustc`, or move the file inside the workspace.
 
 The agentic loop continues until the model stops making tool calls or `max_tool_rounds` is reached.
 
