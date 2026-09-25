@@ -70,8 +70,56 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> io::Result<
 where
     io::Error: From<<B as Backend>::Error>,
 {
+    // Redraw-on-change loop: repainting the whole UI ~20x/s even when
+    // nothing changed burned ~10% CPU idle. Instead we draw once, then
+    // only again when something observable changed — an input event, a
+    // streamed chunk, a model/ctx reply, or child output in the embedded
+    // terminal (signalled via `screen_dirty` from the PTY reader thread).
+    // While a request streams we keep repainting every tick so the
+    // status-bar throbber animates.
+    let mut dirty = true;
+    // Terminal panel visibility/layout also changes when the child
+    // process exits on its own — no event or chunk signals that.
+    let mut term_was_shown = app.terminal_state.visible && app.terminal_state.is_running();
+    // The menu-bar clock (HH:MM) needs one repaint per minute.
+    let mut last_clock_min = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        / 60;
+
     loop {
-        terminal.draw(|f| ui(f, app))?;
+        let now_min = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            / 60;
+        if now_min != last_clock_min {
+            last_clock_min = now_min;
+            dirty = true;
+        }
+
+        let term_shown = app.terminal_state.visible && app.terminal_state.is_running();
+        if term_shown != term_was_shown {
+            dirty = true;
+            term_was_shown = term_shown;
+        }
+        if app
+            .terminal_state
+            .screen_dirty
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
+            dirty = true;
+        }
+        if app.is_loading {
+            // Throbber animation + streaming text.
+            dirty = true;
+        }
+
+        if dirty {
+            terminal.draw(|f| ui(f, app))?;
+            dirty = false;
+        }
 
         if event::poll(Duration::from_millis(50))? {
             let size = terminal.size()?;
@@ -84,10 +132,15 @@ where
             while event::poll(Duration::ZERO)? {
                 handle_event(app, event::read()?, terminal)?;
             }
+            dirty = true;
         }
 
-        app.check_responses();
-        app.check_model_responses();
+        if app.check_responses() {
+            dirty = true;
+        }
+        if app.check_model_responses() {
+            dirty = true;
+        }
         // Answer terminal queries (cursor position, device attributes)
         // coming from the child program.
         app.terminal_state.flush_replies();

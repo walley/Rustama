@@ -547,6 +547,10 @@ pub struct TerminalState {
     pub command: String,
     /// Last PTY size we resized to (cols, rows).
     size: (u16, u16),
+    /// Set by the reader thread whenever the child produced output that
+    /// changed the vt100 screen model; the UI loop clears it after a
+    /// redraw. Lets the loop skip repainting an unchanged terminal panel.
+    pub screen_dirty: Arc<AtomicBool>,
 }
 
 impl TerminalState {
@@ -561,6 +565,7 @@ impl TerminalState {
             width_pct: 40,
             command: String::new(),
             size: (80, 24),
+            screen_dirty: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -618,8 +623,21 @@ impl TerminalState {
                     Err(e) => return format!("Error taking pty writer: {}", e),
                 };
 
+                // The writer must be in place BEFORE the reader thread
+                // starts: the reader answers terminal queries (ESC[6n
+                // cursor position, DA1 — see TerminalQueries) by writing
+                // the reply itself, immediately after parsing the query.
+                // Relying on the UI loop's flush_replies() cadence is not
+                // enough — the loop can be blocked for the child's whole
+                // 2s query window (e.g. while a tool call executes on the
+                // main thread), which made Rustama hang at startup when
+                // run inside its own terminal.
+                *self.writer.lock().unwrap() = Some(writer);
+
                 let core = Arc::new(Mutex::new(TerminalCore::new(self.size.0, self.size.1)));
                 let reader_core = core.clone();
+                let reader_writer = self.writer.clone();
+                let reader_dirty = self.screen_dirty.clone();
                 let reader = std::thread::spawn(move || {
                     let mut buf = [0u8; 8192];
                     loop {
@@ -627,9 +645,24 @@ impl TerminalState {
                             Ok(0) => break,
                             Ok(n) => {
                                 let text = String::from_utf8_lossy(&buf[..n]).to_string();
-                                let mut c = reader_core.lock().unwrap();
-                                c.parser.process(text.as_bytes());
-                                c.raw.push(&text);
+                                // Parse, then answer any terminal queries
+                                // in the same breath — the reply latency
+                                // must not depend on the UI loop.
+                                let replies = {
+                                    let mut c = reader_core.lock().unwrap();
+                                    c.parser.process(text.as_bytes());
+                                    c.raw.push(&text);
+                                    std::mem::take(&mut c.parser.callbacks_mut().pending_replies)
+                                };
+                                // Tell the UI loop the panel needs a repaint.
+                                reader_dirty.store(true, Ordering::Relaxed);
+                                if !replies.is_empty() {
+                                    if let Some(w) = reader_writer.lock().unwrap().as_mut() {
+                                        use std::io::Write;
+                                        let _ = w.write_all(&replies);
+                                        let _ = w.flush();
+                                    }
+                                }
                             }
                             Err(_) => break,
                         }
@@ -637,7 +670,6 @@ impl TerminalState {
                 });
 
                 self.core = core;
-                *self.writer.lock().unwrap() = Some(writer);
                 *self.child.lock().unwrap() = Some(child);
                 *self.master.lock().unwrap() = Some(pair.master);
                 self.reader = Some(reader);
@@ -720,7 +752,9 @@ impl TerminalState {
 
     /// Writes any pending terminal-query replies (cursor position reports,
     /// device attributes — see [`TerminalQueries`]) back to the child
-    /// through the PTY master. Called from the UI loop.
+    /// through the PTY master. Called from the UI loop as a safety net —
+    /// the reader thread is the primary path and answers queries the
+    /// moment it parses them (see `open`).
     pub fn flush_replies(&mut self) {
         let replies = {
             let mut core = self.core.lock().unwrap();
@@ -2363,31 +2397,39 @@ impl App {
         self.set_auto_scroll();
     }
 
-    pub fn check_responses(&mut self) {
+    /// Drains pending stream chunks. Returns true when anything was
+    /// consumed (i.e. the UI needs a redraw).
+    pub fn check_responses(&mut self) -> bool {
+        let mut changed = false;
         if let Some(rx) = &self.response_rx {
             loop {
                 match rx.try_recv() {
                     Ok(StreamChunk::Text(text)) => {
+                        changed = true;
                         self.streaming_text.push_str(&text);
                         self.retrying = false;
                         self.auto_scroll = true;
                     }
                     Ok(StreamChunk::Thinking(text)) => {
+                        changed = true;
                         self.streaming_thinking.push_str(&text);
                         self.retrying = false;
                         self.auto_scroll = true;
                     }
                     Ok(StreamChunk::StatusTick(msg)) => {
+                        changed = true;
                         self.status_message = msg;
                         self.retrying = true;
                         self.auto_scroll = true;
                     }
                     Ok(StreamChunk::Stats(stats)) => {
+                        changed = true;
                         // Mid-stream usage report; committed on the next
                         // Done/ToolCalls transition.
                         self.last_stats = stats;
                     }
                     Ok(StreamChunk::Truncated(msg)) => {
+                        changed = true;
                         self.status_message = msg.clone();
                         self.retrying = false;
                         self.pending_continuation = true;
@@ -2413,6 +2455,7 @@ impl App {
                         )));
                     }
                     Ok(StreamChunk::ToolCalls(tool_calls)) => {
+                        changed = true;
                         if !self.streaming_thinking.is_empty() {
                             self.messages
                                 .push(ChatMessage::Thinking(self.streaming_thinking.clone()));
@@ -2496,6 +2539,7 @@ impl App {
                         break;
                     }
                     Ok(StreamChunk::Done(stats)) => {
+                        changed = true;
                         self.retrying = false;
                         // A bare `[DONE]` sentinel or stream close reports default
                         // stats; keep the ones received earlier via Stats.
@@ -2638,6 +2682,7 @@ impl App {
                         break;
                     }
                     Ok(StreamChunk::Error(msg)) => {
+                        changed = true;
                         self.retrying = false;
                         let had_content =
                             !self.streaming_thinking.is_empty() || !self.streaming_text.is_empty();
@@ -2666,6 +2711,7 @@ impl App {
                         break;
                     }
                     Ok(StreamChunk::RetryPaused(msg)) => {
+                        changed = true;
                         self.retrying = false;
                         let had_content =
                             !self.streaming_thinking.is_empty() || !self.streaming_text.is_empty();
@@ -2694,6 +2740,7 @@ impl App {
                     }
                     Err(mpsc::TryRecvError::Empty) => break,
                     Err(mpsc::TryRecvError::Disconnected) => {
+                        changed = true;
                         if !self.streaming_thinking.is_empty() {
                             self.messages
                                 .push(ChatMessage::Thinking(self.streaming_thinking.clone()));
@@ -2717,6 +2764,7 @@ impl App {
                 }
             }
         }
+        changed
     }
 
     fn send_tool_results_async(&mut self) {
@@ -3805,10 +3853,13 @@ impl App {
         });
     }
 
-    pub fn check_model_responses(&mut self) {
+    /// Returns true when a model/ctx response arrived (UI needs redraw).
+    pub fn check_model_responses(&mut self) -> bool {
+        let mut changed = false;
         if let Some(rx) = &self.models_rx {
             match rx.try_recv() {
                 Ok(Ok(models)) => {
+                    changed = true;
                     self.available_models = models;
                     // Pre-select the current model if it's in the list
                     if let Some(idx) = self
@@ -3821,27 +3872,31 @@ impl App {
                     self.models_rx = None;
                 }
                 Ok(Err(e)) => {
+                    changed = true;
                     self.available_models = vec![format!("Error: {}", e)];
                     self.models_rx = None;
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
                 Err(mpsc::TryRecvError::Disconnected) => {
+                    changed = true;
                     self.available_models = vec!["Failed to fetch models".to_string()];
                     self.models_rx = None;
                 }
             }
         }
-        self.check_ctx_response();
+        self.check_ctx_response() || changed
     }
 
     /// Polls an in-flight context-length detection request and caches the
     /// result on `self.ollama_ctx_length`. Detection is only stored in
     /// memory (used as the default `num_ctx`); it never overwrites an
     /// explicit user-set `params.num_ctx`.
-    fn check_ctx_response(&mut self) {
+    fn check_ctx_response(&mut self) -> bool {
+        let mut changed = false;
         if let Some(rx) = &self.ctx_rx {
             match rx.try_recv() {
                 Ok(Some(len)) => {
+                    changed = true;
                     self.ollama_ctx_length = Some(len);
                     self.status_message = format!(
                         "Context window detected: {} tokens ({})",
@@ -3850,14 +3905,17 @@ impl App {
                     self.ctx_rx = None;
                 }
                 Ok(None) => {
+                    changed = true;
                     self.ctx_rx = None;
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
                 Err(mpsc::TryRecvError::Disconnected) => {
+                    changed = true;
                     self.ctx_rx = None;
                 }
             }
         }
+        changed
     }
 
     /// Asynchronously queries Ollama's `/api/show` for the current model's
@@ -7781,6 +7839,45 @@ mod tests {
         assert!(
             screen.contains("PTY_OK"),
             "screen should show the edited command result: {}",
+            screen
+        );
+        ts.close();
+    }
+
+    #[test]
+    fn pty_answers_cursor_query_without_ui_loop() {
+        // Regression: crossterm-based children (Rustama itself!) query
+        // the cursor position (ESC[6n) at startup and abort if no reply
+        // arrives within their 2s window. The reply must be written by
+        // the READER thread as soon as it parses the query — the UI
+        // loop's flush_replies() cannot be relied upon (it is blocked
+        // while tool calls execute on the main thread). This test never
+        // calls flush_replies().
+        use super::TerminalState;
+        let mut ts = TerminalState::new();
+        // bash sends ESC[6n, then reads the reply (up to the 'R'
+        // terminator) with a 3s timeout. The OK marker prints only if
+        // the reply arrived; the MISSING marker if it did not.
+        let result = ts.open(
+            "printf '\\033[6n'; read -r -t 3 -d 'R' reply && \
+             echo CURSOR_REPLY_OK || echo CURSOR_REPLY_MISSING",
+        );
+        assert!(result.contains("Terminal opened"), "open: {}", result);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut screen = String::new();
+        while std::time::Instant::now() < deadline {
+            // NB: no flush_replies() — the reader thread answers alone.
+            let r = ts.read_buffer_incremental(None);
+            screen = r["screen"].as_str().unwrap_or("").to_string();
+            if screen.contains("CURSOR_REPLY_OK") || screen.contains("CURSOR_REPLY_MISSING") {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(
+            screen.contains("CURSOR_REPLY_OK"),
+            "ESC[6n reply must come from the reader thread, got: {:?}",
             screen
         );
         ts.close();
