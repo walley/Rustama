@@ -2420,7 +2420,11 @@ impl App {
                         changed = true;
                         self.status_message = msg;
                         self.retrying = true;
-                        self.auto_scroll = true;
+                        // No auto_scroll here: while waiting/retrying
+                        // nothing new is appended to the output, so don't
+                        // yank the view to the bottom — the user may have
+                        // scrolled up to read. The Text/Thinking arms
+                        // re-enable auto_scroll once streaming starts.
                     }
                     Ok(StreamChunk::Stats(stats)) => {
                         changed = true;
@@ -6426,6 +6430,12 @@ fn retry_countdown(
     session_id: &str,
     cancel: &AtomicBool,
 ) -> bool {
+    // In tests, cap the real-time wait: the production backoffs (20/40/60s)
+    // would otherwise make every retry test take minutes. 3s keeps the
+    // countdown/cancel semantics observable (see retry_countdown_* tests)
+    // without slowing the suite down.
+    #[cfg(test)]
+    let delay_secs = delay_secs.min(3);
     let ra_str = retry_after.map_or("none".to_string(), |v| format!("{}s", v));
     log_to_file(
         is_logging,
@@ -7497,8 +7507,12 @@ mod tests {
                 assert!(n > 0, "expected a request from the client");
                 if i < 2 {
                     let body = r#"{"error": {"message": "quota exceeded"}}"#;
+                    // `Connection: close` forces the client to dial a fresh
+                    // connection per attempt — otherwise reqwest's connection
+                    // pooling races with this scripted accept loop and the
+                    // outcome of attempt 2 becomes nondeterministic.
                     let resp = format!(
-                        "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nRetry-After: 1\r\nContent-Length: {}\r\n\r\n{}",
+                        "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nRetry-After: 1\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
                         body.len(),
                         body
                     );
