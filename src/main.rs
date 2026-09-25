@@ -255,8 +255,7 @@ fn ui(f: &mut Frame, app: &mut App) {
     }
 
     if app.show_about {
-        let mb = ui::MessageBox::new("About", &app.about_message)
-            .with_header(ui::rustama_logo_lines());
+        let mb = app.about_box();
         mb.render(f, area, true, &app.theme);
     }
 
@@ -828,11 +827,11 @@ fn vt100_color(c: vt100::Color, default: Color) -> Color {
 
 fn render_send_button(f: &mut Frame, app: &App, area: Rect) {
     let has_text = !app.textarea.lines().join("").trim().is_empty();
-    // 15-char mc-style button: centered label + a ► arrow. The padding
-    // lives in the name so `Button::render` brackets it into
-    // "[   send  ►   ]".
+    // mc-style button: centered label + a ► arrow. `Button::render`
+    // brackets it into "[  send  ►  ]" and `Button::width` matches the
+    // drawn width exactly, so the clickable area is the drawn button.
     let send_btn = Button::new(
-        "   send  ►   ",
+        "  send  ►  ",
         0,
         0,
         has_text,
@@ -1116,17 +1115,9 @@ fn keybar_field_widths(labels: &[(&str, &str)], width: u16) -> Vec<u16> {
 
 fn render_model_dialog(f: &mut Frame, app: &App, area: Rect) {
     let model_count = app.available_models.len().min(12) as u16;
-    let dialog_w = 56u16;
-    let dialog_h = model_count + 7;
+    let (popup_area, inner, btn_y, confirm_x, cancel_x) =
+        ui::model_dialog_geometry(model_count, area);
 
-    let popup_area = Rect {
-        x: (area.width.saturating_sub(dialog_w)) / 2,
-        y: (area.height.saturating_sub(dialog_h)) / 2,
-        width: dialog_w,
-        height: dialog_h,
-    };
-
-    let inner = popup_area.inner(Margin::new(1, 1));
     f.render_widget(Clear, popup_area);
     f.render_widget(dialog_block("Select Model", &app.theme), popup_area);
 
@@ -1208,10 +1199,9 @@ fn render_model_dialog(f: &mut Frame, app: &App, area: Rect) {
     let list = List::new(items);
     f.render_widget(list, list_area);
 
-    let btn_y = inner.y + list_height + 1;
     let confirm_btn = Button::new(
         "Confirm",
-        inner.x + 10,
+        confirm_x,
         btn_y,
         app.model_dialog_focus == ModelDialogFocus::Confirm,
         app.theme.dialog_fg,
@@ -1219,7 +1209,7 @@ fn render_model_dialog(f: &mut Frame, app: &App, area: Rect) {
     );
     let cancel_btn = Button::new(
         "Cancel",
-        inner.x + 24,
+        cancel_x,
         btn_y,
         app.model_dialog_focus == ModelDialogFocus::Cancel,
         app.theme.dialog_fg,
@@ -1229,12 +1219,13 @@ fn render_model_dialog(f: &mut Frame, app: &App, area: Rect) {
     let (confirm_text, confirm_style) = confirm_btn.render();
     let (cancel_text, cancel_style) = cancel_btn.render();
 
+    let pad_to = |x: u16| " ".repeat(x.saturating_sub(inner.x) as usize);
+    let gap = " ".repeat(cancel_x.saturating_sub(confirm_x + confirm_btn.width) as usize);
     let buttons = Line::from(vec![
-        Span::raw("          "),
+        Span::raw(pad_to(confirm_x)),
         Span::styled(confirm_text, confirm_style),
-        Span::raw("   "),
+        Span::raw(gap),
         Span::styled(cancel_text, cancel_style),
-        Span::raw("          "),
     ]);
 
     let btn_area = Rect {
@@ -2522,7 +2513,7 @@ mod send_button_tests {
         // Multi-byte symbols: "►" is 3 UTF-8 bytes but ONE column.
         let arrow = Button::new("►", 0, 0, true, crate::ui::MC_GREEN, crate::ui::MC_GREEN);
         assert_eq!(arrow.width, 5); // 1 char + 4, not 3 bytes + 4
-        assert_eq!(arrow.render().0.chars().count(), 3); // [►]
+        assert_eq!(arrow.render().0.chars().count(), 5); // "[ ► ]"
     }
 
     #[test]
@@ -2542,7 +2533,7 @@ mod send_button_tests {
         let bottom: String = (0..buf.area.width)
             .map(|x| buf[(x, 2)].symbol())
             .collect();
-        // Exactly 15 chars, centered "send" + ►.
+        // Exactly 15 chars, centered "send" + ► ("[ " + name + " ]").
         let btn = "[   send  ►   ]";
         assert_eq!(btn.chars().count(), 15);
         assert!(bottom.contains(btn), "got: {}", bottom);
@@ -2750,14 +2741,14 @@ mod settings_dialog_tests {
             border_row
         );
         assert!(
-            !border_row.contains("[Save]") && !border_row.contains("[Cancel]"),
+            !border_row.contains("[ Save ]") && !border_row.contains("[ Cancel ]"),
             "buttons must not sit on the border: {}",
             border_row
         );
 
         // Buttons draw on the last row INSIDE the dialog.
-        assert!(btn_row.contains("[Save]"), "got: {}", btn_row);
-        assert!(btn_row.contains("[Cancel]"), "got: {}", btn_row);
+        assert!(btn_row.contains("[ Save ]"), "got: {}", btn_row);
+        assert!(btn_row.contains("[ Cancel ]"), "got: {}", btn_row);
     }
 }
 
@@ -2787,6 +2778,50 @@ mod about_dialog_tests {
             app.about_message.contains("https://github.com/walley/Rustama"),
             "got: {}",
             app.about_message
+        );
+    }
+
+    #[test]
+    fn about_button_hit_test_matches_render() {
+        // The About box renders WITH the logo header; the click handler
+        // must hit-test the same layout. (Regression: hit_test used to
+        // build the box without the header, so the OK button's clickable
+        // row sat several rows above the drawn one.)
+        let app = test_app();
+        let backend = TestBackend::new(100, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                app.about_box().render(f, area, true, &app.theme);
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let mut found = None;
+        for y in 0..buf.area.height {
+            let line: String = (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect();
+            // Note: char position, not byte index — the box borders are
+            // multi-byte, so `str::find` would be off by 2.
+            if let Some(byte_idx) = line.find("[ OK ]") {
+                let col = line[..byte_idx].chars().count() as u16;
+                found = Some((col, y));
+                break;
+            }
+        }
+        let (bx, by) = found.expect("OK button not rendered");
+        let area = ratatui::layout::Rect::new(0, 0, 100, 40);
+        // Every column of the drawn button is clickable...
+        for dx in 0..6u16 {
+            assert!(
+                app.about_box().hit_test(bx + dx, by, area),
+                "click on drawn OK at +{} must hit",
+                dx
+            );
+        }
+        // ...and the row above the drawn button is not.
+        assert!(
+            !app.about_box().hit_test(bx, by - 1, area),
+            "row above the drawn OK must not hit"
         );
     }
 

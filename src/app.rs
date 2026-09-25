@@ -2418,13 +2418,16 @@ impl App {
                     }
                     Ok(StreamChunk::StatusTick(msg)) => {
                         changed = true;
+                        // Entering a retry countdown detaches autoscroll:
+                        // nothing new is being appended, so don't keep the
+                        // view pinned to the bottom — the user may scroll
+                        // up to read. The Text/Thinking arms re-enable
+                        // auto_scroll once streaming actually starts.
+                        if !self.retrying {
+                            self.auto_scroll = false;
+                        }
                         self.status_message = msg;
                         self.retrying = true;
-                        // No auto_scroll here: while waiting/retrying
-                        // nothing new is appended to the output, so don't
-                        // yank the view to the bottom — the user may have
-                        // scrolled up to read. The Text/Thinking arms
-                        // re-enable auto_scroll once streaming starts.
                     }
                     Ok(StreamChunk::Stats(stats)) => {
                         changed = true;
@@ -4028,18 +4031,17 @@ impl App {
     }
 
     fn handle_model_dialog_click(&mut self, col: u16, row: u16, width: u16, height: u16) {
-        let dialog_w: u16 = 56;
+        let area = Rect::new(0, 0, width, height);
         let model_count = self.available_models.len().min(12) as u16;
-        let dialog_h = model_count + 7;
-        let dialog_x = (width.saturating_sub(dialog_w)) / 2;
-        let dialog_y = (height.saturating_sub(dialog_h)) / 2;
-        let inner_x = dialog_x + 1;
-        let inner_y = dialog_y + 1;
+        // Same geometry the render path uses — no duplicated constants.
+        let (popup_area, inner, btn_y, confirm_x, cancel_x) =
+            crate::ui::model_dialog_geometry(model_count, area);
+        let inner_y = inner.y;
 
-        if col < dialog_x
-            || col >= dialog_x + dialog_w
-            || row < dialog_y
-            || row >= dialog_y + dialog_h
+        if col < popup_area.x
+            || col >= popup_area.x + popup_area.width
+            || row < popup_area.y
+            || row >= popup_area.y + popup_area.height
         {
             self.show_model_dialog = false;
             return;
@@ -4054,10 +4056,9 @@ impl App {
             return;
         }
 
-        let btn_y = inner_y + model_count + 1;
         let confirm_btn = Button::new(
             "Confirm",
-            inner_x + 10,
+            confirm_x,
             btn_y,
             self.model_dialog_focus == ModelDialogFocus::Confirm,
             Color::Green,
@@ -4065,7 +4066,7 @@ impl App {
         );
         let cancel_btn = Button::new(
             "Cancel",
-            inner_x + 22,
+            cancel_x,
             btn_y,
             self.model_dialog_focus == ModelDialogFocus::Cancel,
             Color::Red,
@@ -4365,9 +4366,17 @@ impl App {
         }
     }
 
+    /// The single source of truth for the About dialog — both the render
+    /// path (main.rs) and click hit-testing build the same box (including
+    /// the logo header), so their layouts always agree.
+    pub fn about_box(&self) -> crate::ui::MessageBox {
+        crate::ui::MessageBox::new("About", &self.about_message)
+            .with_header(crate::ui::rustama_logo_lines())
+    }
+
     fn handle_about_dialog_click(&mut self, col: u16, row: u16, width: u16, height: u16) {
         let area = Rect::new(0, 0, width, height);
-        let mb = crate::ui::MessageBox::new("About", &self.about_message);
+        let mb = self.about_box();
         if mb.hit_test(col, row, area) {
             self.show_about = false;
         }
@@ -4686,7 +4695,7 @@ impl App {
             self.file_dialog_focus == FileDialogFocus::List,
         );
 
-        // Buttons render right-aligned in insertion order: [Cancel]  [Load/Open]
+        // Buttons render right-aligned in insertion order: [ Cancel ]  [ Load/Open ]
         d.add_button("Cancel", self.file_dialog_focus == FileDialogFocus::Cancel);
         let open_label = if is_load_session { "Load" } else { "Open" };
         d.add_button(open_label, self.file_dialog_focus == FileDialogFocus::Open);

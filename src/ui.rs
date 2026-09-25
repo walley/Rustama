@@ -126,6 +126,31 @@ pub struct SettingsDialogLayout {
     pub btn_y: u16,
 }
 
+/// Geometry of the "Select Model" dialog, shared by the render path
+/// (main.rs) and the click handler (app.rs) so drawn and clickable
+/// coordinates always agree — nothing is hardcoded twice.
+/// Returns `(popup_area, inner_area, button_row_y, confirm_x, cancel_x)`.
+pub fn model_dialog_geometry(model_count: u16, area: Rect) -> (Rect, Rect, u16, u16, u16) {
+    let dialog_w = 56u16;
+    let dialog_h = model_count + 7;
+    let popup_area = Rect {
+        x: area.x + (area.width.saturating_sub(dialog_w)) / 2,
+        y: area.y + (area.height.saturating_sub(dialog_h)) / 2,
+        width: dialog_w,
+        height: dialog_h,
+    };
+    let inner = popup_area.inner(Margin::new(1, 1));
+    let btn_y = inner.y + model_count + 1;
+    // Button widths come from the Button widget; the pair is centered.
+    let confirm_w = Button::new("Confirm", 0, 0, false, Color::White, Color::White).width;
+    let cancel_w = Button::new("Cancel", 0, 0, false, Color::White, Color::White).width;
+    let btn_gap: u16 = 3;
+    let buttons_w = confirm_w + btn_gap + cancel_w;
+    let confirm_x = inner.x + (inner.width.saturating_sub(buttons_w)) / 2;
+    let cancel_x = confirm_x + confirm_w + btn_gap;
+    (popup_area, inner, btn_y, confirm_x, cancel_x)
+}
+
 /// Computes the Settings dialog layout for a terminal of `area`.
 pub fn settings_dialog_layout(area: Rect) -> SettingsDialogLayout {
     let popup = Rect {
@@ -160,8 +185,9 @@ pub struct Button {
 impl Button {
     pub fn new(name: &str, x: u16, y: u16, active: bool, fg: Color, bg: Color) -> Self {
         // Char count, not byte length — labels may hold non-ASCII
-        // symbols (arrows) that are multi-byte in UTF-8. The +2 over
-        // the `[name]` display is the inter-button gap convention.
+        // symbols (arrows) that are multi-byte in UTF-8. The +4 matches
+        // the `[ name ]` display exactly, so the clickable area is
+        // precisely the drawn button.
         let width = name.chars().count() as u16 + 4;
         Button {
             name: name.to_string(),
@@ -186,12 +212,12 @@ impl Button {
                 let before: String = self.name.chars().take(idx).collect();
                 let at: String = self.name.chars().skip(idx).take(1).collect();
                 let after: String = self.name.chars().skip(idx + 1).collect();
-                format!("[{}{}{}]", before, at.to_uppercase(), after)
+                format!("[ {}{}{} ]", before, at.to_uppercase(), after)
             } else {
-                format!("[{}]", self.name)
+                format!("[ {} ]", self.name)
             }
         } else {
-            format!("[{}]", self.name)
+            format!("[ {} ]", self.name)
         };
 
         let style = if self.active {
@@ -694,26 +720,22 @@ impl FileActionDialog {
         if let Some(idx) = button_idx
             && let Some(DialogItem::Buttons(btns)) = self.items.get(idx)
         {
-            let total_btn_width: u16 = btns
+            // Widths and text come from the Button widget, so the drawn
+            // row always matches hit_test's clickable columns.
+            let btn_widgets: Vec<Button> = btns
                 .iter()
-                .map(|b| b.label.len() as u16 + 4)
-                .sum::<u16>()
-                .saturating_sub(1);
+                .map(|b| Button::new(&b.label, 0, 0, b.focused, theme.dialog_fg, theme.dialog_focus_bg))
+                .collect();
+            let gap: u16 = 2;
+            let total_btn_width: u16 = btn_widgets.iter().map(|b| b.width).sum::<u16>()
+                + gap * (btns.len() as u16).saturating_sub(1);
             let left_pad = inner.width.saturating_sub(total_btn_width + 2).max(1);
             let mut spans = vec![Span::raw(" ".repeat(left_pad as usize))];
-            for (i, btn) in btns.iter().enumerate() {
+            for (i, btn) in btn_widgets.iter().enumerate() {
                 if i > 0 {
                     spans.push(Span::raw("  "));
                 }
-                let display = format!("[{}]", btn.label);
-                let style = if btn.focused {
-                    Style::default()
-                        .fg(theme.dialog_fg)
-                        .bg(theme.dialog_focus_bg)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(theme.dialog_fg)
-                };
+                let (display, style) = btn.render();
                 spans.push(Span::styled(display, style));
             }
             let btn_area = Rect {
@@ -810,22 +832,22 @@ impl FileActionDialog {
             && let Some(DialogItem::Buttons(btns)) = self.items.get(idx)
             && row == btn_bottom_y
         {
+            // Same math as the render path: Button widths, 2-column gaps.
+            let gap: u16 = 2;
             let total_btn_width: u16 = btns
                 .iter()
-                .map(|b| b.label.len() as u16 + 4)
+                .map(|b| Button::new(&b.label, 0, 0, false, Color::White, Color::White).width)
                 .sum::<u16>()
-                .saturating_sub(1);
+                + gap * (btns.len() as u16).saturating_sub(1);
             let left_pad = inner.width.saturating_sub(total_btn_width + 2).max(1);
             let mut x_cursor = inner.x + left_pad;
             for (bi, btn) in btns.iter().enumerate() {
-                if bi > 0 {
-                    x_cursor += 2;
-                }
-                let btn_w = btn.label.len() as u16 + 4;
+                let btn_w =
+                    Button::new(&btn.label, 0, 0, false, Color::White, Color::White).width;
                 if col >= x_cursor && col < x_cursor + btn_w {
                     return DialogHit::Button(bi);
                 }
-                x_cursor += btn_w;
+                x_cursor += btn_w + gap;
             }
         }
 
@@ -1380,7 +1402,9 @@ impl MessageBox {
         };
         let inner = popup_area.inner(Margin::new(2, 1));
         let btn_y = inner.y + msg_height + 1;
-        let btn_w = "OK".len() as u16 + 4;
+        // Button width comes from the Button widget itself, so the rect
+        // always matches what `Button::render` draws.
+        let btn_w = Button::new("OK", 0, 0, false, Color::White, Color::White).width;
         let btn_area = Rect {
             x: inner.x + (inner.width.saturating_sub(btn_w)) / 2,
             y: btn_y,
@@ -1526,9 +1550,10 @@ impl ConfirmationBox {
         let lines = MessageBox::wrap_message(&self.message, inner_w.saturating_sub(2).max(1));
         let msg_height = lines.len() as u16;
 
-        // Make sure both buttons (centered as a pair) always fit.
-        let confirm_w = self.confirm_label.len() as u16 + 4;
-        let cancel_w = self.cancel_label.len() as u16 + 4;
+        // Make sure both buttons (centered as a pair) always fit. Widths
+        // come from the Button widget so they always match what's drawn.
+        let confirm_w = Button::new(&self.confirm_label, 0, 0, false, Color::White, Color::White).width;
+        let cancel_w = Button::new(&self.cancel_label, 0, 0, false, Color::White, Color::White).width;
         let btn_gap: u16 = 2;
         let buttons_w = confirm_w + btn_gap + cancel_w;
         let min_inner_w = buttons_w + 4; // a little breathing room
@@ -2029,13 +2054,13 @@ mod tests {
             track_symbols
         );
 
-        // Buttons on the last-but-two inner row, right-aligned: [Cancel]  [Load].
+        // Buttons on the last-but-two inner row, right-aligned: [ Cancel ]  [ Load ].
         let btn_row = &lines[(dy + dh - 3) as usize];
-        let cancel_at = btn_row.find("[Cancel]").expect("Cancel button missing");
-        let load_at = btn_row.find("[Load]").expect("Load button missing");
+        let cancel_at = btn_row.find("[ Cancel ]").expect("Cancel button missing");
+        let load_at = btn_row.find("[ Load ]").expect("Load button missing");
         assert!(cancel_at < load_at, "Cancel should be left of Load");
         assert!(
-            load_at + "[Load]".len() >= (dx + dw - 4) as usize,
+            load_at + "[ Load ]".len() >= (dx + dw - 4) as usize,
             "buttons should be near the right corner"
         );
     }
