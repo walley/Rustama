@@ -126,13 +126,175 @@ pub struct SettingsDialogLayout {
     pub btn_y: u16,
 }
 
+/// Maximum visible rows in a [`ListBox`] before it scrolls.
+pub const LISTBOX_MAX_VISIBLE: u16 = 10;
+
+/// Generic framed list box: a border (highlighted when focused) with a
+/// title, a full-width selection bar, and a scrollbar when the items
+/// overflow. Used by the model picker; reusable for any single-choice
+/// list. Render and hit_test share `geometry()`, so the clickable rows
+/// always match the drawn ones.
+#[derive(Debug, Clone)]
+pub struct ListBox {
+    /// `(label, is_current)` — the current entry is drawn in the
+    /// dialog-title color, the selected one black-on-cyan.
+    pub items: Vec<(String, bool)>,
+    pub selection: usize,
+    pub scroll: usize,
+    pub focused: bool,
+    pub title: String,
+}
+
+impl ListBox {
+    pub fn new(
+        items: Vec<(String, bool)>,
+        selection: usize,
+        scroll: usize,
+        focused: bool,
+        title: &str,
+    ) -> Self {
+        ListBox {
+            items,
+            selection,
+            scroll,
+            focused,
+            title: title.to_string(),
+        }
+    }
+
+    /// Height the box would take with no space constraints
+    /// (visible rows + 2 border lines).
+    pub fn natural_height(&self) -> u16 {
+        self.items.len().min(LISTBOX_MAX_VISIBLE as usize) as u16 + 2
+    }
+
+    /// Geometry of the box placed in a space `available` rows tall:
+    /// `(box_height, visible_rows, first_visible_item)`. The box is
+    /// clamped to the available space; the scroll offset is clamped to
+    /// the items and adjusted so the selection stays visible.
+    pub fn geometry(&self, available: u16) -> (u16, usize, usize) {
+        let items_len = self.items.len();
+        let box_h = self.natural_height().min(available.max(2));
+        let visible = (box_h - 2) as usize;
+        if visible == 0 || items_len == 0 {
+            return (box_h, visible, 0);
+        }
+        let max_start = items_len.saturating_sub(visible);
+        let mut start = self.scroll.min(max_start);
+        if self.selection < start {
+            start = self.selection;
+        }
+        if self.selection >= start + visible {
+            start = self.selection + 1 - visible;
+        }
+        (box_h, visible, start)
+    }
+
+    pub fn render(&self, f: &mut Frame, area: Rect, theme: &Theme) {
+        let (_, visible, start) = self.geometry(area.height);
+        let border_color = if self.focused {
+            theme.dialog_title_fg
+        } else {
+            theme.dialog_border
+        };
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(format!(" {} ", self.title))
+            .border_style(Style::default().fg(border_color))
+            .style(Style::default().bg(theme.dialog_bg));
+        f.render_widget(block, area);
+
+        let mut rows_area = area.inner(Margin::new(1, 1));
+        let show_scrollbar = visible > 0 && self.items.len() > visible;
+        if show_scrollbar {
+            rows_area.width = rows_area.width.saturating_sub(1);
+        }
+
+        let end = (start + visible).min(self.items.len());
+        let mut list_items: Vec<ListItem> = self.items[start..end]
+            .iter()
+            .enumerate()
+            .map(|(i, (name, is_current))| {
+                let real_idx = start + i;
+                let is_sel = real_idx == self.selection;
+                let name_style = if is_sel {
+                    Style::default()
+                        .fg(theme.list_selected_fg)
+                        .bg(theme.list_selected_bg)
+                        .add_modifier(Modifier::BOLD)
+                } else if *is_current {
+                    Style::default()
+                        .fg(theme.dialog_title_fg)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(theme.dialog_fg)
+                };
+                // Pad the selected row so the highlight spans the full width.
+                let text = if is_sel {
+                    let pad = (rows_area.width as usize).saturating_sub(name.chars().count());
+                    format!("{}{}", name, " ".repeat(pad))
+                } else {
+                    name.clone()
+                };
+                ListItem::new(Line::from(Span::styled(text, name_style)))
+            })
+            .collect();
+
+        list_items.resize_with(visible, || ListItem::new(Line::from(Span::raw(""))));
+        let list = ratatui::widgets::List::new(list_items);
+        f.render_widget(list, rows_area);
+
+        if show_scrollbar {
+            let track = Rect {
+                x: area.x + area.width.saturating_sub(2),
+                y: area.y + 1,
+                width: 1,
+                height: area.height.saturating_sub(2),
+            };
+            let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(Some("▲"))
+                .end_symbol(Some("▼"))
+                .track_symbol(Some("│"))
+                .thumb_style(
+                    Style::default()
+                        .fg(theme.dialog_fg)
+                        .add_modifier(Modifier::BOLD),
+                )
+                .track_style(Style::default().fg(theme.dialog_input_fg));
+            let max_scroll = self.items.len().saturating_sub(visible);
+            let mut state = ScrollbarState::new(max_scroll).position(start);
+            f.render_stateful_widget(scrollbar, track, &mut state);
+        }
+    }
+
+    /// Item index at absolute `row` inside the box `area`, if that row
+    /// is a visible list row. Border rows and rows outside the box (or
+    /// past the items) yield `None`.
+    pub fn hit_test(&self, row: u16, area: Rect) -> Option<usize> {
+        let (_, visible, start) = self.geometry(area.height);
+        if visible == 0 || self.items.is_empty() {
+            return None;
+        }
+        let first = area.y + 1;
+        if row >= first && row < first + visible as u16 {
+            let idx = start + (row - first) as usize;
+            if idx < self.items.len() {
+                return Some(idx);
+            }
+        }
+        None
+    }
+}
+
 /// Geometry of the "Select Model" dialog, shared by the render path
 /// (main.rs) and the click handler (app.rs) so drawn and clickable
 /// coordinates always agree — nothing is hardcoded twice.
-/// Returns `(popup_area, inner_area, button_row_y, confirm_x, cancel_x)`.
-pub fn model_dialog_geometry(model_count: u16, area: Rect) -> (Rect, Rect, u16, u16, u16) {
+/// Returns `(popup_area, list_area, info_row_y, button_row_y, confirm_x, cancel_x)`.
+pub fn model_dialog_geometry(model_count: u16, area: Rect) -> (Rect, Rect, u16, u16, u16, u16) {
     let dialog_w = 56u16;
-    let dialog_h = model_count + 7;
+    // Rows: list box + info line + blank + buttons, plus the 2 border rows.
+    let list_h = model_count.min(LISTBOX_MAX_VISIBLE) + 2;
+    let dialog_h = list_h + 5;
     let popup_area = Rect {
         x: area.x + (area.width.saturating_sub(dialog_w)) / 2,
         y: area.y + (area.height.saturating_sub(dialog_h)) / 2,
@@ -140,7 +302,14 @@ pub fn model_dialog_geometry(model_count: u16, area: Rect) -> (Rect, Rect, u16, 
         height: dialog_h,
     };
     let inner = popup_area.inner(Margin::new(1, 1));
-    let btn_y = inner.y + model_count + 1;
+    let list_area = Rect {
+        x: inner.x,
+        y: inner.y,
+        width: inner.width,
+        height: list_h,
+    };
+    let info_y = inner.y + list_h;
+    let btn_y = info_y + 2;
     // Button widths come from the Button widget; the pair is centered.
     let confirm_w = Button::new("Confirm", 0, 0, false, Color::White, Color::White).width;
     let cancel_w = Button::new("Cancel", 0, 0, false, Color::White, Color::White).width;
@@ -148,7 +317,7 @@ pub fn model_dialog_geometry(model_count: u16, area: Rect) -> (Rect, Rect, u16, 
     let buttons_w = confirm_w + btn_gap + cancel_w;
     let confirm_x = inner.x + (inner.width.saturating_sub(buttons_w)) / 2;
     let cancel_x = confirm_x + confirm_w + btn_gap;
-    (popup_area, inner, btn_y, confirm_x, cancel_x)
+    (popup_area, list_area, info_y, btn_y, confirm_x, cancel_x)
 }
 
 /// Computes the Settings dialog layout for a terminal of `area`.

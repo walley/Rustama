@@ -1114,8 +1114,8 @@ fn keybar_field_widths(labels: &[(&str, &str)], width: u16) -> Vec<u16> {
 }
 
 fn render_model_dialog(f: &mut Frame, app: &App, area: Rect) {
-    let model_count = app.available_models.len().min(12) as u16;
-    let (popup_area, inner, btn_y, confirm_x, cancel_x) =
+    let model_count = app.available_models.len() as u16;
+    let (popup_area, list_area, info_y, btn_y, confirm_x, cancel_x) =
         ui::model_dialog_geometry(model_count, area);
 
     f.render_widget(Clear, popup_area);
@@ -1128,76 +1128,62 @@ fn render_model_dialog(f: &mut Frame, app: &App, area: Rect) {
                 .fg(app.theme.dialog_title_fg)
                 .add_modifier(Modifier::SLOW_BLINK),
         )));
-        f.render_widget(loading, inner);
+        f.render_widget(loading, list_area);
         return;
     }
 
-    let list_height = model_count;
-    let list_area = Rect {
-        x: inner.x,
-        y: inner.y,
-        width: inner.width,
-        height: list_height,
-    };
-
-    let items: Vec<ListItem> = app
+    // The framed, scrollable list of models. The current model is marked
+    // with "(current)" and drawn in the title color.
+    let items: Vec<(String, bool)> = app
         .available_models
         .iter()
-        .enumerate()
-        .take(model_count as usize)
-        .map(|(i, name)| {
+        .map(|name| {
             let is_current = name == &app.model_name;
-            let is_selected = i == app.model_dialog_selection;
-
-            let mut spans = Vec::new();
-            if is_selected {
-                spans.push(Span::styled(
-                    " > ",
-                    Style::default()
-                        .fg(Color::Black)
-                        .bg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                ));
-            } else {
-                spans.push(Span::styled("   ", Style::default()));
-            }
-
-            let name_style = if is_current {
-                Style::default()
-                    .fg(app.theme.dialog_title_fg)
-                    .add_modifier(Modifier::BOLD)
-            } else if is_selected {
-                Style::default()
-                    .fg(app.theme.list_selected_fg)
-                    .bg(app.theme.list_selected_bg)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(app.theme.dialog_fg)
-            };
-
-            let display_name = if name.len() > 46 {
-                format!("{}...", crate::app::safe_prefix(&name, 43))
+            let display_name = if name.chars().count() > 46 {
+                format!("{}...", crate::app::safe_prefix(name, 43))
             } else {
                 name.clone()
             };
-
-            spans.push(Span::styled(display_name, name_style));
-
-            if is_current {
-                spans.push(Span::styled(
-                    " (current)",
-                    Style::default()
-                        .fg(app.theme.dialog_title_fg)
-                        .add_modifier(Modifier::ITALIC),
-                ));
-            }
-
-            ListItem::new(Line::from(spans))
+            let label = if is_current {
+                format!("{} (current)", display_name)
+            } else {
+                display_name
+            };
+            (label, is_current)
         })
         .collect();
+    let listbox = ui::ListBox::new(
+        items,
+        app.model_dialog_selection,
+        app.model_dialog_scroll,
+        app.model_dialog_focus == ModelDialogFocus::List,
+        "Models",
+    );
+    listbox.render(f, list_area, &app.theme);
 
-    let list = List::new(items);
-    f.render_widget(list, list_area);
+    // Info line: context window of the selected model (fetched live via
+    // /api/show; the same detection used to set num_ctx on confirm).
+    let selected_name = app.available_models.get(app.model_dialog_selection);
+    let info_text = match (&app.model_info, selected_name) {
+        (Some((name, Some(ctx))), Some(sel)) if name == sel => {
+            format!("Context: {} tokens", ctx)
+        }
+        (Some((name, None)), Some(sel)) if name == sel => "Context: unknown".to_string(),
+        _ => "Context: detecting...".to_string(),
+    };
+    let info = Paragraph::new(Line::from(Span::styled(
+        format!("  {}", info_text),
+        Style::default().fg(app.theme.dialog_fg),
+    )));
+    f.render_widget(
+        info,
+        Rect {
+            x: list_area.x,
+            y: info_y,
+            width: list_area.width,
+            height: 1,
+        },
+    );
 
     let confirm_btn = Button::new(
         "Confirm",
@@ -1219,6 +1205,7 @@ fn render_model_dialog(f: &mut Frame, app: &App, area: Rect) {
     let (confirm_text, confirm_style) = confirm_btn.render();
     let (cancel_text, cancel_style) = cancel_btn.render();
 
+    let inner = popup_area.inner(Margin::new(1, 1));
     let pad_to = |x: u16| " ".repeat(x.saturating_sub(inner.x) as usize);
     let gap = " ".repeat(cancel_x.saturating_sub(confirm_x + confirm_btn.width) as usize);
     let buttons = Line::from(vec![

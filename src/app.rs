@@ -1040,7 +1040,14 @@ pub struct App {
     pub available_models: Vec<String>,
     pub model_dialog_selection: usize,
     pub model_dialog_focus: ModelDialogFocus,
+    /// Scroll offset of the model picker's ListBox.
+    pub model_dialog_scroll: usize,
     pub models_rx: Option<mpsc::Receiver<Result<Vec<String>, String>>>,
+    /// Context-window info for the model currently selected in the
+    /// dialog: `(model_name, ctx)` — `None` ctx while fetching / unknown.
+    pub model_info: Option<(String, Option<u32>)>,
+    /// Receiver for the in-flight model-info fetch.
+    pub model_info_rx: Option<mpsc::Receiver<(String, Option<u32>)>>,
     /// Auto-detected Ollama context window (tokens) for the current model,
     /// from `/api/show` (`model_info.<arch>.context_length`). Used as the
     /// default `num_ctx` unless the user sets one explicitly. `None` until
@@ -1194,7 +1201,10 @@ impl App {
             available_models: Vec::new(),
             model_dialog_selection: 0,
             model_dialog_focus: ModelDialogFocus::List,
+            model_dialog_scroll: 0,
             models_rx: None,
+            model_info: None,
+            model_info_rx: None,
             ollama_ctx_length: None,
             ctx_rx: None,
             show_file_dialog: false,
@@ -3815,8 +3825,10 @@ impl App {
     fn open_model_dialog(&mut self) {
         self.show_model_dialog = true;
         self.model_dialog_selection = 0;
+        self.model_dialog_scroll = 0;
         self.model_dialog_focus = ModelDialogFocus::List;
         self.available_models.clear();
+        self.model_info = None;
         self.fetch_models_async();
     }
 
@@ -3876,6 +3888,8 @@ impl App {
                     {
                         self.model_dialog_selection = idx;
                     }
+                    // Show the selected model's context size right away.
+                    self.fetch_model_info_async();
                     self.models_rx = None;
                 }
                 Ok(Err(e)) => {
@@ -3888,6 +3902,19 @@ impl App {
                     changed = true;
                     self.available_models = vec!["Failed to fetch models".to_string()];
                     self.models_rx = None;
+                }
+            }
+        }
+        if let Some(rx) = &self.model_info_rx {
+            match rx.try_recv() {
+                Ok(info) => {
+                    changed = true;
+                    self.model_info = Some(info);
+                    self.model_info_rx = None;
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.model_info_rx = None;
                 }
             }
         }
@@ -3959,6 +3986,55 @@ impl App {
         });
     }
 
+    /// Starts an `/api/show` context-length fetch for the model
+    /// currently selected in the model dialog; the result lands in
+    /// `self.model_info` (polled by `check_model_responses`). Cloud
+    /// models get no fetch — their ctx comes from the config.
+    fn fetch_model_info_async(&mut self) {
+        let Some(model) = self
+            .available_models
+            .get(self.model_dialog_selection)
+            .cloned()
+        else {
+            return;
+        };
+        let is_cloud = self.cloud_models.iter().any(|m| m.name == model);
+        if is_cloud {
+            // num_ctx from the per-model config, if set.
+            let ctx = params_for_model(&model, &self.cloud_models, &self.model_params_store)
+                .num_ctx;
+            self.model_info = Some((model, ctx));
+            self.model_info_rx = None;
+            return;
+        }
+        let url = self.ollama_url.clone();
+        let (tx, rx) = mpsc::channel();
+        self.model_info_rx = Some(rx);
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let client = build_reqwest_client(&None);
+                let ctx = match client
+                    .post(format!("{}/api/show", url))
+                    .json(&serde_json::json!({ "model": model }))
+                    .timeout(std::time::Duration::from_secs(10))
+                    .send()
+                    .await
+                {
+                    Ok(resp) => match resp.json::<serde_json::Value>().await {
+                        Ok(json) => extract_context_length(&json),
+                        Err(_) => None,
+                    },
+                    Err(_) => None,
+                };
+                let _ = tx.send((model, ctx));
+            });
+        });
+    }
+
     fn handle_model_dialog_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Esc => {
@@ -3985,14 +4061,20 @@ impl App {
                 if self.model_dialog_focus == ModelDialogFocus::List
                     && !self.available_models.is_empty()
                 {
-                    self.model_dialog_selection = self.model_dialog_selection.saturating_sub(1);
+                    let max = self.available_models.len();
+                    // Wrap around: first entry -> last.
+                    self.model_dialog_selection =
+                        (self.model_dialog_selection + max - 1) % max;
+                    self.fetch_model_info_async();
                 }
             }
             KeyCode::Down => {
                 if self.model_dialog_focus == ModelDialogFocus::List {
                     let max = self.available_models.len();
-                    if max > 0 && self.model_dialog_selection < max - 1 {
-                        self.model_dialog_selection += 1;
+                    if max > 0 {
+                        // Wrap around: last entry -> first.
+                        self.model_dialog_selection = (self.model_dialog_selection + 1) % max;
+                        self.fetch_model_info_async();
                     }
                 }
             }
@@ -4032,11 +4114,10 @@ impl App {
 
     fn handle_model_dialog_click(&mut self, col: u16, row: u16, width: u16, height: u16) {
         let area = Rect::new(0, 0, width, height);
-        let model_count = self.available_models.len().min(12) as u16;
+        let model_count = self.available_models.len() as u16;
         // Same geometry the render path uses — no duplicated constants.
-        let (popup_area, inner, btn_y, confirm_x, cancel_x) =
+        let (popup_area, list_area, _info_y, btn_y, confirm_x, cancel_x) =
             crate::ui::model_dialog_geometry(model_count, area);
-        let inner_y = inner.y;
 
         if col < popup_area.x
             || col >= popup_area.x + popup_area.width
@@ -4047,12 +4128,26 @@ impl App {
             return;
         }
 
-        if row >= inner_y && row < inner_y + model_count {
-            let idx = (row - inner_y) as usize;
-            if idx < self.available_models.len() {
+        // Click inside the list box selects that model (and refreshes
+        // the context info shown below the list).
+        let items: Vec<(String, bool)> = self
+            .available_models
+            .iter()
+            .map(|n| (n.clone(), false))
+            .collect();
+        let listbox = crate::ui::ListBox::new(
+            items,
+            self.model_dialog_selection,
+            self.model_dialog_scroll,
+            true,
+            "Models",
+        );
+        if let Some(idx) = listbox.hit_test(row, list_area) {
+            if idx != self.model_dialog_selection {
                 self.model_dialog_selection = idx;
-                self.model_dialog_focus = ModelDialogFocus::List;
+                self.fetch_model_info_async();
             }
+            self.model_dialog_focus = ModelDialogFocus::List;
             return;
         }
 
