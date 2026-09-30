@@ -1427,7 +1427,7 @@ fn lsp_real_rust_analyzer() {
     }
     assert!(clean, "errors should clear after fixing the file");
 
-    // go_to_definition: resolve `main` on its own line (position 1:1, 0-based
+    // lsp_definition: resolve `main` on its own line (position 1:1, 0-based
     // line 0 char 0) → should point back into main.rs.
     let mut defs = Vec::new();
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
@@ -1448,7 +1448,7 @@ fn lsp_real_rust_analyzer() {
         "definition of main should be in main.rs"
     );
 
-    // lsp_hover: hover over `main` (the identifier at 0-based char 3 of
+    // lsp_symbol_info: hover over `main` (the identifier at 0-based char 3 of
     // `fn main() {`) → should show the fn signature. NB: hovering the
     // `fn` keyword (char 0) yields keyword docs, not the signature.
     let mut hover = String::new();

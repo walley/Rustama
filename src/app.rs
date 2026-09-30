@@ -1876,7 +1876,7 @@ impl App {
                 crate::lsp::LSP_REQUEST_TIMEOUT,
             ));
         }
-        if name == "go_to_definition" {
+        if name == "lsp_definition" {
             let args: serde_json::Value =
                 serde_json::from_str(args_json).unwrap_or(serde_json::json!({}));
             return Some(self.lsp_goto_definition(
@@ -1886,10 +1886,10 @@ impl App {
                 crate::lsp::LSP_REQUEST_TIMEOUT,
             ));
         }
-        if name == "lsp_hover" {
+        if name == "lsp_symbol_info" {
             let args: serde_json::Value =
                 serde_json::from_str(args_json).unwrap_or(serde_json::json!({}));
-            return Some(self.lsp_hover(
+            return Some(self.lsp_symbol_info(
                 args["path"].as_str(),
                 args["line"].as_u64(),
                 args["column"].as_u64(),
@@ -1920,7 +1920,7 @@ impl App {
         None
     }
 
-    /// Core of the `go_to_definition` tool: sync the file into the server,
+    /// Core of the `lsp_definition` tool: sync the file into the server,
     /// resolve the symbol at (line, column), format the target location(s).
     /// `line`/`column` are 1-based in the tool interface (matching how
     /// diagnostics are reported) but are converted to LSP's 0-based
@@ -1938,34 +1938,34 @@ impl App {
         // mandatory (unlike lsp_diagnostics which can fall back to a
         // workspace summary).
         let Some(path) = path else {
-            return "go_to_definition: `path` is required (the file to search in) and \
+            return "lsp_definition: `path` is required (the file to search in) and \
                 `line`/`column` (1-based) must point at the symbol."
                 .to_string();
         };
         let Some(line) = line else {
-            return "go_to_definition: `line` (1-based) is required.".to_string();
+            return "lsp_definition: `line` (1-based) is required.".to_string();
         };
         let Some(column) = column else {
-            return "go_to_definition: `column` (1-based) is required.".to_string();
+            return "lsp_definition: `column` (1-based) is required.".to_string();
         };
         if line == 0 || column == 0 {
-            return "go_to_definition: `line` and `column` are 1-based (>= 1).".to_string();
+            return "lsp_definition: `line` and `column` are 1-based (>= 1).".to_string();
         }
 
         match self.lsp.status() {
             LspStatus::Running => {}
             LspStatus::Stopped => {
-                return "go_to_definition: server not running. Enable it with `lsp = on` in \
+                return "lsp_definition: server not running. Enable it with `lsp = on` in \
                     rustama.conf (or /workspace <dir>) — requires rust-analyzer."
                     .to_string();
             }
-            LspStatus::Failed(e) => return format!("go_to_definition: server failed: {}", e),
+            LspStatus::Failed(e) => return format!("lsp_definition: server failed: {}", e),
             LspStatus::Starting => {} // rare; request below waits for analysis
         }
 
         let path = PathBuf::from(path);
         if let Err(e) = self.lsp.sync_file(&path) {
-            return format!("go_to_definition: cannot sync {}: {}", path.display(), e);
+            return format!("lsp_definition: cannot sync {}: {}", path.display(), e);
         }
 
         let root = self.lsp.root().to_path_buf();
@@ -1980,16 +1980,16 @@ impl App {
             Ok(locs) => locs,
             Err(e) if e.contains("cancelled") => {
                 return format!(
-                    "go_to_definition: {} not analyzed yet (server busy re-analyzing — try again)",
+                    "lsp_definition: {} not analyzed yet (server busy re-analyzing — try again)",
                     path.display()
                 );
             }
-            Err(e) => return format!("go_to_definition: request failed: {}", e),
+            Err(e) => return format!("lsp_definition: request failed: {}", e),
         };
 
         if locs.is_empty() {
             return format!(
-                "go_to_definition: no definition found for {}:{}:{}",
+                "lsp_definition: no definition found for {}:{}:{}",
                 path.display(),
                 line,
                 column
@@ -2006,7 +2006,7 @@ impl App {
     }
 
     /// Shared arg validation for the position-based LSP tools
-    /// (`lsp_hover`, `lsp_references`, `lsp_completion`): all need a
+    /// (`lsp_symbol_info`, `lsp_references`, `lsp_completion`): all need a
     /// `path` plus 1-based `line`/`column`. Returns `Ok((path, line,
     /// column))` or an error string describing the missing/invalid arg.
     fn lsp_position_args(
@@ -2062,21 +2062,21 @@ impl App {
         Ok(())
     }
 
-    /// Core of the `lsp_hover` tool: sync the file, fetch hover info for
+    /// Core of the `lsp_symbol_info` tool: sync the file, fetch hover info for
     /// the symbol at (line, column), return the rendered text.
-    fn lsp_hover(
+    fn lsp_symbol_info(
         &mut self,
         path: Option<&str>,
         line: Option<u64>,
         column: Option<u64>,
         timeout: std::time::Duration,
     ) -> String {
-        let (path, line, column) = match self.lsp_position_args("lsp_hover", path, line, column)
+        let (path, line, column) = match self.lsp_position_args("lsp_symbol_info", path, line, column)
         {
             Ok(t) => t,
             Err(e) => return e,
         };
-        if let Err(e) = self.lsp_position_preflight("lsp_hover", &path) {
+        if let Err(e) = self.lsp_position_preflight("lsp_symbol_info", &path) {
             return e;
         }
         let cancel = AtomicBool::new(false);
@@ -2090,15 +2090,15 @@ impl App {
             Ok(t) => t,
             Err(e) if e.contains("cancelled") => {
                 return format!(
-                    "lsp_hover: {} not analyzed yet (server busy re-analyzing — try again)",
+                    "lsp_symbol_info: {} not analyzed yet (server busy re-analyzing — try again)",
                     path.display()
                 );
             }
-            Err(e) => return format!("lsp_hover: request failed: {}", e),
+            Err(e) => return format!("lsp_symbol_info: request failed: {}", e),
         };
         if text.trim().is_empty() {
             format!(
-                "lsp_hover: no hover information for {}:{}:{}",
+                "lsp_symbol_info: no hover information for {}:{}:{}",
                 path.display(),
                 line,
                 column
@@ -5252,7 +5252,7 @@ impl App {
             ("/session rename <name>", "Rename current session"),
             ("/session load <name>", "Load a session by name"),
             ("/workspace <dir>", "LSP workspace root (restarts rust-analyzer)"),
-            ("/lsp [on|off]", "Toggle the rust-analyzer LSP server"),
+            ("/lsp [on|off|status]", "Show or control the rust-analyzer LSP server"),
             ("/justify", "Toggle paragraph justification"),
             ("/status", "Show app status"),
             ("/usage", "Session token usage & cost estimate"),
@@ -5532,8 +5532,8 @@ impl App {
         }
     }
 
-    /// `/lsp` turns the rust-analyzer LSP server on/off.
-    /// - `/lsp` → toggle: start if stopped, stop if running.
+    /// `/lsp` controls the rust-analyzer LSP server.
+    /// - `/lsp` → show current server state (same as `/lsp status`).
     /// - `/lsp on` → start in the configured/default workspace root.
     /// - `/lsp off` → stop the server.
     /// - `/lsp status` → show server status (same as `/workspace`).
@@ -5567,13 +5567,7 @@ impl App {
                 "LSP: off — server stopped (re-enable with /lsp on)".to_string()
             }
             Some("status") => self.slash_workspace(None),
-            None => {
-                if running {
-                    self.slash_lsp(Some("off"))
-                } else {
-                    self.slash_lsp(Some("on"))
-                }
-            }
+            None => self.slash_workspace(None),
             Some(other) => format!("Unknown /lsp argument '{}' — use: /lsp [on|off|status]", other),
         }
     }
@@ -6527,7 +6521,7 @@ fn get_tool_definitions() -> Vec<serde_json::Value> {
             "type": "function",
             "function": {
                 "name": "search_content",
-                "description": "Search file contents for a pattern (regex supported)",
+                "description": "Search file contents for a pattern (regex supported). Note: for Rust symbols, prefer lsp_references / lsp_definition — they are compiler-accurate.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -6647,7 +6641,7 @@ fn get_tool_definitions() -> Vec<serde_json::Value> {
             "type": "function",
             "function": {
                 "name": "lsp_diagnostics",
-                "description": "Get rust-analyzer compiler diagnostics (errors, warnings) for a Rust file via the LSP server. Use after editing .rs files to check that your changes compile. Requires the LSP server to be running (lsp = on in config, or /workspace <dir>).",
+                "description": "Get rust-analyzer compiler diagnostics (errors, warnings) for a Rust file. Always use this after editing .rs files to verify your changes compile. Requires the LSP server to be running (lsp = on in config, or /lsp on).",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -6666,8 +6660,8 @@ fn get_tool_definitions() -> Vec<serde_json::Value> {
         serde_json::json!({
             "type": "function",
             "function": {
-                "name": "go_to_definition",
-                "description": "Jump to the definition of the symbol at a given position in a Rust file via the LSP server (rust-analyzer). Returns the target file, line, column, and a source excerpt for each definition. Use to navigate the codebase / understand what a call site refers to. Requires the LSP server to be running (lsp = on in config, or /workspace <dir>).",
+                "name": "lsp_definition",
+                "description": "Jump to where a Rust symbol (function, struct, variable, etc.) is defined. Compiler-accurate via rust-analyzer — far more reliable than grep for finding the real definition. Returns the target file, line, column, and a source excerpt. Use whenever you want to know what a call site or name refers to. Requires the LSP server to be running (lsp = on in config, or /lsp on).",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -6677,11 +6671,11 @@ fn get_tool_definitions() -> Vec<serde_json::Value> {
                         },
                         "line": {
                             "type": "integer",
-                            "description": "1-based line number of the symbol."
+                            "description": "1-based line number of the symbol (point anywhere on the symbol's name)."
                         },
                         "column": {
                             "type": "integer",
-                            "description": "1-based column number of the symbol."
+                            "description": "1-based column number of the symbol (point anywhere on the symbol's name)."
                         }
                     },
                     "required": ["path", "line", "column"]
@@ -6691,8 +6685,8 @@ fn get_tool_definitions() -> Vec<serde_json::Value> {
         serde_json::json!({
             "type": "function",
             "function": {
-                "name": "lsp_hover",
-                "description": "Fetch hover documentation for the symbol at a given position in a Rust file via the LSP server (rust-analyzer). Returns the type signature and doc comment as plain text. Use to understand what a symbol does. Requires the LSP server to be running (lsp = on in config, or /workspace <dir>).",
+                "name": "lsp_symbol_info",
+                "description": "Get the type signature and documentation of any Rust symbol (function, struct, variable, etc.) at a file position, via rust-analyzer. Faster and more accurate than opening and reading the source file. Use whenever you need to understand what a symbol is or does. Requires the LSP server to be running (lsp = on in config, or /lsp on).",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -6702,11 +6696,11 @@ fn get_tool_definitions() -> Vec<serde_json::Value> {
                         },
                         "line": {
                             "type": "integer",
-                            "description": "1-based line number of the symbol."
+                            "description": "1-based line number of the symbol (point anywhere on the symbol's name)."
                         },
                         "column": {
                             "type": "integer",
-                            "description": "1-based column number of the symbol."
+                            "description": "1-based column number of the symbol (point anywhere on the symbol's name)."
                         }
                     },
                     "required": ["path", "line", "column"]
@@ -6717,7 +6711,7 @@ fn get_tool_definitions() -> Vec<serde_json::Value> {
             "type": "function",
             "function": {
                 "name": "lsp_references",
-                "description": "Find all references to the symbol at a given position in a Rust file via the LSP server (rust-analyzer). Returns each reference's file, line, column, and a source excerpt. Use to find where a symbol is used across the codebase. Requires the LSP server to be running (lsp = on in config, or /workspace <dir>).",
+                "description": "Find every place a Rust symbol is used, via rust-analyzer. Unlike grep, this is compiler-accurate — it won't match same-named symbols in other scopes or files. Returns each reference's file, line, column, and a source excerpt. Prefer this over search_content when working with Rust symbols. Requires the LSP server to be running (lsp = on in config, or /lsp on).",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -6727,11 +6721,11 @@ fn get_tool_definitions() -> Vec<serde_json::Value> {
                         },
                         "line": {
                             "type": "integer",
-                            "description": "1-based line number of the symbol."
+                            "description": "1-based line number of the symbol (point anywhere on the symbol's name)."
                         },
                         "column": {
                             "type": "integer",
-                            "description": "1-based column number of the symbol."
+                            "description": "1-based column number of the symbol (point anywhere on the symbol's name)."
                         },
                         "include_declaration": {
                             "type": "boolean",
@@ -6746,7 +6740,7 @@ fn get_tool_definitions() -> Vec<serde_json::Value> {
             "type": "function",
             "function": {
                 "name": "lsp_completion",
-                "description": "Request code completions at a given position in a Rust file via the LSP server (rust-analyzer). Returns a list of candidate labels (with optional type detail). Use to discover available members, methods, and identifiers at a cursor position. Requires the LSP server to be running (lsp = on in config, or /workspace <dir>).",
+                "description": "List valid code completions (methods, fields, functions, variables) at a cursor position in a Rust file, via rust-analyzer. Use to discover what members a type has or what identifiers are in scope, without reading the source. Requires the LSP server to be running (lsp = on in config, or /lsp on).",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -7408,8 +7402,8 @@ const TOOL_NAMES: &[&str] = &[
     "terminal_read",
     "terminal_close",
     "lsp_diagnostics",
-    "go_to_definition",
-    "lsp_hover",
+    "lsp_definition",
+    "lsp_symbol_info",
     "lsp_references",
     "lsp_completion",
 ];
@@ -9221,18 +9215,18 @@ mod lsp_tool_tests {
     }
 
     #[test]
-    fn tool_schema_and_names_include_go_to_definition() {
+    fn tool_schema_and_names_include_lsp_definition() {
         let defs = get_tool_definitions();
         let names: Vec<&str> = defs
             .iter()
             .filter_map(|t| t["function"]["name"].as_str())
             .collect();
-        assert!(names.contains(&"go_to_definition"));
-        assert!(TOOL_NAMES.contains(&"go_to_definition"));
+        assert!(names.contains(&"lsp_definition"));
+        assert!(TOOL_NAMES.contains(&"lsp_definition"));
         // required args present
         let def = defs
             .iter()
-            .find(|t| t["function"]["name"].as_str() == Some("go_to_definition"))
+            .find(|t| t["function"]["name"].as_str() == Some("lsp_definition"))
             .unwrap();
         assert_eq!(
             def["function"]["parameters"]["required"],
@@ -9247,7 +9241,7 @@ mod lsp_tool_tests {
             .iter()
             .filter_map(|t| t["function"]["name"].as_str())
             .collect();
-        for tool in ["lsp_hover", "lsp_references", "lsp_completion"] {
+        for tool in ["lsp_symbol_info", "lsp_references", "lsp_completion"] {
             assert!(names.contains(&tool), "schema missing {}", tool);
             assert!(TOOL_NAMES.contains(&tool), "TOOL_NAMES missing {}", tool);
             let def = defs
@@ -9265,7 +9259,7 @@ mod lsp_tool_tests {
     fn lsp_stretch_tools_report_stopped_server() {
         let mut app = test_app();
         let base = r#"{"path": "/tmp/x.rs", "line": 3, "column": 5}"#;
-        for tool in ["lsp_hover", "lsp_references", "lsp_completion"] {
+        for tool in ["lsp_symbol_info", "lsp_references", "lsp_completion"] {
             let out = app.execute_tool(tool, base);
             assert!(out.contains("not running"), "{}: got: {}", tool, out);
         }
@@ -9274,7 +9268,7 @@ mod lsp_tool_tests {
     #[test]
     fn lsp_stretch_tools_validate_args() {
         let mut app = test_app();
-        for tool in ["lsp_hover", "lsp_references", "lsp_completion"] {
+        for tool in ["lsp_symbol_info", "lsp_references", "lsp_completion"] {
             // Missing path.
             let out = app.execute_tool(tool, r#"{"line": 3, "column": 5}"#);
             assert!(out.contains("is required"), "{}: got: {}", tool, out);
@@ -9291,7 +9285,7 @@ mod lsp_tool_tests {
     fn goto_definition_tool_reports_stopped_server() {
         let mut app = test_app();
         let out = app.execute_tool(
-            "go_to_definition",
+            "lsp_definition",
             r#"{"path": "/tmp/x.rs", "line": 3, "column": 5}"#,
         );
         assert!(out.contains("not running"), "got: {}", out);
@@ -9301,17 +9295,17 @@ mod lsp_tool_tests {
     fn goto_definition_tool_validates_args() {
         let mut app = test_app();
         // Missing path.
-        let out = app.execute_tool("go_to_definition", r#"{"line": 3, "column": 5}"#);
+        let out = app.execute_tool("lsp_definition", r#"{"line": 3, "column": 5}"#);
         assert!(out.contains("is required"), "got: {}", out);
         // Missing line.
         let out = app.execute_tool(
-            "go_to_definition",
+            "lsp_definition",
             r#"{"path": "/tmp/x.rs", "column": 5}"#,
         );
         assert!(out.contains("line"), "got: {}", out);
         // Zero-based line rejected.
         let out = app.execute_tool(
-            "go_to_definition",
+            "lsp_definition",
             r#"{"path": "/tmp/x.rs", "line": 0, "column": 5}"#,
         );
         assert!(out.contains("1-based"), "got: {}", out);

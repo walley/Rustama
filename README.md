@@ -363,8 +363,8 @@ Switch at runtime with `/workspace <dir>` (restarts the server on the new root) 
 | Tool | Description |
 |------|-------------|
 | `lsp_diagnostics` | Compiler diagnostics for a `.rs` file (`path`, optional `severity` filter: error/warning/hint/info). No `path` → workspace-wide summary. **Auto-feedback:** a successful `edit_file`/`write_file` on a `.rs` file automatically appends fresh diagnostics to the tool result, so the model sees and fixes its own type errors |
-| `go_to_definition` | Jump to the definition of the symbol at `path`/`line`/`column` (1-based) — returns the target file, line, column, and a source excerpt |
-| `lsp_hover` | Hover info for the symbol at a position — type signature and doc comment |
+| `lsp_definition` | Jump to the definition of the symbol at `path`/`line`/`column` (1-based) — returns the target file, line, column, and a source excerpt |
+| `lsp_symbol_info` | Hover info for the symbol at a position — type signature and doc comment |
 | `lsp_references` | All references to the symbol at a position (optional `include_declaration`, default true) — file/line/column plus a source excerpt per hit |
 | `lsp_completion` | Code completions at a cursor position — candidate labels with type detail |
 
