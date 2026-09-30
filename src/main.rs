@@ -373,33 +373,54 @@ fn render_output(f: &mut Frame, app: &mut App, area: Rect) {
 
         for msg in &app.messages {
             match msg {
-                ChatMessage::User(text) => {
-                    for line in text.lines() {
-                        hist.push(Line::from(vec![
+                ChatMessage::User { text, ts } => {
+                    for (i, line) in text.lines().enumerate() {
+                        let mut spans = vec![
                             Span::styled(
                                 " > ",
                                 Style::default()
                                     .fg(Color::Cyan)
                                     .add_modifier(Modifier::BOLD),
                             ),
-                            Span::styled(
-                                line.to_string(),
-                                Style::default()
-                                    .fg(Color::Cyan)
-                                    .add_modifier(Modifier::BOLD),
-                            ),
-                        ]));
+                        ];
+                        // Timestamp banner on the first line of the
+                        // message; empty ts (legacy session) is skipped.
+                        if i == 0 && !ts.is_empty() {
+                            spans.push(Span::styled(
+                                format!("[{}] ", ts),
+                                Style::default().fg(Color::DarkGray),
+                            ));
+                        }
+                        spans.push(Span::styled(
+                            line.to_string(),
+                            Style::default()
+                                .fg(Color::Cyan)
+                                .add_modifier(Modifier::BOLD),
+                        ));
+                        hist.push(Line::from(spans));
                     }
                     hist.push(Line::from(""));
                 }
-                ChatMessage::Assistant(text) => {
+                ChatMessage::Assistant { text, ts } => {
+                    // Dim timestamp banner above the response body.
+                    if !ts.is_empty() {
+                        hist.push(Line::from(Span::styled(
+                            format!("  [{}]", ts),
+                            Style::default().fg(Color::DarkGray),
+                        )));
+                    }
                     let mut md_lines = render_markdown(text);
                     hist.append(&mut md_lines);
                 }
-                ChatMessage::System(text) => {
-                    for text_line in text.lines() {
+                ChatMessage::System { text, ts } => {
+                    for (i, text_line) in text.lines().enumerate() {
+                        let ts_prefix = if i == 0 && !ts.is_empty() {
+                            format!("[{}] ", ts)
+                        } else {
+                            String::new()
+                        };
                         hist.push(Line::from(Span::styled(
-                            format!("  {}", text_line),
+                            format!("  {}{}", ts_prefix, text_line),
                             Style::default()
                                 .fg(Color::DarkGray)
                                 .add_modifier(Modifier::ITALIC),
@@ -407,10 +428,15 @@ fn render_output(f: &mut Frame, app: &mut App, area: Rect) {
                     }
                     hist.push(Line::from(""));
                 }
-                ChatMessage::App(text) => {
-                    for text_line in text.lines() {
+                ChatMessage::App { text, ts } => {
+                    for (i, text_line) in text.lines().enumerate() {
+                        let ts_prefix = if i == 0 && !ts.is_empty() {
+                            format!("[{}] ", ts)
+                        } else {
+                            String::new()
+                        };
                         hist.push(Line::from(Span::styled(
-                            format!("  {}", text_line),
+                            format!("  {}{}", ts_prefix, text_line),
                             Style::default()
                                 .fg(Color::DarkGray)
                                 .add_modifier(Modifier::ITALIC),
@@ -418,7 +444,13 @@ fn render_output(f: &mut Frame, app: &mut App, area: Rect) {
                     }
                     hist.push(Line::from(""));
                 }
-                ChatMessage::Thinking(text) => {
+                ChatMessage::Thinking { text, ts } => {
+                    if !ts.is_empty() {
+                        hist.push(Line::from(Span::styled(
+                            format!("  [{}]", ts),
+                            Style::default().fg(Color::DarkGray),
+                        )));
+                    }
                     let mut in_code = false;
                     for text_line in text.lines() {
                         let trimmed = text_line.trim();
@@ -438,9 +470,14 @@ fn render_output(f: &mut Frame, app: &mut App, area: Rect) {
                     }
                     hist.push(Line::from(""));
                 }
-                ChatMessage::FileContent { name, content } => {
+                ChatMessage::FileContent { name, content, ts } => {
+                    let ts_prefix = if ts.is_empty() {
+                        String::new()
+                    } else {
+                        format!("[{}] ", ts)
+                    };
                     hist.push(Line::from(Span::styled(
-                        format!("  \u{1F4C4} {}", name),
+                        format!("  \u{1F4C4} {}{}", ts_prefix, name),
                         Style::default()
                             .fg(Color::Cyan)
                             .add_modifier(Modifier::BOLD),
@@ -453,12 +490,14 @@ fn render_output(f: &mut Frame, app: &mut App, area: Rect) {
                     name,
                     arguments,
                     tool_call_id,
+                    ts,
+                    ..
                 } => {
                     tool_call_num += 1;
                     if let Some(id) = tool_call_id {
                         call_numbers.insert(id.clone(), tool_call_num);
                     }
-                    hist.push(Line::from(vec![
+                    let mut call_spans = vec![
                         Span::styled(
                             " \u{2699} ",
                             Style::default()
@@ -471,7 +510,14 @@ fn render_output(f: &mut Frame, app: &mut App, area: Rect) {
                                 .fg(Color::Yellow)
                                 .add_modifier(Modifier::BOLD),
                         ),
-                    ]));
+                    ];
+                    if !ts.is_empty() {
+                        call_spans.push(Span::styled(
+                            format!("  [{}]", ts),
+                            Style::default().fg(Color::DarkGray),
+                        ));
+                    }
+                    hist.push(Line::from(call_spans));
                     let pretty_args = serde_json::from_str::<serde_json::Value>(arguments)
                         .ok()
                         .and_then(|v| serde_json::to_string_pretty(&v).ok())
@@ -488,6 +534,8 @@ fn render_output(f: &mut Frame, app: &mut App, area: Rect) {
                     name,
                     content,
                     tool_call_id,
+                    ts,
+                    ..
                 } => {
                     // Pair the result with its tool call's #id: match by
                     // tool_call_id when present (results may arrive out
@@ -503,7 +551,7 @@ fn render_output(f: &mut Frame, app: &mut App, area: Rect) {
                             result_num
                         }
                     };
-                    hist.push(Line::from(vec![
+                    let mut result_spans = vec![
                         Span::styled(
                             " \u{2714} ",
                             Style::default()
@@ -516,7 +564,14 @@ fn render_output(f: &mut Frame, app: &mut App, area: Rect) {
                                 .fg(Color::Green)
                                 .add_modifier(Modifier::BOLD),
                         ),
-                    ]));
+                    ];
+                    if !ts.is_empty() {
+                        result_spans.push(Span::styled(
+                            format!("  [{}]", ts),
+                            Style::default().fg(Color::DarkGray),
+                        ));
+                    }
+                    hist.push(Line::from(result_spans));
                     // edit_file results (diffs) render in full — no
                     // byte/line shortening; other tools keep the
                     // compact preview.
@@ -1384,6 +1439,7 @@ fn render_settings_dialog(f: &mut Frame, app: &App, area: Rect) {
         ("Max Retries:", SettingsFocus::MaxRetries),
         ("Num Ctx:", SettingsFocus::NumCtx),
         ("Justify:", SettingsFocus::Justify),
+        ("LSP:", SettingsFocus::Lsp),
     ];
 
     for (i, (label, focus)) in field_labels.iter().enumerate() {
@@ -1409,8 +1465,12 @@ fn render_settings_dialog(f: &mut Frame, app: &App, area: Rect) {
         };
         f.render_widget(label_para, label_area);
 
-        if *focus == SettingsFocus::Justify {
-            let checked = app.settings_justify;
+        if matches!(*focus, SettingsFocus::Justify | SettingsFocus::Lsp) {
+            let checked = match *focus {
+                SettingsFocus::Justify => app.settings_justify,
+                SettingsFocus::Lsp => app.settings_lsp,
+                _ => unreachable!(),
+            };
             let toggle_text = if checked { "[X]" } else { "[ ]" };
             let toggle_style = if *focus == app.settings_focus {
                 Style::default()
@@ -2309,11 +2369,11 @@ mod tool_result_full_tests {
         // from "Diagnostics: " on renders magenta.
         let content = "Successfully edited /tmp/x.rs\n@@ -1,2 +1,2 @@\n-old line\n+new line\n\nDiagnostics: LSP diagnostics for /tmp/x.rs:\n/tmp/x.rs:2:5: [error] boom\n";
         let mut app = test_app();
-        app.messages = vec![ChatMessage::ToolResult {
-            name: "edit_file".to_string(),
-            content: content.to_string(),
-            tool_call_id: None,
-        }];
+        app.messages = vec![ChatMessage::tool_result(
+            "edit_file".to_string(),
+            content.to_string(),
+            None,
+        )];
         let backend = TestBackend::new(120, 60);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
@@ -2347,11 +2407,11 @@ mod tool_result_full_tests {
     #[test]
     fn edit_file_renders_in_full() {
         assert!(tool_result_renders_full("edit_file"));
-        let view = render_view(vec![ChatMessage::ToolResult {
-            name: "edit_file".to_string(),
-            content: long_diff(),
-            tool_call_id: None,
-        }]);
+        let view = render_view(vec![ChatMessage::tool_result(
+            "edit_file".to_string(),
+            long_diff(),
+            None,
+        )]);
         // Every diff line is visible — including the last one…
         assert!(view.contains("+ added line 29"), "diff truncated:\n{}", view);
         // …and there is no "more lines" shortening note.
@@ -2361,11 +2421,11 @@ mod tool_result_full_tests {
     #[test]
     fn other_tools_keep_the_compact_preview() {
         assert!(!tool_result_renders_full("read_file"));
-        let view = render_view(vec![ChatMessage::ToolResult {
-            name: "read_file".to_string(),
-            content: long_diff(),
-            tool_call_id: None,
-        }]);
+        let view = render_view(vec![ChatMessage::tool_result(
+            "read_file".to_string(),
+            long_diff(),
+            None,
+        )]);
         // First 20 lines visible, the tail cut with the note.
         assert!(view.contains("+ added line 19"), "first lines missing:\n{}", view);
         assert!(!view.contains("+ added line 29"), "result not truncated:\n{}", view);
@@ -2411,19 +2471,19 @@ mod tool_call_id_tests {
     }
 
     fn tool_call(id: Option<&str>, name: &str) -> ChatMessage {
-        ChatMessage::ToolCall {
-            name: name.to_string(),
-            arguments: "{}".to_string(),
-            tool_call_id: id.map(|s| s.to_string()),
-        }
+        ChatMessage::tool_call(
+            name.to_string(),
+            "{}".to_string(),
+            id.map(|s| s.to_string()),
+        )
     }
 
     fn tool_result(id: Option<&str>, name: &str) -> ChatMessage {
-        ChatMessage::ToolResult {
-            name: name.to_string(),
-            content: "ok".to_string(),
-            tool_call_id: id.map(|s| s.to_string()),
-        }
+        ChatMessage::tool_result(
+            name.to_string(),
+            "ok".to_string(),
+            id.map(|s| s.to_string()),
+        )
     }
 
     #[test]

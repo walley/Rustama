@@ -103,9 +103,9 @@ pub fn dialog_block(title: &str, theme: &Theme) -> Block<'static> {
 
 /// Settings dialog popup size (width × height).
 pub const SETTINGS_DIALOG_W: u16 = 60;
-pub const SETTINGS_DIALOG_H: u16 = 29;
+pub const SETTINGS_DIALOG_H: u16 = 31;
 /// Number of label+value rows in the dialog (drives the button row).
-pub const SETTINGS_FIELD_COUNT: u16 = 13;
+pub const SETTINGS_FIELD_COUNT: u16 = 14;
 
 /// Shared geometry of the Settings dialog: the renderer (main.rs
 /// `render_settings_dialog`) and the mouse hit-test (app.rs
@@ -1843,16 +1843,16 @@ mod tests {
 
     #[test]
     fn settings_dialog_buttons_inside_border() {
-        // 100x40 terminal: popup 60x29 centered at (20, 5).
+        // 100x40 terminal: popup 60x31 centered at (20, 4).
         let l = settings_dialog_layout(Rect::new(0, 0, 100, 40));
-        assert_eq!(l.popup, Rect::new(20, 5, 60, 29));
+        assert_eq!(l.popup, Rect::new(20, 4, 60, 31));
         assert_eq!(l.inner_x, 22);
-        assert_eq!(l.inner_y, 6);
+        assert_eq!(l.inner_y, 5);
         assert_eq!(l.inner_w, 56);
-        // Fields: inner_y + i*2, last of 13 at +24; one blank row (+25);
-        // buttons on the last inner row (+26) — strictly above the
-        // bottom border (popup.y + 28).
-        assert_eq!(l.btn_y, l.inner_y + 26);
+        // Fields: inner_y + i*2, last of 14 at +26; one blank row (+27);
+        // buttons on the last inner row (+28) — strictly above the
+        // bottom border (popup.y + 30).
+        assert_eq!(l.btn_y, l.inner_y + 28);
         assert!(l.btn_y < l.popup.y + l.popup.height - 1);
         assert!(l.btn_y > l.inner_y + (SETTINGS_FIELD_COUNT - 1) * 2);
     }

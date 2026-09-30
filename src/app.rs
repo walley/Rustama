@@ -196,13 +196,14 @@ pub enum SettingsFocus {
     MaxRetries,
     NumCtx,
     Justify,
+    Lsp,
     Save,
     Cancel,
 }
 
 impl SettingsFocus {
     /// Field order used by Tab/BackTab and Up/Down navigation.
-    const ORDER: [SettingsFocus; 15] = [
+    const ORDER: [SettingsFocus; 16] = [
         SettingsFocus::Proxy,
         SettingsFocus::OllamaUrl,
         SettingsFocus::Temperature,
@@ -216,6 +217,7 @@ impl SettingsFocus {
         SettingsFocus::MaxRetries,
         SettingsFocus::NumCtx,
         SettingsFocus::Justify,
+        SettingsFocus::Lsp,
         SettingsFocus::Save,
         SettingsFocus::Cancel,
     ];
@@ -250,27 +252,106 @@ impl SettingsFocus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[allow(dead_code)]
 pub enum ChatMessage {
-    User(String),
-    Assistant(String),
-    System(String),
-    App(String),
-    Thinking(String),
+    User {
+        text: String,
+        /// Creation time "DD-MM-YYYY, HH:MM:SS"; empty on legacy
+        /// (pre-timestamp) session files.
+        #[serde(default)]
+        ts: String,
+    },
+    Assistant {
+        text: String,
+        #[serde(default)]
+        ts: String,
+    },
+    System {
+        text: String,
+        #[serde(default)]
+        ts: String,
+    },
+    App {
+        text: String,
+        #[serde(default)]
+        ts: String,
+    },
+    Thinking {
+        text: String,
+        #[serde(default)]
+        ts: String,
+    },
     FileContent {
         name: String,
         content: String,
+        #[serde(default)]
+        ts: String,
     },
     ToolCall {
         name: String,
         arguments: String,
         tool_call_id: Option<String>,
+        #[serde(default)]
+        ts: String,
     },
     ToolResult {
         name: String,
         content: String,
         tool_call_id: Option<String>,
+        #[serde(default)]
+        ts: String,
     },
+}
+
+impl ChatMessage {
+    /// Current local time as "DD-MM-YYYY, HH:MM:SS".
+    pub fn now_ts() -> String {
+        chrono::Local::now().format("%d-%m-%Y, %H:%M:%S").to_string()
+    }
+
+    /// The message's timestamp ("" when a legacy session file has none).
+    pub fn ts(&self) -> &str {
+        match self {
+            Self::User { ts, .. }
+            | Self::Assistant { ts, .. }
+            | Self::System { ts, .. }
+            | Self::App { ts, .. }
+            | Self::Thinking { ts, .. }
+            | Self::FileContent { ts, .. }
+            | Self::ToolCall { ts, .. }
+            | Self::ToolResult { ts, .. } => ts,
+        }
+    }
+
+    // Auto-stamping constructors — every site below uses these so no
+    // message can ever be created without its timestamp.
+
+    pub fn user(text: String) -> Self {
+        Self::User { text, ts: Self::now_ts() }
+    }
+    pub fn assistant(text: String) -> Self {
+        Self::Assistant { text, ts: Self::now_ts() }
+    }
+    /// Unused today (system messages only come from session files) but
+    /// kept for symmetry with the other auto-stamping constructors.
+    #[allow(dead_code)]
+    pub fn system(text: String) -> Self {
+        Self::System { text, ts: Self::now_ts() }
+    }
+    pub fn app(text: String) -> Self {
+        Self::App { text, ts: Self::now_ts() }
+    }
+    pub fn thinking(text: String) -> Self {
+        Self::Thinking { text, ts: Self::now_ts() }
+    }
+    pub fn file_content(name: String, content: String) -> Self {
+        Self::FileContent { name, content, ts: Self::now_ts() }
+    }
+    pub fn tool_call(name: String, arguments: String, tool_call_id: Option<String>) -> Self {
+        Self::ToolCall { name, arguments, tool_call_id, ts: Self::now_ts() }
+    }
+    pub fn tool_result(name: String, content: String, tool_call_id: Option<String>) -> Self {
+        Self::ToolResult { name, content, tool_call_id, ts: Self::now_ts() }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -1122,6 +1203,8 @@ pub struct App {
     pub terminal_state: TerminalState,
     pub justify: bool,
     pub settings_justify: bool,
+    /// Settings-dialog staging for the LSP on/off checkbox (applied on Save).
+    pub settings_lsp: bool,
     /// Show the hint bar (second-to-last line) with key hints and the
     /// focus indicator. Config: `hintbar` in rustama.conf (default off).
     pub hintbar: bool,
@@ -1147,6 +1230,10 @@ pub struct App {
     pub lsp_server: String,
     /// Whether config asked for LSP at startup (`lsp = on`).
     pub lsp_enabled: bool,
+    /// Configured LSP workspace root (`lsp_workspace`); empty = derive
+    /// from `save_path`/cwd. Remembered so `/lsp on` and the Settings
+    /// checkbox can restart the server on the same root.
+    pub lsp_workspace: String,
     /// Append fresh diagnostics to edit_file/write_file tool results
     /// (`lsp_auto_diagnostics`).
     pub lsp_auto_diagnostics: bool,
@@ -1166,7 +1253,7 @@ impl App {
         // Resolved before `cfg` fields move into the struct below.
         let lsp_root = resolve_lsp_workspace(&cfg.lsp_workspace, &cfg.save_path);
         let mut app = App {
-            messages: vec![ChatMessage::App(
+            messages: vec![ChatMessage::app(
                 "Welcome to Rustama. Start typing your message.".to_string(),
             )],
             textarea,
@@ -1275,6 +1362,7 @@ impl App {
             },
             justify: cfg.justify,
             settings_justify: cfg.justify,
+            settings_lsp: cfg.lsp,
             hintbar: cfg.hintbar,
             selection_start: None,
             selection_end: None,
@@ -1289,6 +1377,7 @@ impl App {
             lsp: crate::lsp::LspClient::new(),
             lsp_server: cfg.lsp_server.clone(),
             lsp_enabled: cfg.lsp,
+            lsp_workspace: cfg.lsp_workspace.clone(),
             lsp_auto_diagnostics: cfg.lsp_auto_diagnostics,
             last_edited_file: None,
         };
@@ -1750,7 +1839,7 @@ impl App {
     /// left in `Failed` state and the tools report it.
     pub fn start_lsp(&mut self, root: PathBuf, server_bin: String) {
         if !root.join("Cargo.toml").exists() {
-            self.messages.push(ChatMessage::App(format!(
+            self.messages.push(ChatMessage::app(format!(
                 "⚠ No Cargo.toml in {} — rust-analyzer will only parse single files.",
                 root.display()
             )));
@@ -2390,17 +2479,17 @@ impl App {
 
         if !self.streaming_thinking.is_empty() {
             self.messages
-                .push(ChatMessage::Thinking(self.streaming_thinking.clone()));
+                .push(ChatMessage::thinking(self.streaming_thinking.clone()));
             self.streaming_thinking.clear();
         }
         if !self.streaming_text.is_empty() {
             self.messages
-                .push(ChatMessage::Assistant(self.streaming_text.clone()));
+                .push(ChatMessage::assistant(self.streaming_text.clone()));
             self.log_event("ASSISTANT", &self.streaming_text);
             self.streaming_text.clear();
         }
         self.messages
-            .push(ChatMessage::App("⏹ Stopped by user (F7)".to_string()));
+            .push(ChatMessage::app("⏹ Stopped by user (F7)".to_string()));
         self.log_event("STOP", "request interrupted by user (F7)");
         self.autosave_session();
         self.status_message = "⏹ Request stopped".to_string();
@@ -2453,20 +2542,20 @@ impl App {
                         // Commit any partial thinking
                         if !self.streaming_thinking.is_empty() {
                             self.messages
-                                .push(ChatMessage::Thinking(self.streaming_thinking.clone()));
+                                .push(ChatMessage::thinking(self.streaming_thinking.clone()));
                             self.streaming_thinking.clear();
                         }
                         // Commit partial assistant text (may be incomplete)
                         if !self.streaming_text.is_empty() {
                             self.messages
-                                .push(ChatMessage::Assistant(self.streaming_text.clone()));
+                                .push(ChatMessage::assistant(self.streaming_text.clone()));
                             self.log_event("ASSISTANT", &self.streaming_text);
                             self.streaming_text.clear();
                         }
                         // Discard partial tool-call map (arguments JSON may be incomplete)
                         self.pending_tool_calls.clear();
                         // Push visible warning — Done handler will set_auto_scroll
-                        self.messages.push(ChatMessage::App(format!(
+                        self.messages.push(ChatMessage::app(format!(
                             "⚠ {} Increase max_output_tokens in cloud_models.conf or model_params.conf.",
                             msg
                         )));
@@ -2475,12 +2564,12 @@ impl App {
                         changed = true;
                         if !self.streaming_thinking.is_empty() {
                             self.messages
-                                .push(ChatMessage::Thinking(self.streaming_thinking.clone()));
+                                .push(ChatMessage::thinking(self.streaming_thinking.clone()));
                             self.streaming_thinking.clear();
                         }
                         if !self.streaming_text.is_empty() {
                             self.messages
-                                .push(ChatMessage::Assistant(self.streaming_text.clone()));
+                                .push(ChatMessage::assistant(self.streaming_text.clone()));
                             self.log_event("ASSISTANT", &self.streaming_text);
                             self.streaming_text.clear();
                         }
@@ -2512,11 +2601,11 @@ impl App {
                                     .unwrap_or_else(|| format!("call_{}", &name)),
                             );
 
-                            self.messages.push(ChatMessage::ToolCall {
-                                name: name.clone(),
-                                arguments: args.clone(),
-                                tool_call_id: tool_call_id.clone(),
-                            });
+                            self.messages.push(ChatMessage::tool_call(
+                                name.clone(),
+                                args.clone(),
+                                tool_call_id.clone(),
+                            ));
 
                             let result = self.execute_tool(&name, &args);
                             self.tool_call_count += 1;
@@ -2527,11 +2616,11 @@ impl App {
                                 &format!("{}({}) -> {}", name, args, truncate(&result, 500)),
                             );
 
-                            self.messages.push(ChatMessage::ToolResult {
+                            self.messages.push(ChatMessage::tool_result(
                                 name,
-                                content: result,
+                                result,
                                 tool_call_id,
-                            });
+                            ));
                         }
                         self.pending_tool_calls = tool_calls;
                         self.is_loading = false;
@@ -2545,7 +2634,7 @@ impl App {
                         self.response_rx = None;
                         self.tool_round_count += 1;
                         if self.tool_round_count >= self.max_tool_rounds {
-                            self.messages.push(ChatMessage::App(format!(
+                            self.messages.push(ChatMessage::app(format!(
                                 "Reached max tool rounds ({}/{} rounds, {} tool calls). Stopping.",
                                 self.tool_round_count, self.max_tool_rounds, self.tool_call_count
                             )));
@@ -2576,7 +2665,7 @@ impl App {
                             self.response_rx = None;
                             if self.agentic_mode && self.continuation_count < 3 {
                                 self.continuation_count += 1;
-                                self.messages.push(ChatMessage::App(format!(
+                                self.messages.push(ChatMessage::app(format!(
                                     "Auto-continuing (attempt {}/3)...",
                                     self.continuation_count
                                 )));
@@ -2593,7 +2682,7 @@ impl App {
 
                         if !self.streaming_thinking.is_empty() {
                             self.messages
-                                .push(ChatMessage::Thinking(self.streaming_thinking.clone()));
+                                .push(ChatMessage::thinking(self.streaming_thinking.clone()));
                             self.streaming_thinking.clear();
                         }
                         if !self.streaming_text.is_empty() {
@@ -2604,11 +2693,11 @@ impl App {
                                     let name = tc["name"].as_str().unwrap_or("unknown").to_string();
                                     let args = tc["parameters"].to_string();
                                     let tc_id = format!("call_{}", &name);
-                                    self.messages.push(ChatMessage::ToolCall {
-                                        name: name.clone(),
-                                        arguments: args.clone(),
-                                        tool_call_id: Some(tc_id.clone()),
-                                    });
+                                    self.messages.push(ChatMessage::tool_call(
+                                        name.clone(),
+                                        args.clone(),
+                                        Some(tc_id.clone()),
+                                    ));
                                     let result = self.execute_tool(&name, &args);
                                     self.tool_call_count += 1;
                                     self.tool_call_log.push((
@@ -2625,11 +2714,11 @@ impl App {
                                             truncate(&result, 500)
                                         ),
                                     );
-                                    self.messages.push(ChatMessage::ToolResult {
+                                    self.messages.push(ChatMessage::tool_result(
                                         name,
-                                        content: result,
-                                        tool_call_id: Some(tc_id),
-                                    });
+                                        result,
+                                        Some(tc_id),
+                                    ));
                                 }
                                 self.streaming_thinking.clear();
                                 self.streaming_text.clear();
@@ -2639,7 +2728,7 @@ impl App {
                                 self.response_rx = None;
                                 self.tool_round_count += 1;
                                 if self.tool_round_count >= self.max_tool_rounds {
-                                    self.messages.push(ChatMessage::App(
+                                    self.messages.push(ChatMessage::app(
                                         format!("Reached max tool rounds ({}/{} rounds, {} tool calls). Stopping.", self.tool_round_count, self.max_tool_rounds, self.tool_call_count),
                                     ));
                                     self.set_auto_scroll();
@@ -2658,7 +2747,7 @@ impl App {
                             let unfinished = self.agentic_mode && needs_continuation(&text);
                             let wants_more =
                                 unfinished && self.auto_continue_count < MAX_AUTO_CONTINUES;
-                            self.messages.push(ChatMessage::Assistant(text));
+                            self.messages.push(ChatMessage::assistant(text));
                             self.streaming_thinking.clear();
                             self.streaming_text.clear();
                             if wants_more {
@@ -2670,7 +2759,7 @@ impl App {
                                         self.auto_continue_count, MAX_AUTO_CONTINUES
                                     ),
                                 );
-                                self.messages.push(ChatMessage::App(format!(
+                                self.messages.push(ChatMessage::app(format!(
                                     "Model stopped mid-thought — auto-sending \"continue\" ({}/{})...",
                                     self.auto_continue_count, MAX_AUTO_CONTINUES
                                 )));
@@ -2679,13 +2768,13 @@ impl App {
                                 break;
                             }
                             if unfinished {
-                                self.messages.push(ChatMessage::App(format!(
+                                self.messages.push(ChatMessage::app(format!(
                                     "Auto-continue limit ({}) reached — type \"continue\" to keep going.",
                                     MAX_AUTO_CONTINUES
                                 )));
                             }
                         } else {
-                            self.messages.push(ChatMessage::App(
+                            self.messages.push(ChatMessage::app(
                                 "Error: Empty response from model".to_string(),
                             ));
                         }
@@ -2705,20 +2794,20 @@ impl App {
                             !self.streaming_thinking.is_empty() || !self.streaming_text.is_empty();
                         if !self.streaming_thinking.is_empty() {
                             self.messages
-                                .push(ChatMessage::Thinking(self.streaming_thinking.clone()));
+                                .push(ChatMessage::thinking(self.streaming_thinking.clone()));
                             self.streaming_thinking.clear();
                         }
                         if !self.streaming_text.is_empty() {
                             self.messages
-                                .push(ChatMessage::Assistant(self.streaming_text.clone()));
+                                .push(ChatMessage::assistant(self.streaming_text.clone()));
                             self.streaming_text.clear();
                         }
                         if had_content {
-                            self.messages.push(ChatMessage::App(
+                            self.messages.push(ChatMessage::app(
                                 "⚠ Stream ended unexpectedly (partial response shown)".to_string(),
                             ));
                         } else {
-                            self.messages.push(ChatMessage::App(msg));
+                            self.messages.push(ChatMessage::app(msg));
                         }
                         self.autosave_session();
                         self.is_loading = false;
@@ -2734,16 +2823,16 @@ impl App {
                             !self.streaming_thinking.is_empty() || !self.streaming_text.is_empty();
                         if !self.streaming_thinking.is_empty() {
                             self.messages
-                                .push(ChatMessage::Thinking(self.streaming_thinking.clone()));
+                                .push(ChatMessage::thinking(self.streaming_thinking.clone()));
                             self.streaming_thinking.clear();
                         }
                         if !self.streaming_text.is_empty() {
                             self.messages
-                                .push(ChatMessage::Assistant(self.streaming_text.clone()));
+                                .push(ChatMessage::assistant(self.streaming_text.clone()));
                             self.streaming_text.clear();
                         }
                         if had_content {
-                            self.messages.push(ChatMessage::App(
+                            self.messages.push(ChatMessage::app(
                                 "⚠ Stream ended unexpectedly (partial response shown)".to_string(),
                             ));
                         }
@@ -2760,15 +2849,15 @@ impl App {
                         changed = true;
                         if !self.streaming_thinking.is_empty() {
                             self.messages
-                                .push(ChatMessage::Thinking(self.streaming_thinking.clone()));
+                                .push(ChatMessage::thinking(self.streaming_thinking.clone()));
                             self.streaming_thinking.clear();
                         }
                         if !self.streaming_text.is_empty() {
                             self.messages
-                                .push(ChatMessage::Assistant(self.streaming_text.clone()));
+                                .push(ChatMessage::assistant(self.streaming_text.clone()));
                             self.streaming_text.clear();
                         } else {
-                            self.messages.push(ChatMessage::App(
+                            self.messages.push(ChatMessage::app(
                                 "Error: Connection to background task lost.".to_string(),
                             ));
                         }
@@ -2807,21 +2896,21 @@ impl App {
 
         for m in &self.messages {
             match m {
-                ChatMessage::User(t) => {
+                ChatMessage::User { text: t, .. } => {
                     api_messages.push(serde_json::json!({"role": "user", "content": t}));
                 }
-                ChatMessage::Assistant(t) => {
+                ChatMessage::Assistant { text: t, .. } => {
                     api_messages.push(serde_json::json!({"role": "assistant", "content": t}));
                 }
-                ChatMessage::System(_) => {}
-                ChatMessage::App(_) => {}
-                ChatMessage::Thinking(t) => {
+                ChatMessage::System { .. } => {}
+                ChatMessage::App { .. } => {}
+                ChatMessage::Thinking { text: t, .. } => {
                     api_messages.push(serde_json::json!({
                         "role": "system",
                         "content": format!("Your previous reasoning (interrupted): {}", t),
                     }));
                 }
-                ChatMessage::FileContent { name, content } => {
+                ChatMessage::FileContent { name, content, .. } => {
                     api_messages.push(serde_json::json!({
                         "role": "user",
                         "content": format!("Here is the content of `{}`:\n\n{}", name, content)
@@ -2831,6 +2920,7 @@ impl App {
                     name,
                     arguments,
                     tool_call_id,
+                    ..
                 } => {
                     let args_value: serde_json::Value = if is_cloud {
                         serde_json::json!(arguments)
@@ -2859,6 +2949,7 @@ impl App {
                     name,
                     content,
                     tool_call_id,
+                    ..
                 } => {
                     let mut msg = serde_json::json!({
                         "role": "tool",
@@ -2941,14 +3032,14 @@ impl App {
 
         if let Some(result) = self.handle_slash_command(&prompt) {
             if !result.is_empty() {
-                self.messages.push(ChatMessage::App(result));
+                self.messages.push(ChatMessage::app(result));
             }
             self.set_auto_scroll();
             return;
         }
 
         if !prompt.is_empty() {
-            self.messages.push(ChatMessage::User(prompt));
+            self.messages.push(ChatMessage::user(prompt));
             // Persist the turn boundary so a crash never loses the prompt.
             self.autosave_session();
         }
@@ -2979,21 +3070,21 @@ impl App {
 
         for m in &self.messages {
             match m {
-                ChatMessage::User(t) => {
+                ChatMessage::User { text: t, .. } => {
                     api_messages.push(serde_json::json!({"role": "user", "content": t}));
                 }
-                ChatMessage::Assistant(t) => {
+                ChatMessage::Assistant { text: t, .. } => {
                     api_messages.push(serde_json::json!({"role": "assistant", "content": t}));
                 }
-                ChatMessage::System(_) => {}
-                ChatMessage::App(_) => {}
-                ChatMessage::Thinking(t) => {
+                ChatMessage::System { .. } => {}
+                ChatMessage::App { .. } => {}
+                ChatMessage::Thinking { text: t, .. } => {
                     api_messages.push(serde_json::json!({
                         "role": "system",
                         "content": format!("Your previous reasoning (interrupted): {}", t),
                     }));
                 }
-                ChatMessage::FileContent { name, content } => {
+                ChatMessage::FileContent { name, content, .. } => {
                     api_messages.push(serde_json::json!({
                         "role": "user",
                         "content": format!("Here is the content of `{}`:\n\n{}", name, content)
@@ -3003,6 +3094,7 @@ impl App {
                     name,
                     arguments,
                     tool_call_id,
+                    ..
                 } => {
                     let args_value: serde_json::Value = if is_cloud {
                         serde_json::json!(arguments)
@@ -3031,6 +3123,7 @@ impl App {
                     name,
                     content,
                     tool_call_id,
+                    ..
                 } => {
                     let mut msg = serde_json::json!({
                         "role": "tool",
@@ -3095,46 +3188,73 @@ impl App {
         let is_md = self.export_format == ExportFormat::Markdown;
         let mut content = String::new();
         for msg in &self.messages {
+            // Timestamp prefix "DD-MM-YYYY, HH:MM:SS — " (empty on
+            // legacy messages loaded from pre-timestamp session files).
+            let ts = msg.ts();
+            let ts_prefix = if ts.is_empty() {
+                String::new()
+            } else {
+                format!("{} — ", ts)
+            };
             match msg {
-                ChatMessage::User(t) => {
+                ChatMessage::User { text: t, .. } => {
                     if is_md {
-                        content.push_str(&format!("**User:** {}\n\n", t));
+                        content.push_str(&format!("**[{}] User:** {}\n\n", ts_prefix.trim_end(), t));
                     } else {
-                        content.push_str(&format!("User: {}\n\n", t));
+                        content.push_str(&format!("[{}] User: {}\n\n", ts_prefix.trim_end(), t));
                     }
                 }
-                ChatMessage::Assistant(t) => {
+                ChatMessage::Assistant { text: t, .. } => {
                     if is_md {
-                        content.push_str(&format!("**Assistant:** {}\n\n", t));
+                        content.push_str(&format!(
+                            "**[{}] Assistant:** {}\n\n",
+                            ts_prefix.trim_end(),
+                            t
+                        ));
                     } else {
-                        content.push_str(&format!("Assistant: {}\n\n", t));
+                        content.push_str(&format!("[{}] Assistant: {}\n\n", ts_prefix.trim_end(), t));
                     }
                 }
-                ChatMessage::System(t) => {
+                ChatMessage::System { text: t, .. } => {
                     if is_md {
-                        content.push_str(&format!("_{}_\n\n", t));
+                        content.push_str(&format!("_[{}] {}_\n\n", ts_prefix.trim_end(), t));
                     } else {
-                        content.push_str(&format!("System: {}\n\n", t));
+                        content.push_str(&format!("[{}] System: {}\n\n", ts_prefix.trim_end(), t));
                     }
                 }
-                ChatMessage::App(t) => {
-                    content.push_str(&format!("{}\n\n", t));
+                ChatMessage::App { text: t, .. } => {
+                    content.push_str(&format!("[{}] {}\n\n", ts_prefix.trim_end(), t));
                 }
-                ChatMessage::Thinking(t) => {
+                ChatMessage::Thinking { text: t, .. } => {
                     if is_md {
-                        content.push_str(&format!("_Thinking:_ {}\n\n", t));
+                        content.push_str(&format!(
+                            "_[{}] Thinking:_ {}\n\n",
+                            ts_prefix.trim_end(),
+                            t
+                        ));
                     } else {
-                        content.push_str(&format!("Thinking: {}\n\n", t));
+                        content.push_str(&format!("[{}] Thinking: {}\n\n", ts_prefix.trim_end(), t));
                     }
                 }
                 ChatMessage::FileContent {
                     name,
                     content: file_content,
+                    ..
                 } => {
                     if is_md {
-                        content.push_str(&format!("**File:** `{}`\n\n{}\n\n", name, file_content));
+                        content.push_str(&format!(
+                            "**[{}] File:** `{}`\n\n{}\n\n",
+                            ts_prefix.trim_end(),
+                            name,
+                            file_content
+                        ));
                     } else {
-                        content.push_str(&format!("File: {}\n{}\n\n", name, file_content));
+                        content.push_str(&format!(
+                            "[{}] File: {}\n{}\n\n",
+                            ts_prefix.trim_end(),
+                            name,
+                            file_content
+                        ));
                     }
                 }
                 ChatMessage::ToolCall {
@@ -3142,11 +3262,18 @@ impl App {
                 } => {
                     if is_md {
                         content.push_str(&format!(
-                            "**Tool Call:** `{}`\n```\n{}\n```\n\n",
-                            name, arguments
+                            "**[{}] Tool Call:** `{}`\n```\n{}\n```\n\n",
+                            ts_prefix.trim_end(),
+                            name,
+                            arguments
                         ));
                     } else {
-                        content.push_str(&format!("Tool Call: {}\n{}\n\n", name, arguments));
+                        content.push_str(&format!(
+                            "[{}] Tool Call: {}\n{}\n\n",
+                            ts_prefix.trim_end(),
+                            name,
+                            arguments
+                        ));
                     }
                 }
                 ChatMessage::ToolResult {
@@ -3156,11 +3283,18 @@ impl App {
                 } => {
                     if is_md {
                         content.push_str(&format!(
-                            "**Tool Result:** `{}`\n```\n{}\n```\n\n",
-                            name, result
+                            "**[{}] Tool Result:** `{}`\n```\n{}\n```\n\n",
+                            ts_prefix.trim_end(),
+                            name,
+                            result
                         ));
                     } else {
-                        content.push_str(&format!("Tool Result: {}\n{}\n\n", name, result));
+                        content.push_str(&format!(
+                            "[{}] Tool Result: {}\n{}\n\n",
+                            ts_prefix.trim_end(),
+                            name,
+                            result
+                        ));
                     }
                 }
             }
@@ -3249,6 +3383,12 @@ impl App {
             max_tool_rounds: self.max_tool_rounds,
             max_retries: self.max_retries,
             terminal_width_pct: self.terminal_state.width_pct,
+            justify: self.justify,
+            hintbar: self.hintbar,
+            lsp: self.lsp_enabled,
+            lsp_server: self.lsp_server.clone(),
+            lsp_workspace: self.lsp_workspace.clone(),
+            lsp_auto_diagnostics: self.lsp_auto_diagnostics,
             ..Config::default()
         };
         cfg.save()?;
@@ -3276,7 +3416,7 @@ impl App {
     /// starting the app never litters the sessions directory.
     /// Failures are only logged — autosave must stay unobtrusive.
     pub fn autosave_session(&mut self) {
-        if !self.messages.iter().any(|m| matches!(m, ChatMessage::User(_))) {
+        if !self.messages.iter().any(|m| matches!(m, ChatMessage::User { .. })) {
             return;
         }
         match self.save_session() {
@@ -3293,7 +3433,7 @@ impl App {
         let previous = self.session_name.clone();
         self.session_id = generate_session_id();
         self.session_name = self.session_id.clone();
-        self.messages = vec![ChatMessage::App(format!(
+        self.messages = vec![ChatMessage::app(format!(
             "New session started. Previous session saved as {}.",
             previous
         ))];
@@ -3318,7 +3458,7 @@ impl App {
         let json =
             std::fs::read_to_string(&path).map_err(|e| format!("Session not found: {}", e))?;
         let data: serde_json::Value = serde_json::from_str(&json).map_err(|e| e.to_string())?;
-        let mut msgs: Vec<ChatMessage> = serde_json::from_value(data["messages"].clone())
+        let mut msgs: Vec<ChatMessage> = parse_messages(&data["messages"])
             .map_err(|e| format!("Invalid session data: {}", e))?;
         patch_tool_call_ids(&mut msgs);
         self.messages = msgs;
@@ -3364,7 +3504,7 @@ impl App {
                 return;
             }
         };
-        let mut msgs: Vec<ChatMessage> = match serde_json::from_value(data["messages"].clone()) {
+        let mut msgs: Vec<ChatMessage> = match parse_messages(&data["messages"]) {
             Ok(m) => m,
             Err(e) => {
                 self.status_message = format!("Invalid session data: {}", e);
@@ -4198,6 +4338,7 @@ impl App {
             self.params.reasoning_effort.clone().unwrap_or_default();
         self.settings_max_tool_rounds = self.max_tool_rounds.to_string();
         self.settings_justify = self.justify;
+        self.settings_lsp = self.lsp_enabled;
         self.settings_num_ctx = self
             .params
             .num_ctx
@@ -4207,7 +4348,10 @@ impl App {
 
     fn handle_settings_dialog_key(&mut self, key: KeyEvent) {
         let is_text_field = self.settings_focus.is_text_field();
-        let is_toggle = self.settings_focus == SettingsFocus::Justify;
+        let is_toggle = matches!(
+            self.settings_focus,
+            SettingsFocus::Justify | SettingsFocus::Lsp
+        );
 
         match key.code {
             KeyCode::Esc => {
@@ -4233,7 +4377,7 @@ impl App {
                 if is_text_field {
                     self.settings_cursor = self.settings_cursor.saturating_sub(1);
                 } else if is_toggle {
-                    self.settings_justify = !self.settings_justify;
+                    self.toggle_settings_checkbox();
                 } else if self.settings_focus == SettingsFocus::Save {
                     self.settings_focus = SettingsFocus::Cancel;
                 } else if self.settings_focus == SettingsFocus::Cancel {
@@ -4247,7 +4391,7 @@ impl App {
                         self.settings_cursor += 1;
                     }
                 } else if is_toggle {
-                    self.settings_justify = !self.settings_justify;
+                    self.toggle_settings_checkbox();
                 } else if self.settings_focus == SettingsFocus::Save {
                     self.settings_focus = SettingsFocus::Cancel;
                 } else if self.settings_focus == SettingsFocus::Cancel {
@@ -4301,7 +4445,7 @@ impl App {
             }
             KeyCode::Enter | KeyCode::Char(' ') if !is_text_field => {
                 if is_toggle {
-                    self.settings_justify = !self.settings_justify;
+                    self.toggle_settings_checkbox();
                 } else {
                     match self.settings_focus {
                         SettingsFocus::Save => self.confirm_settings(),
@@ -4310,6 +4454,16 @@ impl App {
                     }
                 }
             }
+            _ => {}
+        }
+    }
+
+    /// Toggles the checkbox field currently focused in the Settings
+    /// dialog (Justify or LSP). No-op on text fields / buttons.
+    fn toggle_settings_checkbox(&mut self) {
+        match self.settings_focus {
+            SettingsFocus::Justify => self.settings_justify = !self.settings_justify,
+            SettingsFocus::Lsp => self.settings_lsp = !self.settings_lsp,
             _ => {}
         }
     }
@@ -4383,6 +4537,18 @@ impl App {
             self.max_retries = v;
         }
         self.justify = self.settings_justify;
+        // LSP checkbox: apply immediately — start/stop rust-analyzer to
+        // match the new state (on the configured/default workspace root).
+        if self.settings_lsp != self.lsp_enabled {
+            if self.settings_lsp {
+                let root = resolve_lsp_workspace(&self.lsp_workspace, &self.save_path);
+                let server = self.lsp_server.clone();
+                self.start_lsp(root, server);
+            } else {
+                self.stop_lsp();
+                self.lsp_enabled = false;
+            }
+        }
         let _ = self.save_config();
         self.show_settings_dialog = false;
         self.status_message = "Settings saved".to_string();
@@ -4423,15 +4589,16 @@ impl App {
             (SettingsFocus::MaxRetries, "Max Retries:"),
             (SettingsFocus::NumCtx, "Num Ctx:"),
             (SettingsFocus::Justify, "Justify:"),
+            (SettingsFocus::Lsp, "LSP:"),
         ];
 
         for (i, (focus, _label)) in fields.iter().enumerate() {
             let field_y = inner_y + i as u16 * 2;
             let max_w = inner_w.saturating_sub(16);
             if row == field_y {
-                if *focus == SettingsFocus::Justify {
-                    self.settings_focus = SettingsFocus::Justify;
-                    self.settings_justify = !self.settings_justify;
+                if matches!(*focus, SettingsFocus::Justify | SettingsFocus::Lsp) {
+                    self.settings_focus = *focus;
+                    self.toggle_settings_checkbox();
                     return;
                 } else if col >= inner_x + 14 && col < inner_x + 14 + max_w + 2 {
                     self.settings_focus = *focus;
@@ -4621,14 +4788,13 @@ impl App {
                         return;
                     }
                 };
-                let mut msgs: Vec<ChatMessage> =
-                    match serde_json::from_value(data["messages"].clone()) {
-                        Ok(m) => m,
-                        Err(e) => {
-                            self.status_message = format!("Invalid session data: {}", e);
-                            return;
-                        }
-                    };
+                let mut msgs: Vec<ChatMessage> = match parse_messages(&data["messages"]) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        self.status_message = format!("Invalid session data: {}", e);
+                        return;
+                    }
+                };
                 patch_tool_call_ids(&mut msgs);
                 self.messages = msgs;
                 self.streaming_text.clear();
@@ -4651,10 +4817,7 @@ impl App {
             match std::fs::read_to_string(&path) {
                 Ok(content) => {
                     let display_path = path.display().to_string();
-                    self.messages.push(ChatMessage::FileContent {
-                        name: display_path,
-                        content,
-                    });
+                    self.messages.push(ChatMessage::file_content(display_path, content));
                     self.set_auto_scroll();
                     self.status_message = format!("Loaded: {}", name);
                 }
@@ -5035,6 +5198,7 @@ impl App {
                     .to_string(),
             }),
             "workspace" => Some(self.slash_workspace(arg)),
+            "lsp" => Some(self.slash_lsp(arg)),
             "justify" => {
                 self.justify = !self.justify;
                 Some(
@@ -5088,6 +5252,7 @@ impl App {
             ("/session rename <name>", "Rename current session"),
             ("/session load <name>", "Load a session by name"),
             ("/workspace <dir>", "LSP workspace root (restarts rust-analyzer)"),
+            ("/lsp [on|off]", "Toggle the rust-analyzer LSP server"),
             ("/justify", "Toggle paragraph justification"),
             ("/status", "Show app status"),
             ("/usage", "Session token usage & cost estimate"),
@@ -5364,6 +5529,52 @@ impl App {
                     format!("LSP failed to start in {}: {}", root.display(), self.status_message)
                 }
             }
+        }
+    }
+
+    /// `/lsp` turns the rust-analyzer LSP server on/off.
+    /// - `/lsp` → toggle: start if stopped, stop if running.
+    /// - `/lsp on` → start in the configured/default workspace root.
+    /// - `/lsp off` → stop the server.
+    /// - `/lsp status` → show server status (same as `/workspace`).
+    fn slash_lsp(&mut self, arg: Option<&str>) -> String {
+        let running = self.lsp.status() == crate::lsp::LspStatus::Running;
+        match arg {
+            Some("on") => {
+                if running {
+                    return format!(
+                        "LSP: already running (workspace: {})",
+                        self.lsp.root().display()
+                    );
+                }
+                let root = resolve_lsp_workspace(&self.lsp_workspace, &self.save_path);
+                self.start_lsp(root.clone(), self.lsp_server.clone());
+                if self.lsp.status() == crate::lsp::LspStatus::Running {
+                    format!("LSP: on — rust-analyzer running ({})", root.display())
+                } else {
+                    format!("LSP failed to start: {}", self.status_message)
+                }
+            }
+            Some("off") => {
+                if !running
+                    && self.lsp.status() == crate::lsp::LspStatus::Stopped
+                    && !self.lsp_enabled
+                {
+                    return "LSP: already off".to_string();
+                }
+                self.stop_lsp();
+                self.lsp_enabled = false;
+                "LSP: off — server stopped (re-enable with /lsp on)".to_string()
+            }
+            Some("status") => self.slash_workspace(None),
+            None => {
+                if running {
+                    self.slash_lsp(Some("off"))
+                } else {
+                    self.slash_lsp(Some("on"))
+                }
+            }
+            Some(other) => format!("Unknown /lsp argument '{}' — use: /lsp [on|off|status]", other),
         }
     }
 
@@ -5963,6 +6174,71 @@ mod truncate_tests {
         let out = truncate("───", 1);
         assert!(out.starts_with("... ("));
     }
+}
+
+/// Deserializes a session's `messages` array, upgrading legacy
+/// tuple-style payloads (`{"User": "text"}`) to the struct form with an
+/// empty `ts` (rendered without a timestamp).
+fn parse_messages(value: &serde_json::Value) -> Result<Vec<ChatMessage>, serde_json::Error> {
+    let upgraded = upgrade_legacy_messages(value.clone());
+    serde_json::from_value(upgraded)
+}
+
+/// Rewrites pre-timestamp session payloads (tuple variants) into the
+/// struct-variant shape. New-format files pass through untouched.
+fn upgrade_legacy_messages(mut value: serde_json::Value) -> serde_json::Value {
+    let Some(arr) = value.as_array_mut() else {
+        return value;
+    };
+    for msg in arr.iter_mut() {
+        let Some(obj) = msg.as_object_mut() else { continue };
+        // One key per message (externally tagged enum).
+        let Some((kind, payload)) = obj.iter().next() else { continue };
+        let legacy_text = match payload {
+            serde_json::Value::String(_) => true,
+            serde_json::Value::Array(items) => items.iter().all(|i| i.is_string()),
+            _ => false,
+        };
+        if !legacy_text {
+            continue;
+        }
+        let kind = kind.clone();
+        let payload = obj.get(&kind).cloned().unwrap_or_default();
+        let fields = match payload {
+            // {"User": "text"} -> {"User": {"text": ..., "ts": ""}}
+            serde_json::Value::String(text) => serde_json::json!({ "text": text, "ts": "" }),
+            // {"ToolCall": ["name", "args", null]} -> struct form
+            serde_json::Value::Array(items) => {
+                let name = items.first().cloned().unwrap_or_default();
+                let second = items.get(1).cloned().unwrap_or_default();
+                let third = items.get(2).cloned().unwrap_or_default();
+                match kind.as_str() {
+                    "ToolCall" => serde_json::json!({
+                        "name": name,
+                        "arguments": second,
+                        "tool_call_id": third,
+                        "ts": "",
+                    }),
+                    "ToolResult" => serde_json::json!({
+                        "name": name,
+                        "content": second,
+                        "tool_call_id": third,
+                        "ts": "",
+                    }),
+                    "FileContent" => serde_json::json!({
+                        "name": name,
+                        "content": second,
+                        "ts": "",
+                    }),
+                    _ => serde_json::Value::Array(items.clone()),
+                }
+            }
+            _ => payload,
+        };
+        obj.clear();
+        obj.insert(kind, fields);
+    }
+    value
 }
 
 fn patch_tool_call_ids(msgs: &mut [ChatMessage]) {
@@ -7382,15 +7658,15 @@ mod menu_focus_tests {
         let has_assistant = app
             .messages
             .iter()
-            .any(|m| matches!(m, ChatMessage::Assistant(t) if t == "partial answer"));
+            .any(|m| matches!(m, ChatMessage::Assistant { text: t, .. } if t == "partial answer"));
         let has_thinking = app
             .messages
             .iter()
-            .any(|m| matches!(m, ChatMessage::Thinking(t) if t == "partial thinking"));
+            .any(|m| matches!(m, ChatMessage::Thinking { text: t, .. } if t == "partial thinking"));
         let has_marker = app
             .messages
             .iter()
-            .any(|m| matches!(m, ChatMessage::App(t) if t.contains("Stopped by user")));
+            .any(|m| matches!(m, ChatMessage::App { text: t, .. } if t.contains("Stopped by user")));
         assert!(has_assistant, "partial answer committed");
         assert!(has_thinking, "partial thinking committed");
         assert!(has_marker, "stopped marker pushed");
@@ -7420,7 +7696,7 @@ mod menu_focus_tests {
         assert!(
             app.messages
                 .iter()
-                .any(|m| matches!(m, ChatMessage::App(t) if t.contains("Stopped by user")))
+                .any(|m| matches!(m, ChatMessage::App { text: t, .. } if t.contains("Stopped by user")))
         );
     }
 }
@@ -9207,5 +9483,145 @@ mod file_dialog_tests {
         app.scroll_up();
         assert_eq!(app.file_dialog_selection, 0);
         assert_eq!(app.file_dialog_scroll, 0);
+    }
+}
+
+#[cfg(test)]
+mod timestamp_tests {
+    use super::*;
+
+    fn test_app() -> App {
+        let cfg = crate::config::Config {
+            logging: false,
+            logfile: std::env::temp_dir()
+                .join(format!("rustama-test-{}.log", std::process::id()))
+                .to_string_lossy()
+                .to_string(),
+            ..crate::config::Config::default()
+        };
+        App::new(cfg)
+    }
+
+    #[test]
+    fn now_ts_matches_requested_format() {
+        // DD-MM-YYYY, HH:MM:SS — 19 chars, digits+dashes+comma+colons.
+        let ts = ChatMessage::now_ts();
+        let parts: Vec<&str> = ts.splitn(2, ", ").collect();
+        assert_eq!(parts.len(), 2, "missing time part: {}", ts);
+        let date: Vec<&str> = parts[0].split('-').collect();
+        assert_eq!(date.len(), 3, "bad date: {}", ts);
+        assert_eq!(date[0].len(), 2, "day not 2 digits: {}", ts);
+        assert_eq!(date[1].len(), 2, "month not 2 digits: {}", ts);
+        assert_eq!(date[2].len(), 4, "year not 4 digits: {}", ts);
+        let time: Vec<&str> = parts[1].split(':').collect();
+        assert_eq!(time.len(), 3, "bad time: {}", ts);
+        assert!(time.iter().all(|p| p.len() == 2 && p.chars().all(|c| c.is_ascii_digit())),
+            "bad time: {}", ts);
+    }
+
+    #[test]
+    fn constructors_stamp_messages() {
+        let u = ChatMessage::user("hi".to_string());
+        let a = ChatMessage::assistant("hello".to_string());
+        let t = ChatMessage::thinking("hm".to_string());
+        let c = ChatMessage::tool_call("bash".to_string(), "{}".to_string(), None);
+        let r = ChatMessage::tool_result("bash".to_string(), "ok".to_string(), None);
+        let f = ChatMessage::file_content("a.rs".to_string(), "fn main(){}".to_string());
+        for m in [&u, &a, &t, &c, &r, &f] {
+            assert!(!m.ts().is_empty(), "message missing timestamp: {:?}", m);
+            // Same format as now_ts.
+            assert_eq!(m.ts().len(), 20, "unexpected ts: {}", m.ts());
+        }
+    }
+
+    #[test]
+    fn legacy_tuple_session_upgrades_and_loads() {
+        // Exact shape of a pre-timestamp session file: tuple-style
+        // User/Assistant/App plus struct-style ToolCall/ToolResult.
+        let legacy = serde_json::json!([
+            {"App": "Welcome to Rustama. Start typing your message."},
+            {"User": "hi"},
+            {"Assistant": "hello!"},
+            {"Thinking": "pondering"},
+            {"FileContent": ["notes.txt", "some content"]},
+            {"ToolCall": {"name": "bash", "arguments": "{\"cmd\":\"ls\"}", "tool_call_id": Some("call_1")}},
+            {"ToolResult": {"name": "bash", "content": "file.txt", "tool_call_id": Some("call_1")}},
+        ]);
+        let msgs = parse_messages(&legacy).expect("legacy session should parse");
+        assert_eq!(msgs.len(), 7);
+        // Tuple-style entries upgraded with empty (legacy) ts.
+        for m in &msgs {
+            assert_eq!(m.ts(), "", "legacy ts should be empty: {:?}", m);
+        }
+        assert!(matches!(&msgs[1], ChatMessage::User { text, .. } if text == "hi"));
+        assert!(matches!(&msgs[2], ChatMessage::Assistant { text, .. } if text == "hello!"));
+        assert!(matches!(&msgs[4], ChatMessage::FileContent { name, content, .. }
+            if name == "notes.txt" && content == "some content"));
+        assert!(matches!(&msgs[5], ChatMessage::ToolCall { name, arguments, tool_call_id, .. }
+            if name == "bash" && arguments == "{\"cmd\":\"ls\"}"
+                && tool_call_id.as_deref() == Some("call_1")));
+        assert!(matches!(&msgs[6], ChatMessage::ToolResult { name, content, tool_call_id, .. }
+            if name == "bash" && content == "file.txt"));
+    }
+
+    #[test]
+    fn new_format_session_roundtrips_with_ts() {
+        let msgs = vec![
+            ChatMessage::user("q".to_string()),
+            ChatMessage::assistant("a".to_string()),
+        ];
+        let ts0 = msgs[0].ts().to_string();
+        let json = serde_json::to_value(&msgs).unwrap();
+        let back: Vec<ChatMessage> = parse_messages(&json).unwrap();
+        assert_eq!(back[0].ts(), ts0, "timestamp lost in roundtrip");
+        assert!(matches!(&back[1], ChatMessage::Assistant { text, .. } if text == "a"));
+    }
+
+    #[test]
+    fn load_session_end_to_end() {
+        // Write a legacy-style session file and load it via the app.
+        let dir = std::env::temp_dir().join(format!("rustama-ts-load-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sess = dir.join("legacytest.session.rustama");
+        std::fs::write(
+            &sess,
+            r#"{"messages": [{"App": "Welcome"}, {"User": "hi"}, {"Assistant": "hello!"}]}"#,
+        )
+        .unwrap();
+        // sessions_dir() is Documents/rustama — load_session looks there,
+        // so test via parse_messages on the raw file instead.
+        let raw = std::fs::read_to_string(&sess).unwrap();
+        let data: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let msgs = parse_messages(&data["messages"]).unwrap();
+        assert_eq!(msgs.len(), 3);
+        assert!(matches!(&msgs[1], ChatMessage::User { text, .. } if text == "hi"));
+        let _ = std::fs::remove_dir_all(&dir);
+        // Keep test_app referenced so the helper stays used if extended.
+        let _ = test_app();
+    }
+
+    #[test]
+    fn real_legacy_sessions_in_documents_dir_parse() {
+        // Runs against the developer's actual saved sessions — skips
+        // silently when the directory does not exist.
+        let dir = dirs_home().join("Documents/rustama");
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return; // not on this machine
+        };
+        let mut checked = 0;
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !name.ends_with(".session.rustama") {
+                continue;
+            }
+            let Ok(raw) = std::fs::read_to_string(entry.path()) else { continue };
+            let Ok(data) = serde_json::from_str::<serde_json::Value>(&raw) else { continue };
+            let msgs = parse_messages(&data["messages"])
+                .unwrap_or_else(|e| panic!("{} failed to parse: {}", name, e));
+            assert!(!msgs.is_empty(), "{} is empty", name);
+            checked += 1;
+        }
+        assert!(checked > 0, "no sessions found in {}", dir.display());
+        eprintln!("checked {} real session files", checked);
     }
 }
