@@ -14,6 +14,13 @@ use ratatui::widgets::{
 ///pub const MC_GREEN: Color = Color::Rgb(0, 187, 187);
 pub const MC_GREEN: Color = Color::Cyan;
 
+/// Code-block background in the chat output. Applied by `markdown.rs`
+/// (`render_markdown()` fence headers, `highlight_code()` body lines) and
+/// by the thinking-block rendering in main.rs; `wrap_and_justify_lines()`
+/// (main.rs) keys on it to leave code lines unwrapped/unjustified. Single
+/// source of truth — reference the constant, never the raw `Rgb` value.
+pub const CODE_BLOCK_BG: Color = Color::Rgb(30, 60, 120);
+
 #[derive(Debug, Clone)]
 /// mc-style dialog colors (observed from mc's "Configuration options"
 /// dialog): white background, black text, blue titles/hotkeys, cyan
