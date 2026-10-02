@@ -8,10 +8,17 @@ pub struct Config {
     pub model: String,
     pub save_path: String,
     pub agentic: bool,
+    /// Startup workflow mode: "chat", "coder" (former agentic), or
+    /// "assistant" (tool use, but not for coding). When absent, the
+    /// legacy `agentic` flag decides: true → coder, false → chat.
+    pub mode: String,
     pub timeout_secs: u64,
     pub logging: bool,
     pub logfile: String,
-    pub system_prompt: String,
+    /// System prompt for Coder mode (legacy key: `system_prompt`).
+    pub system_prompt_coder: String,
+    /// System prompt for Assistant mode.
+    pub system_prompt_assistant: String,
     pub proxy: Option<String>,
     pub max_tool_rounds: usize,
     pub max_retries: u32,
@@ -245,10 +252,12 @@ impl Default for Config {
             model: "llama3.2:3b".to_string(),
             save_path: "output.md".to_string(),
             agentic: true,
+            mode: "coder".to_string(),
             timeout_secs: 300,
             logging: true,
             logfile: "rustama.log".to_string(),
-            system_prompt: "You are a coding assistant with access to tools. When the user asks you to do something, use the available tools to accomplish the task. Always use tools when needed - do not just describe what you would do. Execute the actual tool calls. After using a tool, continue working until the task is complete.".to_string(),
+            system_prompt_coder: "You are a coding assistant with access to tools. When the user asks you to do something, use the available tools to accomplish the task. Always use tools when needed - do not just describe what you would do. Execute the actual tool calls. After using a tool, continue working until the task is complete.".to_string(),
+            system_prompt_assistant: "You are a helpful assistant".to_string(),
             proxy: None,
             max_tool_rounds: 10,
             max_retries: 10,
@@ -274,6 +283,9 @@ impl Config {
             if let Ok(content) = fs::read_to_string(&conf_path) {
                 let cfg = Self::parse(&content);
                 let dflt = Config::default();
+                // Migrate the legacy single `system_prompt` key: its value
+                // becomes the coder prompt, not the hardcoded default.
+                let coder_default = cfg.system_prompt_coder.clone();
                 let missing: Vec<(String, String)> = vec![
                     (
                         "logging".to_string(),
@@ -284,7 +296,15 @@ impl Config {
                         },
                     ),
                     ("logfile".to_string(), dflt.logfile.clone()),
-                    ("system_prompt".to_string(), dflt.system_prompt.clone()),
+                    ("mode".to_string(), dflt.mode.clone()),
+                    (
+                        "system_prompt_coder".to_string(),
+                        coder_default,
+                    ),
+                    (
+                        "system_prompt_assistant".to_string(),
+                        dflt.system_prompt_assistant.clone(),
+                    ),
                     (
                         "justify".to_string(),
                         if dflt.justify {
@@ -312,7 +332,16 @@ impl Config {
 
                 let mut updated = content.clone();
                 for (key, value) in &missing {
-                    if !content.contains(key) {
+                    // Match a real `key = ...` line, not a substring of a
+                    // longer key (e.g. "mode" inside "model").
+                    let has_key = content.lines().any(|l| {
+                        let l = l.trim();
+                        !l.starts_with('#')
+                            && !l.starts_with(';')
+                            && l.split_once('=')
+                                .is_some_and(|(k, _)| k.trim() == key)
+                    });
+                    if !has_key {
                         if !updated.ends_with('\n') {
                             updated.push('\n');
                         }
@@ -343,16 +372,21 @@ impl Config {
              model = {}\n\n\
              # Default save path\n\
              save_path = {}\n\n\
-             # Enable agentic mode on startup (true/false)\n\
+             # Enable agentic mode on startup (true/false) — legacy,\n\
+             # superseded by `mode` below\n\
              agentic = {}\n\n\
+             # Startup workflow mode: chat, coder, or assistant\n\
+             mode = {}\n\n\
              # HTTP request timeout in seconds\n\
              timeout_secs = {}\n\n\
              # Enable logging on startup (true/yes/on or false/no/off)\n\
              logging = {}\n\n\
              # Log file path\n\
              logfile = {}\n\n\
-             # System prompt (set via /setsystem command)\n\
-             system_prompt = {}\n\n\
+             # System prompt for Coder mode (set via /setsystem command)\n\
+             system_prompt_coder = {}\n\n\
+             # System prompt for Assistant mode\n\
+             system_prompt_assistant = {}\n\n\
              # HTTP proxy URL (optional, e.g. http://proxy:8080)\n\
              # proxy = http://proxy:8080\n\n\
              # Max agentic tool rounds per request (1-100, default: 10)\n\
@@ -381,10 +415,12 @@ impl Config {
             self.model,
             self.save_path,
             self.agentic,
+            self.mode,
             self.timeout_secs,
             self.logging,
             self.logfile,
-            self.system_prompt,
+            self.system_prompt_coder,
+            self.system_prompt_assistant,
             self.max_tool_rounds,
             self.max_retries,
             self.justify,
@@ -412,6 +448,19 @@ impl Config {
         if let Some(v) = values.get("agentic") {
             cfg.agentic = parse_bool(v);
         }
+        if let Some(v) = values.get("mode") {
+            let v = v.trim().to_lowercase();
+            if matches!(v.as_str(), "chat" | "coder" | "assistant") {
+                cfg.mode = v;
+            }
+        } else {
+            // Legacy configs only have the `agentic` flag.
+            cfg.mode = if cfg.agentic {
+                "coder".to_string()
+            } else {
+                "chat".to_string()
+            };
+        }
         if let Some(v) = values.get("timeout_secs")
             && let Ok(n) = v.parse::<u64>()
         {
@@ -423,8 +472,14 @@ impl Config {
         if let Some(v) = values.get("logfile") {
             cfg.logfile = v.clone();
         }
-        if let Some(v) = values.get("system_prompt") {
-            cfg.system_prompt = v.clone();
+        if let Some(v) = values.get("system_prompt_coder") {
+            cfg.system_prompt_coder = v.clone();
+        } else if let Some(v) = values.get("system_prompt") {
+            // Legacy key: the old single system prompt was the coder one.
+            cfg.system_prompt_coder = v.clone();
+        }
+        if let Some(v) = values.get("system_prompt_assistant") {
+            cfg.system_prompt_assistant = v.clone();
         }
         if let Some(v) = values.get("proxy") {
             let v = v.trim();
@@ -478,14 +533,23 @@ impl Config {
         cfg
     }
 
-    pub fn set_system_prompt(prompt: &str) -> Result<(), String> {
+    /// Persist a system prompt under `key` (`system_prompt_coder` or
+    /// `system_prompt_assistant`), updating the existing key in place or
+    /// appending it.
+    pub fn set_system_prompt_key(key: &str, prompt: &str) -> Result<(), String> {
         if let Some(conf_path) = find_conf_file() {
             let content = fs::read_to_string(&conf_path).map_err(|e| e.to_string())?;
             let mut lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
             let mut found = false;
             for line in &mut lines {
-                if line.starts_with("system_prompt") {
-                    *line = format!("system_prompt = {}", prompt);
+                let trimmed = line.trim();
+                if !trimmed.starts_with('#')
+                    && !trimmed.starts_with(';')
+                    && trimmed
+                        .split_once('=')
+                        .is_some_and(|(k, _)| k.trim() == key)
+                {
+                    *line = format!("{} = {}", key, prompt);
                     found = true;
                     break;
                 }
@@ -494,17 +558,18 @@ impl Config {
                 if !lines.last().is_none_or(|l| l.is_empty()) {
                     lines.push(String::new());
                 }
-                lines.push(format!("system_prompt = {}", prompt));
+                lines.push(format!("{} = {}", key, prompt));
             }
             let new_content = lines.join("\n");
             fs::write(&conf_path, new_content).map_err(|e| e.to_string())?;
         } else {
             let dir = conf_dir().ok_or("Cannot determine config directory")?;
             let conf_path = dir.join("rustama.conf");
-            let cfg = Config {
-                system_prompt: prompt.to_string(),
-                ..Config::default()
-            };
+            let mut cfg = Config::default();
+            match key {
+                "system_prompt_assistant" => cfg.system_prompt_assistant = prompt.to_string(),
+                _ => cfg.system_prompt_coder = prompt.to_string(),
+            }
             fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
             fs::write(&conf_path, cfg.default_conf()).map_err(|e| e.to_string())?;
         }
@@ -522,10 +587,15 @@ impl Config {
         lines.push(format!("model = {}", self.model));
         lines.push(format!("save_path = {}", self.save_path));
         lines.push(format!("agentic = {}", self.agentic));
+        lines.push(format!("mode = {}", self.mode));
         lines.push(format!("timeout_secs = {}", self.timeout_secs));
         lines.push(format!("logging = {}", self.logging));
         lines.push(format!("logfile = {}", self.logfile));
-        lines.push(format!("system_prompt = {}", self.system_prompt));
+        lines.push(format!("system_prompt_coder = {}", self.system_prompt_coder));
+        lines.push(format!(
+            "system_prompt_assistant = {}",
+            self.system_prompt_assistant
+        ));
         lines.push(String::new());
         if let Some(ref proxy) = self.proxy {
             lines.push(format!("proxy = {}", proxy));

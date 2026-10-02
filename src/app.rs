@@ -154,6 +154,74 @@ pub enum ModelDialogFocus {
     Cancel,
 }
 
+/// Workflow mode: how the assistant behaves and which system prompt /
+/// tool set it gets.
+///
+/// * `Chat` — plain conversation, no system prompt, no tools.
+/// * `Coder` — the former "agentic" mode: coding system prompt and the
+///   full tool set.
+/// * `Assistant` — general helpful assistant: its own system prompt and
+///   the non-coding tools (read/search/fetch/web — no file editing,
+///   shell, terminal, or LSP).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChatMode {
+    Chat,
+    Coder,
+    Assistant,
+}
+
+impl ChatMode {
+    pub const ALL: [ChatMode; 3] = [ChatMode::Chat, ChatMode::Coder, ChatMode::Assistant];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ChatMode::Chat => "Chat",
+            ChatMode::Coder => "Coder",
+            ChatMode::Assistant => "Assistant",
+        }
+    }
+
+    /// Config key value (`mode = ...` in rustama.conf).
+    pub fn config_key(self) -> &'static str {
+        match self {
+            ChatMode::Chat => "chat",
+            ChatMode::Coder => "coder",
+            ChatMode::Assistant => "assistant",
+        }
+    }
+
+    pub fn from_config_key(key: &str) -> Option<ChatMode> {
+        match key {
+            "chat" => Some(ChatMode::Chat),
+            "coder" => Some(ChatMode::Coder),
+            "assistant" => Some(ChatMode::Assistant),
+            _ => None,
+        }
+    }
+
+    /// Short description shown in the Workflow dialog.
+    pub fn description(self) -> &'static str {
+        match self {
+            ChatMode::Chat => "Plain conversation, no tools",
+            ChatMode::Coder => "Coding agent with the full tool set",
+            ChatMode::Assistant => "Helpful assistant, non-coding tools only",
+        }
+    }
+
+    /// Does this mode attach tool definitions to requests (and run the
+    /// agentic tool-call loop)?
+    pub fn uses_tools(self) -> bool {
+        !matches!(self, ChatMode::Chat)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum WorkflowDialogFocus {
+    List,
+    Confirm,
+    Cancel,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum FileDialogFocus {
     List,
@@ -1143,7 +1211,13 @@ pub struct App {
     pub file_dialog_focus: FileDialogFocus,
     pub file_dialog_scroll: usize,
     pub file_dialog_mode: FileDialogMode,
-    pub agentic_mode: bool,
+    /// Current workflow mode (chat / coder / assistant). Derived from
+    /// the config `mode` key (or legacy `agentic` flag) at startup.
+    pub chat_mode: ChatMode,
+    pub show_workflow_dialog: bool,
+    pub workflow_dialog_selection: usize,
+    pub workflow_dialog_focus: WorkflowDialogFocus,
+    pub workflow_dialog_scroll: usize,
     pub max_tool_rounds: usize,
     pub max_retries: u32,
     pub tool_round_count: usize,
@@ -1187,7 +1261,10 @@ pub struct App {
     /// the cost estimate.
     pub session_usage: TokenStats,
     pub cloud_models: Vec<CloudModel>,
+    /// System prompt used in Coder mode (`system_prompt_coder` config key).
     pub system_prompt: String,
+    /// System prompt used in Assistant mode (`system_prompt_assistant`).
+    pub system_prompt_assistant: String,
     pub export_format: ExportFormat,
     pub theme: Theme,
     pub cached_output: Vec<Line<'static>>,
@@ -1301,7 +1378,15 @@ impl App {
             file_dialog_focus: FileDialogFocus::List,
             file_dialog_scroll: 0,
             file_dialog_mode: FileDialogMode::AttachFile,
-            agentic_mode: cfg.agentic,
+            chat_mode: ChatMode::from_config_key(&cfg.mode).unwrap_or(if cfg.agentic {
+                ChatMode::Coder
+            } else {
+                ChatMode::Chat
+            }),
+            show_workflow_dialog: false,
+            workflow_dialog_selection: 0,
+            workflow_dialog_focus: WorkflowDialogFocus::List,
+            workflow_dialog_scroll: 0,
             max_tool_rounds: cfg.max_tool_rounds,
             max_retries: cfg.max_retries,
             tool_round_count: 0,
@@ -1343,7 +1428,8 @@ impl App {
             token_stats: TokenStats::default(),
             session_usage: TokenStats::default(),
             cloud_models,
-            system_prompt: cfg.system_prompt.clone(),
+            system_prompt: cfg.system_prompt_coder.clone(),
+            system_prompt_assistant: cfg.system_prompt_assistant.clone(),
             export_format: ExportFormat::Markdown,
             theme: Theme::dark(),
             cached_output: Vec::new(),
@@ -1556,6 +1642,10 @@ impl App {
             self.handle_model_dialog_key(key);
             return;
         }
+        if self.show_workflow_dialog {
+            self.handle_workflow_dialog_key(key);
+            return;
+        }
         if self.show_settings_dialog {
             self.handle_settings_dialog_key(key);
             return;
@@ -1754,14 +1844,7 @@ impl App {
             MenuAction::ExportChat => self.open_export_dialog(),
             MenuAction::Quit => self.open_quit_confirm(),
             MenuAction::OpenModelDialog => self.open_model_dialog(),
-            MenuAction::ToggleAgenticMode(_) => {
-                self.agentic_mode = !self.agentic_mode;
-                self.status_message = if self.agentic_mode {
-                    "Agentic mode: ON".to_string()
-                } else {
-                    "Agentic mode: OFF".to_string()
-                };
-            }
+            MenuAction::OpenWorkflowDialog => self.open_workflow_dialog(),
             MenuAction::ToggleTerminal => {
                 if self.terminal_state.is_running() {
                     if self.terminal_state.visible {
@@ -2368,6 +2451,14 @@ impl App {
     /// Unified tool dispatch: terminal tools → LSP tools → stateless tools,
     /// then the auto-diagnostics hook for file edits.
     fn execute_tool(&mut self, name: &str, args: &str) -> String {
+        // Assistant mode only offers the non-coding tools; refuse the
+        // rest even if the model hallucinates a call for them.
+        if self.chat_mode == ChatMode::Assistant && !ASSISTANT_TOOLS.contains(&name) {
+            return format!(
+                "Tool '{}' is not available in Assistant mode (no coding/shell tools).",
+                name
+            );
+        }
         if matches!(name, "edit_file" | "write_file") {
             let parsed: serde_json::Value =
                 serde_json::from_str(args).unwrap_or(serde_json::json!({}));
@@ -2438,19 +2529,35 @@ impl App {
         self.spinner_idx = nanos % SPINNERS.len();
     }
 
-    /// Build the system prompt sent with API requests: the configured
-    /// system prompt (or the default agentic one) plus the contents of
-    /// the application-global AGENTS.md (~/.config/rustama/AGENTS.md),
-    /// when present.
+    /// Build the system prompt sent with API requests. Each workflow
+    /// mode has its own: Coder uses `system_prompt_coder`, Assistant
+    /// uses `system_prompt_assistant`, Chat gets none. AGENTS.md
+    /// (~/.config/rustama/AGENTS.md) is appended in Coder mode only —
+    /// it holds standing instructions for the coding agent.
     fn build_system_content(&self) -> String {
-        let base = if !self.system_prompt.is_empty() {
-            self.system_prompt.clone()
-        } else {
-            "You are a coding assistant with access to tools. When the user asks you to do something, use the available tools to accomplish the task. Always use tools when needed - do not just describe what you would do. Execute the actual tool calls. After using a tool, continue working until the task is complete.".to_string()
+        let base = match self.chat_mode {
+            ChatMode::Chat => return String::new(),
+            ChatMode::Coder => {
+                if self.system_prompt.is_empty() {
+                    Config::default().system_prompt_coder
+                } else {
+                    self.system_prompt.clone()
+                }
+            }
+            ChatMode::Assistant => {
+                if self.system_prompt_assistant.is_empty() {
+                    Config::default().system_prompt_assistant
+                } else {
+                    self.system_prompt_assistant.clone()
+                }
+            }
         };
-        match load_agents_md() {
-            Some(agents) => format!("{}\n\n# AGENTS.md\n{}", base, agents),
-            None => base,
+        if base.is_empty() {
+            return base;
+        }
+        match (self.chat_mode, load_agents_md()) {
+            (ChatMode::Coder, Some(agents)) => format!("{}\n\n# AGENTS.md\n{}", base, agents),
+            _ => base,
         }
     }
 
@@ -2663,7 +2770,7 @@ impl App {
                             // Token info belongs to the status bar's token slot only.
                             self.status_message.clear();
                             self.response_rx = None;
-                            if self.agentic_mode && self.continuation_count < 3 {
+                            if self.chat_mode.uses_tools() && self.continuation_count < 3 {
                                 self.continuation_count += 1;
                                 self.messages.push(ChatMessage::app(format!(
                                     "Auto-continuing (attempt {}/3)...",
@@ -2688,7 +2795,7 @@ impl App {
                         if !self.streaming_text.is_empty() {
                             let text = self.streaming_text.clone();
                             let parsed_tool_calls = parse_text_tool_calls(&text);
-                            if self.agentic_mode && !parsed_tool_calls.is_empty() {
+                            if self.chat_mode.uses_tools() && !parsed_tool_calls.is_empty() {
                                 for tc in &parsed_tool_calls {
                                     let name = tc["name"].as_str().unwrap_or("unknown").to_string();
                                     let args = tc["parameters"].to_string();
@@ -2744,7 +2851,7 @@ impl App {
                             // tool calls, so the run stalled until the user typed
                             // "continue" — detect the unfinished-looking text and send it
                             // automatically.
-                            let unfinished = self.agentic_mode && needs_continuation(&text);
+                            let unfinished = self.chat_mode.uses_tools() && needs_continuation(&text);
                             let wants_more =
                                 unfinished && self.auto_continue_count < MAX_AUTO_CONTINUES;
                             self.messages.push(ChatMessage::assistant(text));
@@ -2984,7 +3091,7 @@ impl App {
             None
         };
         let max_retries = self.max_retries;
-        let agentic = self.agentic_mode;
+        let mode = self.chat_mode;
 
         self.log_event(
             "PROMPT",
@@ -2994,7 +3101,7 @@ impl App {
         let cancel = Arc::new(AtomicBool::new(false));
         let rx = stream_chat_request(
             api_messages,
-            agentic,
+            mode,
             model,
             url,
             cloud_model,
@@ -3142,7 +3249,7 @@ impl App {
 
         let url = self.ollama_url.clone();
         let model = self.model_name.clone();
-        let agentic = self.agentic_mode;
+        let mode = self.chat_mode;
         let cloud_model = self.cloud_models.iter().find(|m| m.name == model).cloned();
         let is_logging = self.is_logging;
         let log_file = self.log_file.clone();
@@ -3168,7 +3275,7 @@ impl App {
         let cancel = Arc::new(AtomicBool::new(false));
         let rx = stream_chat_request(
             api_messages,
-            agentic,
+            mode,
             model,
             url,
             cloud_model,
@@ -3375,10 +3482,12 @@ impl App {
             ollama_url: self.ollama_url.clone(),
             model: self.model_name.clone(),
             save_path: self.save_path.clone(),
-            agentic: self.agentic_mode,
+            agentic: self.chat_mode.uses_tools(),
+            mode: self.chat_mode.config_key().to_string(),
             logging: self.is_logging,
             logfile: self.log_file.clone(),
-            system_prompt: self.system_prompt.clone(),
+            system_prompt_coder: self.system_prompt.clone(),
+            system_prompt_assistant: self.system_prompt_assistant.clone(),
             proxy: self.proxy.clone(),
             max_tool_rounds: self.max_tool_rounds,
             max_retries: self.max_retries,
@@ -3801,6 +3910,10 @@ impl App {
         }
         if self.show_model_dialog {
             self.handle_model_dialog_click(col, row, width, height);
+            return;
+        }
+        if self.show_workflow_dialog {
+            self.handle_workflow_dialog_click(col, row, width, height);
             return;
         }
         if self.show_quit_confirm {
@@ -4315,6 +4428,132 @@ impl App {
         }
         if cancel_btn.is_clicked(col, row) {
             self.show_model_dialog = false;
+        }
+    }
+
+    // ── Workflow dialog (Edit → Workflow...) ─────────────────────────
+
+    fn open_workflow_dialog(&mut self) {
+        self.show_workflow_dialog = true;
+        self.workflow_dialog_selection = ChatMode::ALL
+            .iter()
+            .position(|m| *m == self.chat_mode)
+            .unwrap_or(0);
+        self.workflow_dialog_scroll = 0;
+        self.workflow_dialog_focus = WorkflowDialogFocus::List;
+    }
+
+    fn confirm_workflow_selection(&mut self) {
+        let mode = ChatMode::ALL[self.workflow_dialog_selection];
+        if mode != self.chat_mode {
+            self.chat_mode = mode;
+            self.status_message = format!("Workflow mode: {}", mode.label());
+        }
+        self.show_workflow_dialog = false;
+    }
+
+    fn handle_workflow_dialog_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                self.show_workflow_dialog = false;
+            }
+            KeyCode::Tab => {
+                self.workflow_dialog_focus = match self.workflow_dialog_focus {
+                    WorkflowDialogFocus::List => WorkflowDialogFocus::Confirm,
+                    WorkflowDialogFocus::Confirm => WorkflowDialogFocus::Cancel,
+                    WorkflowDialogFocus::Cancel => WorkflowDialogFocus::List,
+                };
+            }
+            KeyCode::Left => {
+                if self.workflow_dialog_focus == WorkflowDialogFocus::Cancel {
+                    self.workflow_dialog_focus = WorkflowDialogFocus::Confirm;
+                }
+            }
+            KeyCode::Right => {
+                if self.workflow_dialog_focus == WorkflowDialogFocus::Confirm {
+                    self.workflow_dialog_focus = WorkflowDialogFocus::Cancel;
+                }
+            }
+            KeyCode::Up => {
+                if self.workflow_dialog_focus == WorkflowDialogFocus::List {
+                    let max = ChatMode::ALL.len();
+                    self.workflow_dialog_selection =
+                        (self.workflow_dialog_selection + max - 1) % max;
+                }
+            }
+            KeyCode::Down => {
+                if self.workflow_dialog_focus == WorkflowDialogFocus::List {
+                    let max = ChatMode::ALL.len();
+                    self.workflow_dialog_selection = (self.workflow_dialog_selection + 1) % max;
+                }
+            }
+            KeyCode::Enter => match self.workflow_dialog_focus {
+                WorkflowDialogFocus::List => {
+                    self.workflow_dialog_focus = WorkflowDialogFocus::Confirm;
+                }
+                WorkflowDialogFocus::Confirm => self.confirm_workflow_selection(),
+                WorkflowDialogFocus::Cancel => self.show_workflow_dialog = false,
+            },
+            _ => {}
+        }
+    }
+
+    fn handle_workflow_dialog_click(&mut self, col: u16, row: u16, width: u16, height: u16) {
+        let area = Rect::new(0, 0, width, height);
+        // Same geometry the render path uses — no duplicated constants.
+        let (popup_area, list_area, _info_y, btn_y, confirm_x, cancel_x) =
+            crate::ui::workflow_dialog_geometry(ChatMode::ALL.len() as u16, area);
+
+        if col < popup_area.x
+            || col >= popup_area.x + popup_area.width
+            || row < popup_area.y
+            || row >= popup_area.y + popup_area.height
+        {
+            self.show_workflow_dialog = false;
+            return;
+        }
+
+        let items: Vec<(String, bool)> = ChatMode::ALL
+            .iter()
+            .map(|m| (m.label().to_string(), false))
+            .collect();
+        let listbox = crate::ui::ListBox::new(
+            items,
+            self.workflow_dialog_selection,
+            self.workflow_dialog_scroll,
+            true,
+            "Mode",
+        );
+        if let Some(idx) = listbox.hit_test(row, list_area) {
+            self.workflow_dialog_selection = idx;
+            self.workflow_dialog_focus = WorkflowDialogFocus::List;
+            return;
+        }
+
+        let confirm_btn = Button::new(
+            "OK",
+            confirm_x,
+            btn_y,
+            self.workflow_dialog_focus == WorkflowDialogFocus::Confirm,
+            Color::Green,
+            Color::Green,
+        );
+        let cancel_btn = Button::new(
+            "Cancel",
+            cancel_x,
+            btn_y,
+            self.workflow_dialog_focus == WorkflowDialogFocus::Cancel,
+            Color::Red,
+            Color::Red,
+        );
+
+        if confirm_btn.is_clicked(col, row) {
+            self.workflow_dialog_focus = WorkflowDialogFocus::Confirm;
+            self.confirm_workflow_selection();
+            return;
+        }
+        if cancel_btn.is_clicked(col, row) {
+            self.show_workflow_dialog = false;
         }
     }
 
@@ -5447,12 +5686,12 @@ impl App {
         };
         let p = &self.params;
         format!(
-            "Config file: {}\n\n  ollama_url     = {}\n  model          = {}\n  save_path      = {}\n  agentic        = {}\n  max_rounds     = {}\n  timeout_secs   = {}\n  logging        = {}\n  logfile        = {}\n  justify        = {}\n\nModel parameters (per-model):\n  temperature    = {}\n  top_p          = {}\n  top_k          = {}\n  frequency_pen. = {}\n  presence_pen.  = {}\n  max_tokens     = {}\n  effort         = {}\n  seed           = {}",
+            "Config file: {}\n\n  ollama_url     = {}\n  model          = {}\n  save_path      = {}\n  mode           = {}\n  max_rounds     = {}\n  timeout_secs   = {}\n  logging        = {}\n  logfile        = {}\n  justify        = {}\n\nModel parameters (per-model):\n  temperature    = {}\n  top_p          = {}\n  top_k          = {}\n  frequency_pen. = {}\n  presence_pen.  = {}\n  max_tokens     = {}\n  effort         = {}\n  seed           = {}",
             conf_path.display(),
             self.ollama_url,
             self.model_name,
             self.save_path,
-            self.agentic_mode,
+            self.chat_mode.label(),
             self.max_tool_rounds,
             300,
             self.is_logging,
@@ -5578,14 +5817,14 @@ impl App {
         let tool_calls = self.tool_call_log.len();
         let p = &self.params;
         format!(
-            "Status:\n  Session ID:    {}\n  Session Name:  {}\n  Model:         {}\n  Messages:      {}\n  Logging:       {}\n  Log file:      {}\n  Agentic mode:  {}\n  Available:     {} model(s)\n  Tool calls:    {}\n  System prompt: {}\n  Temperature:   {}\n  Top_p:         {}\n  Top_k:         {}\n  Freq penalty:  {}\n  Pres penalty:  {}\n  Max tokens:    {}\n  Effort:        {}\n  Seed:          {}\n  Justify:       {}",
+            "Status:\n  Session ID:    {}\n  Session Name:  {}\n  Model:         {}\n  Messages:      {}\n  Logging:       {}\n  Log file:      {}\n  Mode:          {}\n  Available:     {} model(s)\n  Tool calls:    {}\n  System prompt: {}\n  Temperature:   {}\n  Top_p:         {}\n  Top_k:         {}\n  Freq penalty:  {}\n  Pres penalty:  {}\n  Max tokens:    {}\n  Effort:        {}\n  Seed:          {}\n  Justify:       {}",
             self.session_id,
             self.session_name,
             self.model_name,
             msg_count,
             if self.is_logging { "ON" } else { "OFF" },
             self.log_file,
-            if self.agentic_mode { "ON" } else { "OFF" },
+            self.chat_mode.label(),
             model_count,
             tool_calls,
             if self.system_prompt.is_empty() {
@@ -5644,25 +5883,43 @@ impl App {
     }
 
     fn slash_system(&self) -> String {
-        if self.system_prompt.is_empty() {
+        let prompt = match self.chat_mode {
+            ChatMode::Chat => {
+                return "Chat mode has no system prompt. Switch to Coder/Assistant via Edit → Workflow...".to_string();
+            }
+            ChatMode::Coder => &self.system_prompt,
+            ChatMode::Assistant => &self.system_prompt_assistant,
+        };
+        if prompt.is_empty() {
             "No system prompt set. Use /setsystem <prompt> to set one.".to_string()
         } else {
-            format!("Current system prompt:\n{}", self.system_prompt)
+            format!(
+                "Current system prompt ({} mode):\n{}",
+                self.chat_mode.label(),
+                prompt
+            )
         }
     }
 
     fn slash_setsystem(&mut self, arg: Option<&str>) -> String {
+        let (key, current) = match self.chat_mode {
+            ChatMode::Chat => {
+                return "Chat mode has no system prompt. Switch to Coder/Assistant via Edit → Workflow...".to_string();
+            }
+            ChatMode::Coder => ("system_prompt_coder", &mut self.system_prompt),
+            ChatMode::Assistant => ("system_prompt_assistant", &mut self.system_prompt_assistant),
+        };
         match arg {
             Some(prompt) => {
-                self.system_prompt = prompt.to_string();
-                match Config::set_system_prompt(prompt) {
+                *current = prompt.to_string();
+                match Config::set_system_prompt_key(key, prompt) {
                     Ok(_) => format!("System prompt set and saved: {}", prompt),
                     Err(e) => format!("System prompt set (save failed: {}): {}", e, prompt),
                 }
             }
             None => {
-                self.system_prompt.clear();
-                match Config::set_system_prompt("") {
+                current.clear();
+                match Config::set_system_prompt_key(key, "") {
                     Ok(_) => "System prompt cleared and saved.".to_string(),
                     Err(e) => format!("System prompt cleared (save failed: {}).", e),
                 }
@@ -6387,6 +6644,36 @@ fn params_for_model(
         return cm.params.clone();
     }
     store.params_for(model)
+}
+
+/// Tool names available in Assistant mode — general-purpose, non-coding
+/// tools only (no file editing, shell, terminal, or LSP).
+const ASSISTANT_TOOLS: &[&str] = &[
+    "read_file",
+    "list_files",
+    "search_files",
+    "search_content",
+    "fetch_url",
+    "web_search",
+];
+
+/// The tool definitions for a workflow mode. `Chat` gets none,
+/// `Assistant` the non-coding subset, `Coder` the full set.
+fn tools_for_mode(mode: ChatMode) -> Option<Vec<serde_json::Value>> {
+    match mode {
+        ChatMode::Chat => None,
+        ChatMode::Coder => Some(get_tool_definitions()),
+        ChatMode::Assistant => Some(
+            get_tool_definitions()
+                .into_iter()
+                .filter(|t| {
+                    t["function"]["name"]
+                        .as_str()
+                        .is_some_and(|n| ASSISTANT_TOOLS.contains(&n))
+                })
+                .collect(),
+        ),
+    }
 }
 
 fn get_tool_definitions() -> Vec<serde_json::Value> {
@@ -8695,7 +8982,7 @@ fn extract_context_length(json: &serde_json::Value) -> Option<u32> {
 fn build_chat_body(
     model: &str,
     cloud_model: Option<&CloudModel>,
-    agentic: bool,
+    mode: ChatMode,
     api_messages: &[serde_json::Value],
     params: &ModelParams,
 ) -> serde_json::Value {
@@ -8708,7 +8995,9 @@ fn build_chat_body(
         if let Some(max_tokens) = params.max_output_tokens {
             body["max_tokens"] = serde_json::json!(max_tokens);
         }
-        body["tools"] = serde_json::json!(get_tool_definitions());
+        if let Some(tools) = tools_for_mode(mode) {
+            body["tools"] = serde_json::json!(tools);
+        }
         body["temperature"] = serde_json::json!(params.temperature);
         body["top_p"] = serde_json::json!(params.top_p);
         if params.frequency_penalty != 0.0 {
@@ -8733,8 +9022,8 @@ fn build_chat_body(
             "messages": api_messages,
             "stream": true,
         });
-        if agentic {
-            body["tools"] = serde_json::json!(get_tool_definitions());
+        if let Some(tools) = tools_for_mode(mode) {
+            body["tools"] = serde_json::json!(tools);
         }
         let mut options = serde_json::json!({});
         options["temperature"] = serde_json::json!(params.temperature);
@@ -8788,7 +9077,7 @@ fn build_chat_body(
 #[allow(clippy::too_many_arguments)]
 fn stream_chat_request(
     api_messages: Vec<serde_json::Value>,
-    agentic: bool,
+    mode: ChatMode,
     model: String,
     url: String,
     cloud_model: Option<CloudModel>,
@@ -8811,7 +9100,7 @@ fn stream_chat_request(
         rt.block_on(async {
             let client = build_reqwest_client(&proxy);
 
-            let body = build_chat_body(&model, cloud_model.as_ref(), agentic, &api_messages, &params);
+            let body = build_chat_body(&model, cloud_model.as_ref(), mode, &api_messages, &params);
             let (api_url, headers) = if let Some(ref cloud) = cloud_model {
                 let mut headers = reqwest::header::HeaderMap::new();
                 headers.insert(
@@ -9055,7 +9344,7 @@ mod chat_body_tests {
             seed: Some(42),
             num_ctx: Some(202752),
         };
-        let body = build_chat_body("llama3.2:3b", None, true, &msgs(), &params);
+        let body = build_chat_body("llama3.2:3b", None, ChatMode::Coder, &msgs(), &params);
         assert_eq!(body["model"], "llama3.2:3b");
         let o = &body["options"];
         assert_eq!(o["temperature"], 0.7);
@@ -9073,7 +9362,7 @@ mod chat_body_tests {
     #[test]
     fn ollama_body_defaults_send_only_basics() {
         let params = ModelParams::default();
-        let body = build_chat_body("m", None, false, &msgs(), &params);
+        let body = build_chat_body("m", None, ChatMode::Chat, &msgs(), &params);
         let o = &body["options"];
         assert_eq!(o["temperature"], 1.0);
         assert_eq!(o["top_p"], 0.9);
@@ -9092,17 +9381,17 @@ mod chat_body_tests {
         let mut params = ModelParams::default();
         params.reasoning_effort = Some("off".to_string());
         assert_eq!(
-            build_chat_body("m", None, false, &msgs(), &params)["think"],
+            build_chat_body("m", None, ChatMode::Chat, &msgs(), &params)["think"],
             false
         );
         params.reasoning_effort = Some("on".to_string());
         assert_eq!(
-            build_chat_body("m", None, false, &msgs(), &params)["think"],
+            build_chat_body("m", None, ChatMode::Chat, &msgs(), &params)["think"],
             true
         );
         params.reasoning_effort = Some("low".to_string());
         assert_eq!(
-            build_chat_body("m", None, false, &msgs(), &params)["think"],
+            build_chat_body("m", None, ChatMode::Chat, &msgs(), &params)["think"],
             "low"
         );
     }
@@ -9121,7 +9410,7 @@ mod chat_body_tests {
             seed: Some(7),
             num_ctx: Some(9999), // not an OpenAI concept — must not be sent
         };
-        let body = build_chat_body("test-cloud", Some(&cloud), true, &msgs(), &params);
+        let body = build_chat_body("test-cloud", Some(&cloud), ChatMode::Coder, &msgs(), &params);
         assert_eq!(body["model"], "test-cloud");
         assert_eq!(body["temperature"], 0.6);
         assert_eq!(body["top_p"], 0.95);
@@ -9141,7 +9430,7 @@ mod chat_body_tests {
     fn cloud_body_skips_unset_and_toggle_effort() {
         let cloud = cloud();
         let mut params = ModelParams::default();
-        let body = build_chat_body("test-cloud", Some(&cloud), true, &msgs(), &params);
+        let body = build_chat_body("test-cloud", Some(&cloud), ChatMode::Coder, &msgs(), &params);
         assert!(body.get("max_tokens").is_none());
         assert!(body.get("frequency_penalty").is_none());
         assert!(body.get("presence_penalty").is_none());
@@ -9150,7 +9439,7 @@ mod chat_body_tests {
 
         // "off"/"on" are toggles, not levels — cloud APIs reject them.
         params.reasoning_effort = Some("off".to_string());
-        let body = build_chat_body("test-cloud", Some(&cloud), true, &msgs(), &params);
+        let body = build_chat_body("test-cloud", Some(&cloud), ChatMode::Coder, &msgs(), &params);
         assert!(body.get("reasoning_effort").is_none());
     }
 

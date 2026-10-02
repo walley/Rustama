@@ -327,6 +327,40 @@ pub fn model_dialog_geometry(model_count: u16, area: Rect) -> (Rect, Rect, u16, 
     (popup_area, list_area, info_y, btn_y, confirm_x, cancel_x)
 }
 
+/// Geometry of the "Workflow" dialog (mode picker: Chat / Coder /
+/// Assistant), shared by the render path (main.rs) and the click
+/// handler (app.rs). Mirrors `model_dialog_geometry`: a small list box,
+/// a description line for the selected mode, then OK/Cancel buttons.
+/// Returns `(popup_area, list_area, info_row_y, button_row_y, confirm_x, cancel_x)`.
+pub fn workflow_dialog_geometry(mode_count: u16, area: Rect) -> (Rect, Rect, u16, u16, u16, u16) {
+    let dialog_w = 56u16;
+    // Rows: list box + description line + blank + buttons, plus borders.
+    let list_h = mode_count.min(LISTBOX_MAX_VISIBLE) + 2;
+    let dialog_h = list_h + 5;
+    let popup_area = Rect {
+        x: area.x + (area.width.saturating_sub(dialog_w)) / 2,
+        y: area.y + (area.height.saturating_sub(dialog_h)) / 2,
+        width: dialog_w,
+        height: dialog_h,
+    };
+    let inner = popup_area.inner(Margin::new(1, 1));
+    let list_area = Rect {
+        x: inner.x,
+        y: inner.y,
+        width: inner.width,
+        height: list_h,
+    };
+    let info_y = inner.y + list_h;
+    let btn_y = info_y + 2;
+    let confirm_w = Button::new("OK", 0, 0, false, Color::White, Color::White).width;
+    let cancel_w = Button::new("Cancel", 0, 0, false, Color::White, Color::White).width;
+    let btn_gap: u16 = 3;
+    let buttons_w = confirm_w + btn_gap + cancel_w;
+    let confirm_x = inner.x + (inner.width.saturating_sub(buttons_w)) / 2;
+    let cancel_x = confirm_x + confirm_w + btn_gap;
+    (popup_area, list_area, info_y, btn_y, confirm_x, cancel_x)
+}
+
 /// Computes the Settings dialog layout for a terminal of `area`.
 pub fn settings_dialog_layout(area: Rect) -> SettingsDialogLayout {
     let popup = Rect {
@@ -1051,7 +1085,7 @@ pub enum MenuAction {
     ExportChat,
     Quit,
     OpenModelDialog,
-    ToggleAgenticMode(bool),
+    OpenWorkflowDialog,
     ToggleTerminal,
     ToggleHintbar,
     OpenSettingsDialog,
@@ -1087,7 +1121,7 @@ impl MainMenu {
     pub fn item_names(&self) -> Vec<&'static str> {
         match self.active {
             ActiveMenu::File => vec!["New", "Load", "Save", "Export...", "\u{2500}", "Exit"],
-            ActiveMenu::Edit => vec!["Set Model", "Agentic Mode", "\u{2500}", "Settings..."],
+            ActiveMenu::Edit => vec!["Set Model", "Workflow...", "\u{2500}", "Settings..."],
             ActiveMenu::View => vec!["Terminal", "Hintbar"],
             ActiveMenu::Help => vec!["About"],
             ActiveMenu::None => vec![],
@@ -1177,7 +1211,7 @@ impl MainMenu {
             (ActiveMenu::File, 3) => MenuAction::ExportChat,
             (ActiveMenu::File, 5) => MenuAction::Quit,
             (ActiveMenu::Edit, 0) => MenuAction::OpenModelDialog,
-            (ActiveMenu::Edit, 1) => MenuAction::ToggleAgenticMode(true),
+            (ActiveMenu::Edit, 1) => MenuAction::OpenWorkflowDialog,
             (ActiveMenu::Edit, 3) => MenuAction::OpenSettingsDialog,
             (ActiveMenu::View, 0) => MenuAction::ToggleTerminal,
             (ActiveMenu::View, 1) => MenuAction::ToggleHintbar,

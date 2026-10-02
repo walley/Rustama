@@ -266,6 +266,9 @@ fn ui(f: &mut Frame, app: &mut App) {
         render_model_dialog(f, app, area);
     }
 
+    if app.show_workflow_dialog {
+        render_workflow_dialog(f, app, area);
+    }
     if app.show_load_dialog {
         render_load_dialog(f, app, area);
     }
@@ -941,21 +944,27 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
         format!(" {} |", throbber(app)),
         Style::default().fg(Color::Yellow),
     )];
-    let (mode_label, mode_style) = if app.agentic_mode {
-        (
-            " AGENTIC ",
+    let (mode_label, mode_style) = match app.chat_mode {
+        crate::app::ChatMode::Coder => (
+            " CODER ",
             Style::default()
                 .fg(Color::Black)
                 .bg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
-        )
-    } else {
-        (
+        ),
+        crate::app::ChatMode::Assistant => (
+            " ASSISTANT ",
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ),
+        crate::app::ChatMode::Chat => (
             " CHAT ",
             Style::default()
                 .fg(Color::White)
                 .add_modifier(Modifier::BOLD),
-        )
+        ),
     };
 
     let sep_style = Style::default().fg(Color::Gray);
@@ -1251,6 +1260,93 @@ fn render_model_dialog(f: &mut Frame, app: &App, area: Rect) {
         cancel_x,
         btn_y,
         app.model_dialog_focus == ModelDialogFocus::Cancel,
+        app.theme.dialog_fg,
+        app.theme.dialog_focus_bg,
+    );
+
+    let (confirm_text, confirm_style) = confirm_btn.render();
+    let (cancel_text, cancel_style) = cancel_btn.render();
+
+    let inner = popup_area.inner(Margin::new(1, 1));
+    let pad_to = |x: u16| " ".repeat(x.saturating_sub(inner.x) as usize);
+    let gap = " ".repeat(cancel_x.saturating_sub(confirm_x + confirm_btn.width) as usize);
+    let buttons = Line::from(vec![
+        Span::raw(pad_to(confirm_x)),
+        Span::styled(confirm_text, confirm_style),
+        Span::raw(gap),
+        Span::styled(cancel_text, cancel_style),
+    ]);
+
+    let btn_area = Rect {
+        x: inner.x,
+        y: btn_y,
+        width: inner.width,
+        height: 1,
+    };
+    f.render_widget(Paragraph::new(buttons), btn_area);
+}
+
+fn render_workflow_dialog(f: &mut Frame, app: &App, area: Rect) {
+    use crate::app::{ChatMode, WorkflowDialogFocus};
+
+    let (popup_area, list_area, info_y, btn_y, confirm_x, cancel_x) =
+        ui::workflow_dialog_geometry(ChatMode::ALL.len() as u16, area);
+
+    f.render_widget(Clear, popup_area);
+    f.render_widget(dialog_block("Workflow", &app.theme), popup_area);
+
+    // The mode list; the active mode is marked "(current)" and drawn in
+    // the title color, like the current model in the model dialog.
+    let items: Vec<(String, bool)> = ChatMode::ALL
+        .iter()
+        .map(|m| {
+            let is_current = *m == app.chat_mode;
+            let label = if is_current {
+                format!("{} (current)", m.label())
+            } else {
+                m.label().to_string()
+            };
+            (label, is_current)
+        })
+        .collect();
+    let listbox = ui::ListBox::new(
+        items,
+        app.workflow_dialog_selection,
+        app.workflow_dialog_scroll,
+        app.workflow_dialog_focus == WorkflowDialogFocus::List,
+        "Mode",
+    );
+    listbox.render(f, list_area, &app.theme);
+
+    // Info line: what the selected mode does.
+    let selected = ChatMode::ALL[app.workflow_dialog_selection];
+    let info = Paragraph::new(Line::from(Span::styled(
+        format!("  {}", selected.description()),
+        Style::default().fg(app.theme.dialog_fg),
+    )));
+    f.render_widget(
+        info,
+        Rect {
+            x: list_area.x,
+            y: info_y,
+            width: list_area.width,
+            height: 1,
+        },
+    );
+
+    let confirm_btn = Button::new(
+        "OK",
+        confirm_x,
+        btn_y,
+        app.workflow_dialog_focus == WorkflowDialogFocus::Confirm,
+        app.theme.dialog_fg,
+        app.theme.dialog_focus_bg,
+    );
+    let cancel_btn = Button::new(
+        "Cancel",
+        cancel_x,
+        btn_y,
+        app.workflow_dialog_focus == WorkflowDialogFocus::Cancel,
         app.theme.dialog_fg,
         app.theme.dialog_focus_bg,
     );
