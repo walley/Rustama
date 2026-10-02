@@ -2451,14 +2451,6 @@ impl App {
     /// Unified tool dispatch: terminal tools → LSP tools → stateless tools,
     /// then the auto-diagnostics hook for file edits.
     fn execute_tool(&mut self, name: &str, args: &str) -> String {
-        // Assistant mode only offers the non-coding tools; refuse the
-        // rest even if the model hallucinates a call for them.
-        if self.chat_mode == ChatMode::Assistant && !ASSISTANT_TOOLS.contains(&name) {
-            return format!(
-                "Tool '{}' is not available in Assistant mode (no coding/shell tools).",
-                name
-            );
-        }
         if matches!(name, "edit_file" | "write_file") {
             let parsed: serde_json::Value =
                 serde_json::from_str(args).unwrap_or(serde_json::json!({}));
@@ -6647,7 +6639,8 @@ fn params_for_model(
 }
 
 /// Tool names available in Assistant mode — general-purpose, non-coding
-/// tools only (no file editing, shell, terminal, or LSP).
+/// tools only (no file editing, shell, terminal, or LSP). CURRENTLY NOT USED IN
+//the future this will be conigurable
 const ASSISTANT_TOOLS: &[&str] = &[
     "read_file",
     "list_files",
@@ -6658,21 +6651,12 @@ const ASSISTANT_TOOLS: &[&str] = &[
 ];
 
 /// The tool definitions for a workflow mode. `Chat` gets none,
-/// `Assistant` the non-coding subset, `Coder` the full set.
+/// `Assistant` `Coder` the full set.
 fn tools_for_mode(mode: ChatMode) -> Option<Vec<serde_json::Value>> {
     match mode {
         ChatMode::Chat => None,
         ChatMode::Coder => Some(get_tool_definitions()),
-        ChatMode::Assistant => Some(
-            get_tool_definitions()
-                .into_iter()
-                .filter(|t| {
-                    t["function"]["name"]
-                        .as_str()
-                        .is_some_and(|n| ASSISTANT_TOOLS.contains(&n))
-                })
-                .collect(),
-        ),
+        ChatMode::Assistant => Some(get_tool_definitions()),
     }
 }
 
