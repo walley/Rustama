@@ -143,7 +143,7 @@ pub enum Focus {
     Output,
     Input,
     /// Keyboard focus is on the embedded terminal: every key is forwarded
-    /// to the PTY (except Ctrl+G, which leaves this mode).
+    /// to the PTY (except Ctrl+~, which leaves this mode).
     Terminal,
 }
 
@@ -1265,6 +1265,11 @@ pub struct App {
     pub system_prompt: String,
     /// System prompt used in Assistant mode (`system_prompt_assistant`).
     pub system_prompt_assistant: String,
+    /// Config-dir-relative file name holding the Coder prompt, when the
+    /// conf key references a file instead of an inline prompt.
+    pub system_prompt_coder_file: Option<String>,
+    /// Same for the Assistant prompt.
+    pub system_prompt_assistant_file: Option<String>,
     pub export_format: ExportFormat,
     pub theme: Theme,
     pub cached_output: Vec<Line<'static>>,
@@ -1430,6 +1435,8 @@ impl App {
             cloud_models,
             system_prompt: cfg.system_prompt_coder.clone(),
             system_prompt_assistant: cfg.system_prompt_assistant.clone(),
+            system_prompt_coder_file: cfg.system_prompt_coder_file.clone(),
+            system_prompt_assistant_file: cfg.system_prompt_assistant_file.clone(),
             export_format: ExportFormat::Markdown,
             theme: Theme::dark(),
             cached_output: Vec::new(),
@@ -1506,16 +1513,11 @@ impl App {
         }
 
         // Terminal focus mode: nearly every key goes straight to the PTY.
-        // F8 and Ctrl+G are the escape hatches: they close the terminal.
+        // Ctrl+~ - escape hatches: they close the terminal.
         // F7 stops an in-flight request (e.g. the agentic loop driving
         // this terminal); with no request running F7 goes to the PTY.
         if self.focus == Focus::Terminal {
-            if key.code == KeyCode::F(7) && self.is_loading {
-                self.stop_request();
-                return;
-            }
-            if key.code == KeyCode::F(8)
-                || (matches!(key.code, KeyCode::Char('g') | KeyCode::Char('G'))
+            if (matches!(key.code, KeyCode::Char('~'))
                     && key.modifiers.contains(KeyModifiers::CONTROL))
             {
                 self.terminal_state.close();
@@ -1560,19 +1562,8 @@ impl App {
                 return;
             }
             KeyCode::F(6) => {
-                // Grab terminal keyboard focus.
-                if self.terminal_state.is_running() {
-                    self.terminal_state.visible = true;
-                    self.focus = Focus::Terminal;
-                    self.status_message =
-                        "Terminal focused — keystrokes go to the shell. F8/^G: close terminal"
-                            .to_string();
-                } else {
-                    let result = self.terminal_state.open("bash");
-                    self.focus = Focus::Terminal;
-                    self.status_message = result;
-                }
-                return;
+              //currentrly nothing
+              return;
             }
             KeyCode::Char('t' | 'T') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 if self.terminal_state.is_running() {
@@ -1659,7 +1650,7 @@ impl App {
 
     fn handle_output_key(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Tab => self.open_menu(),
+//            KeyCode::Tab => should be:cycles through windows, was menu, needs to be properly chaged
             KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.open_export_dialog();
             }
@@ -3480,6 +3471,8 @@ impl App {
             logfile: self.log_file.clone(),
             system_prompt_coder: self.system_prompt.clone(),
             system_prompt_assistant: self.system_prompt_assistant.clone(),
+            system_prompt_coder_file: self.system_prompt_coder_file.clone(),
+            system_prompt_assistant_file: self.system_prompt_assistant_file.clone(),
             proxy: self.proxy.clone(),
             max_tool_rounds: self.max_tool_rounds,
             max_retries: self.max_retries,
@@ -7870,20 +7863,6 @@ mod menu_focus_tests {
         assert_eq!(app.textarea.lines().join(""), "x");
     }
 
-    #[test]
-    fn plain_g_does_not_close_terminal() {
-        // Regression: `a || b && c` precedence made a bare 'g' release
-        // terminal focus — only Ctrl+G may act (the documented escape
-        // hatch, closes the terminal).
-        let mut app = test_app();
-        app.focus = Focus::Terminal;
-        app.handle_global_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
-        assert_eq!(app.focus, Focus::Terminal);
-        app.handle_global_key(KeyEvent::new(KeyCode::Char('G'), KeyModifiers::SHIFT));
-        assert_eq!(app.focus, Focus::Terminal);
-        app.handle_global_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL));
-        assert_eq!(app.focus, Focus::Input);
-    }
 
     #[test]
     fn common_prefix_never_splits_chars() {

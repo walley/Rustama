@@ -19,6 +19,13 @@ pub struct Config {
     pub system_prompt_coder: String,
     /// System prompt for Assistant mode.
     pub system_prompt_assistant: String,
+    /// File name (relative to the config directory) that holds the
+    /// Coder system prompt. When set, the `system_prompt_coder` conf
+    /// key contains this file name and `system_prompt_coder` holds the
+    /// prompt text loaded from the file.
+    pub system_prompt_coder_file: Option<String>,
+    /// Same as `system_prompt_coder_file`, for the Assistant prompt.
+    pub system_prompt_assistant_file: Option<String>,
     pub proxy: Option<String>,
     pub max_tool_rounds: usize,
     pub max_retries: u32,
@@ -258,6 +265,8 @@ impl Default for Config {
             logfile: "rustama.log".to_string(),
             system_prompt_coder: "You are a coding assistant with access to tools. When the user asks you to do something, use the available tools to accomplish the task. Always use tools when needed - do not just describe what you would do. Execute the actual tool calls. After using a tool, continue working until the task is complete.".to_string(),
             system_prompt_assistant: "You are a helpful assistant".to_string(),
+            system_prompt_coder_file: None,
+            system_prompt_assistant_file: None,
             proxy: None,
             max_tool_rounds: 10,
             max_retries: 10,
@@ -281,7 +290,18 @@ impl Config {
 
         if let Some(conf_path) = find_conf_file() {
             if let Ok(content) = fs::read_to_string(&conf_path) {
-                let cfg = Self::parse(&content);
+                let mut cfg = Self::parse(&content);
+                // The system_prompt_* keys may hold a file name (relative
+                // to the config directory) instead of the prompt text;
+                // load the actual prompt from that file.
+                if let Some(dir) = conf_path.parent() {
+                    let (text, file) = resolve_prompt_file(&cfg.system_prompt_coder, dir);
+                    cfg.system_prompt_coder = text;
+                    cfg.system_prompt_coder_file = file;
+                    let (text, file) = resolve_prompt_file(&cfg.system_prompt_assistant, dir);
+                    cfg.system_prompt_assistant = text;
+                    cfg.system_prompt_assistant_file = file;
+                }
                 let dflt = Config::default();
                 // Migrate the legacy single `system_prompt` key: its value
                 // becomes the coder prompt, not the hardcoded default.
@@ -357,13 +377,31 @@ impl Config {
         }
 
         let _ = fs::create_dir_all(&dir);
-        let cfg = Config::default();
+        let mut cfg = Config::default();
+        // Store the default system prompts in separate files — they are
+        // too large to keep inline in the config file.
+        let coder_file = "coder.prompt";
+        let assistant_file = "assistant.prompt";
+        let _ = fs::write(dir.join(coder_file), &cfg.system_prompt_coder);
+        let _ = fs::write(dir.join(assistant_file), &cfg.system_prompt_assistant);
+        cfg.system_prompt_coder_file = Some(coder_file.to_string());
+        cfg.system_prompt_assistant_file = Some(assistant_file.to_string());
         let conf_path = dir.join("rustama.conf");
         let _ = fs::write(&conf_path, cfg.default_conf());
         cfg
     }
 
     fn default_conf(&self) -> String {
+        // When the prompts live in separate files, the conf keys hold
+        // the file names rather than the (large) prompt texts.
+        let coder_prompt = self
+            .system_prompt_coder_file
+            .clone()
+            .unwrap_or_else(|| self.system_prompt_coder.clone());
+        let assistant_prompt = self
+            .system_prompt_assistant_file
+            .clone()
+            .unwrap_or_else(|| self.system_prompt_assistant.clone());
         format!(
             "# Rustama configuration\n\n\
              # Ollama API URL\n\
@@ -419,8 +457,8 @@ impl Config {
             self.timeout_secs,
             self.logging,
             self.logfile,
-            self.system_prompt_coder,
-            self.system_prompt_assistant,
+            coder_prompt,
+            assistant_prompt,
             self.max_tool_rounds,
             self.max_retries,
             self.justify,
@@ -539,6 +577,17 @@ impl Config {
     pub fn set_system_prompt_key(key: &str, prompt: &str) -> Result<(), String> {
         if let Some(conf_path) = find_conf_file() {
             let content = fs::read_to_string(&conf_path).map_err(|e| e.to_string())?;
+            // If the conf key currently references a prompt file, write
+            // the new prompt into that file and leave the conf untouched.
+            let values = parse_ini(&content);
+            if let (Some(name), Some(dir)) = (values.get(key), conf_path.parent()) {
+                let name = name.trim();
+                let path = dir.join(name);
+                if !name.is_empty() && !name.contains('\n') && path.is_file() {
+                    fs::write(&path, prompt).map_err(|e| e.to_string())?;
+                    return Ok(());
+                }
+            }
             let mut lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
             let mut found = false;
             for line in &mut lines {
@@ -591,11 +640,25 @@ impl Config {
         lines.push(format!("timeout_secs = {}", self.timeout_secs));
         lines.push(format!("logging = {}", self.logging));
         lines.push(format!("logfile = {}", self.logfile));
-        lines.push(format!("system_prompt_coder = {}", self.system_prompt_coder));
-        lines.push(format!(
-            "system_prompt_assistant = {}",
-            self.system_prompt_assistant
-        ));
+        // Prompts living in separate files: the conf keeps the file
+        // name, the prompt text goes to the file.
+        match &self.system_prompt_coder_file {
+            Some(name) => {
+                let _ = fs::write(dir.join(name), &self.system_prompt_coder);
+                lines.push(format!("system_prompt_coder = {}", name));
+            }
+            None => lines.push(format!("system_prompt_coder = {}", self.system_prompt_coder)),
+        }
+        match &self.system_prompt_assistant_file {
+            Some(name) => {
+                let _ = fs::write(dir.join(name), &self.system_prompt_assistant);
+                lines.push(format!("system_prompt_assistant = {}", name));
+            }
+            None => lines.push(format!(
+                "system_prompt_assistant = {}",
+                self.system_prompt_assistant
+            )),
+        }
         lines.push(String::new());
         if let Some(ref proxy) = self.proxy {
             lines.push(format!("proxy = {}", proxy));
@@ -1070,6 +1133,26 @@ fn update_ini_section(content: &str, section: &str, entries: &[(String, String)]
 fn conf_dir() -> Option<PathBuf> {
     let home = dirs_home()?;
     Some(home.join(".config").join("rustama"))
+}
+
+/// Resolve a `system_prompt_*` config value: if it names an existing
+/// file relative to the config directory, return the file's contents
+/// (trimmed) together with the file name; otherwise treat the value as
+/// an inline prompt and return it unchanged.
+fn resolve_prompt_file(value: &str, dir: &std::path::Path) -> (String, Option<String>) {
+    let name = value.trim();
+    // A file name is a single short line; real prompts are long and may
+    // contain spaces — but a non-existent file must not swallow a prompt,
+    // so only accept names that actually resolve to a file.
+    if !name.is_empty() && !name.contains('\n') && name.len() < 256 {
+        let path = dir.join(name);
+        if path.is_file()
+            && let Ok(content) = fs::read_to_string(&path)
+        {
+            return (content.trim().to_string(), Some(name.to_string()));
+        }
+    }
+    (value.to_string(), None)
 }
 
 /// Load the application-global AGENTS.md (~/.config/rustama/AGENTS.md).

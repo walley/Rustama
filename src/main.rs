@@ -1070,14 +1070,19 @@ fn render_keybar(f: &mut Frame, app: &App, area: Rect) {
     } else {
         "Term"
     };
-    // F7 "Stop" is always shown — it is a no-op when nothing is in
-    // flight ("Nothing to stop"), and hiding the key while idle made
-    // the keybar layout appear/disappear between requests.
-    let f7_label = "Stop";
     let labels: [(&str, &str); 10] = if app.focus == Focus::Terminal {
-        [("1", "Help"), ("2", " "),("3", " "),("4", " "),("5", " "), ("6", " "),("7", f7_label),("8", f8_label), ("9", "PullDn"), ("10", "Exit")]
+        [("1", "Help"), ("2", " "),("3", " "),("4", " "),("5", " "), ("6", " "),("7", "Stop"),("8", f8_label), ("9", "PullDn"), ("10", "Exit")]
     } else {
-        [("1", "Help"), ("2", " "),("3", " "),("4", " "),("5", " "), ("6", "t"),("7", f7_label),("8", f8_label), ("9", "PullDn"), ("10", "Exit")]
+        [("1", "Help"),
+         ("2", "TBDMenu"),
+         ("3", "TBD"),
+         ("4", "TBD"),
+         ("5", "TBDWorkflow"),
+         ("6", "TBD"),
+         ("7", "Stop"),
+         ("8", f8_label),
+         ("9", "PullDn"),
+         ("10", "Exit")]
     };
 
     let widths = keybar_field_widths(&labels, area.width);
