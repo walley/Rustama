@@ -300,6 +300,11 @@ fn ui(f: &mut Frame, app: &mut App) {
         render_settings_dialog(f, app, area);
     }
 
+    if app.show_theme_dialog {
+        let dlg = app.build_theme_dialog(area);
+        dlg.render(f, area, &app.theme);
+    }
+
     if app.show_retry_paused {
         let mb = ui::MessageBox::new("Retry Paused", &app.retry_paused_message);
         mb.render(f, area, true, &app.theme);

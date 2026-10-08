@@ -625,6 +625,39 @@ impl Config {
         Ok(())
     }
 
+    /// Sets (or adds) a single `key = value` line in rustama.conf,
+    /// updating an existing key in place. Used to persist the selected
+    /// theme name (`theme = <name>`).
+    pub fn set_conf_value(key: &str, value: &str) -> Result<(), String> {
+        let Some(conf_path) = find_conf_file() else {
+            return Err("Cannot determine config directory".to_string());
+        };
+        let content = fs::read_to_string(&conf_path).map_err(|e| e.to_string())?;
+        let mut lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
+        let mut found = false;
+        for line in &mut lines {
+            let trimmed = line.trim();
+            if !trimmed.starts_with('#')
+                && !trimmed.starts_with(';')
+                && trimmed
+                    .split_once('=')
+                    .is_some_and(|(k, _)| k.trim() == key)
+            {
+                *line = format!("{} = {}", key, value);
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            if !lines.last().is_none_or(|l| l.is_empty()) {
+                lines.push(String::new());
+            }
+            lines.push(format!("{} = {}", key, value));
+        }
+        fs::write(&conf_path, lines.join("\n")).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
     pub fn save(&self) -> Result<(), String> {
         let dir = conf_dir().ok_or("Cannot determine config directory")?;
         let conf_path = dir.join("rustama.conf");
@@ -1130,7 +1163,7 @@ fn update_ini_section(content: &str, section: &str, entries: &[(String, String)]
     out
 }
 
-fn conf_dir() -> Option<PathBuf> {
+pub fn conf_dir() -> Option<PathBuf> {
     let home = dirs_home()?;
     Some(home.join(".config").join("rustama"))
 }
@@ -1170,7 +1203,7 @@ pub fn load_agents_md() -> Option<String> {
     }
 }
 
-fn find_conf_file() -> Option<PathBuf> {
+pub fn find_conf_file() -> Option<PathBuf> {
     let home = dirs_home()?;
     let preferred = home.join(".config").join("rustama").join("rustama.conf");
     if preferred.exists() {

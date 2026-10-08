@@ -241,6 +241,17 @@ pub enum SaveDialogMode {
     ExportChat,
 }
 
+/// Which control of the theme-selection dialog has focus. The buttons
+/// are (in display order) Cancel / Preview / Load / Default.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ThemeDialogFocus {
+    List,
+    Preview,
+    Load,
+    Default,
+    Cancel,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum SaveDialogFocus {
     Path,
@@ -1272,6 +1283,22 @@ pub struct App {
     pub system_prompt_assistant_file: Option<String>,
     pub export_format: ExportFormat,
     pub theme: Theme,
+    /// Theme-selection dialog (Edit → Theme...): lists `<name>.theme`
+    /// files from the config directory. Preview applies a theme only
+    /// temporarily; Load commits it (persists `theme = <name>` in
+    /// rustama.conf); Cancel/Esc restores the pre-dialog theme.
+    pub show_theme_dialog: bool,
+    pub theme_dialog_selection: usize,
+    pub theme_dialog_scroll: usize,
+    pub theme_dialog_focus: ThemeDialogFocus,
+    /// `.theme` file names (with extension) found in the config dir.
+    pub theme_dialog_files: Vec<String>,
+    /// Theme snapshot taken when the dialog opens — the restore target
+    /// for Preview/Cancel.
+    pub theme_backup: Theme,
+    /// Whether the currently shown theme differs from `theme_backup`
+    /// (i.e. a Preview is active).
+    pub theme_preview_active: bool,
     pub cached_output: Vec<Line<'static>>,
     pub cached_wrapped: Vec<Line<'static>>,
     pub cached_msg_count: usize,
@@ -1438,7 +1465,14 @@ impl App {
             system_prompt_coder_file: cfg.system_prompt_coder_file.clone(),
             system_prompt_assistant_file: cfg.system_prompt_assistant_file.clone(),
             export_format: ExportFormat::Markdown,
-            theme: Theme::dark(),
+            theme: Theme::selected(),
+            show_theme_dialog: false,
+            theme_dialog_selection: 0,
+            theme_dialog_scroll: 0,
+            theme_dialog_focus: ThemeDialogFocus::List,
+            theme_dialog_files: Vec::new(),
+            theme_backup: Theme::default(),
+            theme_preview_active: false,
             cached_output: Vec::new(),
             cached_wrapped: Vec::new(),
             cached_msg_count: 0,
@@ -1645,6 +1679,10 @@ impl App {
         }
         if self.show_settings_dialog {
             self.handle_settings_dialog_key(key);
+            return;
+        }
+        if self.show_theme_dialog {
+            self.handle_theme_dialog_key(key);
             return;
         }
         match self.input_mode {
@@ -1928,6 +1966,7 @@ impl App {
                 };
             }
             MenuAction::OpenSettingsDialog => self.open_settings_dialog(),
+            MenuAction::OpenThemeDialog => self.open_theme_dialog(),
             MenuAction::ShowAbout => self.show_about = true,
         }
         if !matches!(action, MenuAction::None) {
@@ -2533,6 +2572,10 @@ impl App {
             self.file_dialog_select_prev();
             return;
         }
+        if self.show_theme_dialog {
+            self.theme_dialog_select_prev();
+            return;
+        }
         self.auto_scroll = false;
         self.scroll_offset = self.scroll_offset.saturating_sub(1);
     }
@@ -2540,6 +2583,10 @@ impl App {
     pub fn scroll_down(&mut self) {
         if self.show_file_dialog {
             self.file_dialog_select_next();
+            return;
+        }
+        if self.show_theme_dialog {
+            self.theme_dialog_select_next();
             return;
         }
         self.scroll_offset = self.scroll_offset.saturating_add(1);
@@ -3958,6 +4005,10 @@ impl App {
             self.handle_settings_dialog_click(col, row, width, height);
             return;
         }
+        if self.show_theme_dialog {
+            self.handle_theme_dialog_click(col, row, width, height);
+            return;
+        }
         if self.show_file_dialog {
             self.handle_file_dialog_click(col, row, width, height);
             return;
@@ -5272,6 +5323,238 @@ impl App {
                     self.open_selected_file();
                 }
             }
+            _ => {}
+        }
+    }
+
+    // ─── Theme selection dialog (Edit → Theme...) ───────────────────
+
+    /// Opens the theme dialog: snapshots the current theme (the restore
+    /// target for Cancel) and lists `<name>.theme` files from the
+    /// config directory.
+    fn open_theme_dialog(&mut self) {
+        self.theme_backup = self.theme.clone();
+        self.theme_preview_active = false;
+        self.theme_dialog_selection = 0;
+        self.theme_dialog_scroll = 0;
+        self.theme_dialog_focus = ThemeDialogFocus::List;
+        self.theme_dialog_files.clear();
+        if let Some(dir) = crate::config::conf_dir() {
+            if let Ok(entries) = std::fs::read_dir(&dir) {
+                let mut names: Vec<String> = entries
+                    .flatten()
+                    .filter_map(|e| {
+                        let name = e.file_name().to_string_lossy().to_string();
+                        if name.ends_with(".theme") {
+                            Some(name)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                names.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
+                self.theme_dialog_files = names;
+            }
+        }
+        self.show_theme_dialog = true;
+    }
+
+    /// Closes the theme dialog, restoring the pre-dialog theme when a
+    /// preview is active (Cancel semantics).
+    fn close_theme_dialog(&mut self, restore: bool) {
+        if restore && self.theme_preview_active {
+            self.theme = self.theme_backup.clone();
+        }
+        self.theme_preview_active = false;
+        self.show_theme_dialog = false;
+    }
+
+    /// The `.theme` file name currently highlighted in the list.
+    fn selected_theme_file(&self) -> Option<String> {
+        self.theme_dialog_files.get(self.theme_dialog_selection).cloned()
+    }
+
+    /// Applies the selected theme file to the app — preview only. The
+    /// change becomes permanent via [`Self::commit_theme_selection`],
+    /// and is undone via [`Self::close_theme_dialog`] with restore.
+    fn preview_theme(&mut self) {
+        let Some(name) = self.selected_theme_file() else {
+            return;
+        };
+        let Some(dir) = crate::config::conf_dir() else {
+            return;
+        };
+        if let Some(theme) = Theme::from_file(&dir.join(&name)) {
+            self.theme = theme;
+            self.theme_preview_active = true;
+            self.status_message =
+                format!("Previewing theme: {}", name.strip_suffix(".theme").unwrap_or(&name));
+        } else {
+            self.status_message = format!("Failed to read theme file: {}", name);
+        }
+    }
+
+    /// Makes the selected theme permanent: persists `theme = <name>` in
+    /// rustama.conf and keeps the (possibly previewed) theme applied.
+    fn commit_theme_selection(&mut self) {
+        let Some(name) = self.selected_theme_file() else {
+            self.close_theme_dialog(true);
+            return;
+        };
+        // Make sure the selected theme is the one applied (Load without
+        // a prior Preview).
+        let Some(dir) = crate::config::conf_dir() else {
+            self.close_theme_dialog(true);
+            return;
+        };
+        if let Some(theme) = Theme::from_file(&dir.join(&name)) {
+            self.theme = theme;
+        }
+        let stem = name.strip_suffix(".theme").unwrap_or(&name).to_string();
+        match Config::set_conf_value("theme", &stem) {
+            Ok(()) => self.status_message = format!("Theme set to {}", stem),
+            Err(e) => self.status_message = format!("Theme applied, but saving failed: {}", e),
+        }
+        self.theme_preview_active = false;
+        self.show_theme_dialog = false;
+    }
+
+    /// Reverts to the built-in default theme: applies it and persists
+    /// `theme = default` in rustama.conf (no matching `.theme` file,
+    /// so [`Theme::selected`] falls back to the hardcoded default).
+    fn reset_theme_to_default(&mut self) {
+        self.theme = Theme::default();
+        self.theme_preview_active = false;
+        match Config::set_conf_value("theme", "default") {
+            Ok(()) => self.status_message = "Theme set to default".to_string(),
+            Err(e) => self.status_message = format!("Theme reset, but saving failed: {}", e),
+        }
+        self.show_theme_dialog = false;
+    }
+
+    fn theme_dialog_select_prev(&mut self) {
+        self.theme_dialog_selection = self.theme_dialog_selection.saturating_sub(1);
+        self.theme_dialog_adjust_scroll();
+    }
+
+    fn theme_dialog_select_next(&mut self) {
+        if !self.theme_dialog_files.is_empty()
+            && self.theme_dialog_selection + 1 < self.theme_dialog_files.len()
+        {
+            self.theme_dialog_selection += 1;
+        }
+        self.theme_dialog_adjust_scroll();
+    }
+
+    fn theme_dialog_adjust_scroll(&mut self) {
+        let visible = crate::ui::FILE_LIST_MAX_VISIBLE;
+        if self.theme_dialog_selection < self.theme_dialog_scroll {
+            self.theme_dialog_scroll = self.theme_dialog_selection;
+        }
+        if self.theme_dialog_selection >= self.theme_dialog_scroll + visible {
+            self.theme_dialog_scroll = self.theme_dialog_selection - visible + 1;
+        }
+    }
+
+    fn handle_theme_dialog_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => self.close_theme_dialog(true),
+            KeyCode::Tab => {
+                self.theme_dialog_focus = match self.theme_dialog_focus {
+                    ThemeDialogFocus::List => ThemeDialogFocus::Preview,
+                    ThemeDialogFocus::Preview => ThemeDialogFocus::Load,
+                    ThemeDialogFocus::Load => ThemeDialogFocus::Default,
+                    ThemeDialogFocus::Default => ThemeDialogFocus::Cancel,
+                    ThemeDialogFocus::Cancel => ThemeDialogFocus::List,
+                };
+            }
+            KeyCode::Left => match self.theme_dialog_focus {
+                ThemeDialogFocus::Load => self.theme_dialog_focus = ThemeDialogFocus::Preview,
+                ThemeDialogFocus::Default => self.theme_dialog_focus = ThemeDialogFocus::Load,
+                ThemeDialogFocus::Cancel => self.theme_dialog_focus = ThemeDialogFocus::Default,
+                _ => {}
+            },
+            KeyCode::Right => match self.theme_dialog_focus {
+                ThemeDialogFocus::Preview => self.theme_dialog_focus = ThemeDialogFocus::Load,
+                ThemeDialogFocus::Load => self.theme_dialog_focus = ThemeDialogFocus::Default,
+                ThemeDialogFocus::Default => self.theme_dialog_focus = ThemeDialogFocus::Cancel,
+                _ => {}
+            },
+            KeyCode::Up => {
+                if self.theme_dialog_focus == ThemeDialogFocus::List {
+                    self.theme_dialog_select_prev();
+                }
+            }
+            KeyCode::Down => {
+                if self.theme_dialog_focus == ThemeDialogFocus::List {
+                    self.theme_dialog_select_next();
+                }
+            }
+            KeyCode::Char('p') | KeyCode::Char('P') => self.preview_theme(),
+            KeyCode::Enter => match self.theme_dialog_focus {
+                ThemeDialogFocus::List => {
+                    if self.selected_theme_file().is_some() {
+                        self.theme_dialog_focus = ThemeDialogFocus::Preview;
+                    }
+                }
+                ThemeDialogFocus::Preview => self.preview_theme(),
+                ThemeDialogFocus::Load => self.commit_theme_selection(),
+                ThemeDialogFocus::Default => self.reset_theme_to_default(),
+                ThemeDialogFocus::Cancel => self.close_theme_dialog(true),
+            },
+            _ => {}
+        }
+    }
+
+    /// Builds the theme-selection dialog (shared by rendering in
+    /// main.rs and the mouse hit test so the two always agree).
+    /// Buttons in display order: Cancel / Preview / Load.
+    pub fn build_theme_dialog(&self, _area: Rect) -> FileActionDialog {
+        let mut d = FileActionDialog::new("Select Theme");
+        let dir_str = crate::config::conf_dir()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "(config dir not found)".to_string());
+        d.add_label_colored(&dir_str, self.theme.path_fg);
+        d.add_file_list(
+            self.theme_dialog_files
+                .iter()
+                .map(|n| (n.clone(), false))
+                .collect(),
+            self.theme_dialog_selection,
+            self.theme_dialog_scroll,
+            self.theme_dialog_focus == ThemeDialogFocus::List,
+        );
+        d.add_button(
+            "Cancel",
+            self.theme_dialog_focus == ThemeDialogFocus::Cancel,
+        );
+        d.add_button(
+            "Preview",
+            self.theme_dialog_focus == ThemeDialogFocus::Preview,
+        );
+        d.add_button("Load", self.theme_dialog_focus == ThemeDialogFocus::Load);
+        d.add_button(
+            "Default",
+            self.theme_dialog_focus == ThemeDialogFocus::Default,
+        );
+        d
+    }
+
+    fn handle_theme_dialog_click(&mut self, col: u16, row: u16, width: u16, height: u16) {
+        let area = Rect::new(0, 0, width, height);
+        let dlg = self.build_theme_dialog(area);
+        match dlg.hit_test(col, row, area) {
+            DialogHit::Outside => self.close_theme_dialog(true),
+            DialogHit::FileListItem(idx) => {
+                self.theme_dialog_selection = idx;
+                self.theme_dialog_focus = ThemeDialogFocus::List;
+            }
+            DialogHit::Button(bi) => match bi {
+                0 => self.close_theme_dialog(true),
+                1 => self.preview_theme(),
+                2 => self.commit_theme_selection(),
+                _ => self.reset_theme_to_default(),
+            },
             _ => {}
         }
     }

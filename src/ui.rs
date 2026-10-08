@@ -54,7 +54,9 @@ pub struct Theme {
 }
 
 impl Theme {
-    #[cfg(test)]
+    /// The built-in default theme (mc-style dialog colors). Acts as the
+    /// fallback when no theme is selected or the selected theme file
+    /// is missing/corrupt.
     pub fn default() -> Self {
         Theme {
             dialog_border: Color::Black,
@@ -77,27 +79,135 @@ impl Theme {
         }
     }
 
-    pub fn dark() -> Self {
-        Theme {
-            dialog_border: Color::Black,
-            dialog_bg: Color::White,
-            dialog_fg: Color::Black,
-            dialog_title_fg: Color::Blue,
-            dialog_focus_bg: Color::Cyan,
-            dialog_input_fg: Color::DarkGray,
-            list_selected_bg: Color::Cyan,
-            list_selected_fg: Color::Black,
-            dir_fg: Color::Blue,
-            file_fg: Color::Black,
-            path_fg: Color::DarkGray,
-            thinking_fg: Color::Yellow,
-            menu_selected_bg: Color::Black,
-            menu_selected_fg: Color::White,
-            menu_unselected_bg: MC_GREEN,
-            menu_unselected_fg: Color::White,
-            menu_border_fg: Color::White,
+    /// The theme selected in the configuration file. Reads the `theme`
+    /// key from `rustama.conf` (config directory) and loads the matching
+    /// `<name>.theme` file from the same directory. Falls back to
+    /// [`Theme::default`] when no theme is selected or the file is
+    /// missing/invalid — unknown keys/lines are ignored, so a partial
+    /// theme file keeps the default values for unspecified colors.
+    pub fn selected() -> Self {
+        let Some(dir) = crate::config::conf_dir() else {
+            return Theme::default();
+        };
+        let Some(name) = selected_theme_name() else {
+            return Theme::default();
+        };
+        match Theme::from_file(&dir.join(format!("{}.theme", name))) {
+            Some(theme) => theme,
+            None => Theme::default(),
         }
     }
+
+    /// Loads a theme from an ini-style `.theme` file: one `key = value`
+    /// pair per line, keys are the `Theme` field names (e.g.
+    /// `dialog_bg = White`), values are colors (see [`parse_color`]).
+    /// Returns `None` when the file cannot be read at all; unrecognized
+    /// keys or values fall back to the default per-field.
+    pub fn from_file(path: &std::path::Path) -> Option<Self> {
+        let content = std::fs::read_to_string(path).ok()?;
+        let mut theme = Theme::default();
+        for line in content.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+                continue;
+            }
+            let Some((key, value)) = line.split_once('=') else {
+                continue;
+            };
+            let key = key.trim();
+            let value = value.trim();
+            let Some(color) = parse_color(value) else {
+                continue;
+            };
+            apply_color(&mut theme, key, color);
+        }
+        Some(theme)
+    }
+}
+
+/// Parses a color spec: a named ratatui color (`black`, `light_red`, …,
+/// case-insensitive), `rgb(r,g,b)` / `rgb(r g b)`, or a hex `#rrggbb`.
+pub fn parse_color(s: &str) -> Option<Color> {
+    let s = s.trim();
+    let lower = s.to_lowercase();
+    let named = match lower.as_str() {
+        "black" => Some(Color::Black),
+        "red" => Some(Color::Red),
+        "green" => Some(Color::Green),
+        "yellow" => Some(Color::Yellow),
+        "blue" => Some(Color::Blue),
+        "magenta" => Some(Color::Magenta),
+        "cyan" => Some(Color::Cyan),
+        "gray" | "grey" => Some(Color::Gray),
+        "darkgray" | "dark_grey" => Some(Color::DarkGray),
+        "lightred" | "light_red" => Some(Color::LightRed),
+        "lightgreen" | "light_green" => Some(Color::LightGreen),
+        "lightyellow" | "light_yellow" => Some(Color::LightYellow),
+        "lightblue" | "light_blue" => Some(Color::LightBlue),
+        "lightmagenta" | "light_magenta" => Some(Color::LightMagenta),
+        "lightcyan" | "light_cyan" => Some(Color::LightCyan),
+        "white" => Some(Color::White),
+        "reset" | "default" => Some(Color::Reset),
+        _ => None,
+    };
+    if let Some(c) = named {
+        return Some(c);
+    }
+    if let Some(rest) = lower.strip_prefix("rgb(").and_then(|r| r.strip_suffix(')')) {
+        let parts: Vec<u8> = rest
+            .split([',', ' ', '\t'])
+            .filter(|p| !p.is_empty())
+            .filter_map(|p| p.trim().parse().ok())
+            .collect();
+        if parts.len() == 3 {
+            return Some(Color::Rgb(parts[0], parts[1], parts[2]));
+        }
+        return None;
+    }
+    if let Some(rest) = s.strip_prefix('#')
+        && rest.len() == 6
+        && let Ok(n) = u32::from_str_radix(rest, 16)
+    {
+        return Some(Color::Rgb((n >> 16) as u8, (n >> 8) as u8, n as u8));
+    }
+    None
+}
+
+/// Applies a parsed color to the named `Theme` field. Unknown keys are
+/// ignored.
+fn apply_color(theme: &mut Theme, key: &str, color: Color) {
+    match key {
+        "dialog_border" => theme.dialog_border = color,
+        "dialog_bg" => theme.dialog_bg = color,
+        "dialog_fg" => theme.dialog_fg = color,
+        "dialog_title_fg" => theme.dialog_title_fg = color,
+        "dialog_focus_bg" => theme.dialog_focus_bg = color,
+        "dialog_input_fg" => theme.dialog_input_fg = color,
+        "list_selected_bg" => theme.list_selected_bg = color,
+        "list_selected_fg" => theme.list_selected_fg = color,
+        "dir_fg" => theme.dir_fg = color,
+        "file_fg" => theme.file_fg = color,
+        "path_fg" => theme.path_fg = color,
+        "thinking_fg" => theme.thinking_fg = color,
+        "menu_selected_bg" => theme.menu_selected_bg = color,
+        "menu_selected_fg" => theme.menu_selected_fg = color,
+        "menu_unselected_bg" => theme.menu_unselected_bg = color,
+        "menu_unselected_fg" => theme.menu_unselected_fg = color,
+        "menu_border_fg" => theme.menu_border_fg = color,
+        _ => {}
+    }
+}
+
+/// The theme name selected in `rustama.conf` (`theme = <name>` key),
+/// or `None` when unset — in which case the built-in default applies.
+fn selected_theme_name() -> Option<String> {
+    let content = std::fs::read_to_string(crate::config::find_conf_file()?).ok()?;
+    content
+        .lines()
+        .filter_map(|l| l.trim().split_once('='))
+        .find(|(k, _)| k.trim() == "theme")
+        .map(|(_, v)| v.trim().trim_matches('"').to_string())
+        .filter(|v| !v.is_empty())
 }
 
 pub fn dialog_block(title: &str, theme: &Theme) -> Block<'static> {
@@ -1093,6 +1203,7 @@ pub enum MenuAction {
     ToggleTerminal,
     ToggleHintbar,
     OpenSettingsDialog,
+    OpenThemeDialog,
     ShowAbout,
 }
 
@@ -1125,7 +1236,7 @@ impl MainMenu {
     pub fn item_names(&self) -> Vec<&'static str> {
         match self.active {
             ActiveMenu::File => vec!["New", "Load", "Save", "Export...", "\u{2500}", "Exit"],
-            ActiveMenu::Edit => vec!["Set Model", "Workflow... F5", "\u{2500}", "Settings..."],
+            ActiveMenu::Edit => vec!["Set Model", "Workflow... F5", "\u{2500}", "Theme...", "Settings..."],
             ActiveMenu::View => vec!["Terminal", "Hintbar"],
             ActiveMenu::Help => vec!["About"],
             ActiveMenu::None => vec![],
@@ -1216,7 +1327,8 @@ impl MainMenu {
             (ActiveMenu::File, 5) => MenuAction::Quit,
             (ActiveMenu::Edit, 0) => MenuAction::OpenModelDialog,
             (ActiveMenu::Edit, 1) => MenuAction::OpenWorkflowDialog,
-            (ActiveMenu::Edit, 3) => MenuAction::OpenSettingsDialog,
+            (ActiveMenu::Edit, 3) => MenuAction::OpenThemeDialog,
+            (ActiveMenu::Edit, 4) => MenuAction::OpenSettingsDialog,
             (ActiveMenu::View, 0) => MenuAction::ToggleTerminal,
             (ActiveMenu::View, 1) => MenuAction::ToggleHintbar,
             (ActiveMenu::Help, 0) => MenuAction::ShowAbout,
@@ -1906,7 +2018,8 @@ mod tests {
     fn theme_uses_mc_dialog_colors() {
         // The dialog palette mirrors mc's "Configuration options"
         // dialog: white bg, black text/frame, blue titles, cyan focus.
-        for theme in [Theme::default(), Theme::dark()] {
+        let theme = Theme::default();
+        {
             assert_eq!(theme.dialog_bg, Color::White);
             assert_eq!(theme.dialog_fg, Color::Black);
             assert_eq!(theme.dialog_border, Color::Black);
@@ -1917,6 +2030,90 @@ mod tests {
             assert_eq!(theme.list_selected_bg, Color::Cyan);
             assert_eq!(theme.list_selected_fg, Color::Black);
         }
+    }
+
+    #[test]
+    fn parse_color_named_rgb_and_hex() {
+        assert_eq!(parse_color("Black"), Some(Color::Black));
+        assert_eq!(parse_color("light_red"), Some(Color::LightRed));
+        assert_eq!(parse_color("Gray"), Some(Color::Gray));
+        assert_eq!(parse_color("rgb(30, 60, 120)"), Some(Color::Rgb(30, 60, 120)));
+        assert_eq!(parse_color("#1e3c78"), Some(Color::Rgb(0x1e, 0x3c, 0x78)));
+        assert_eq!(parse_color("nope"), None);
+        assert_eq!(parse_color("rgb(1,2)"), None);
+    }
+
+    #[test]
+    fn theme_file_parse_and_fallback() {
+        let dir = std::env::temp_dir().join("rustama_theme_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("test.theme");
+        std::fs::write(
+            &path,
+            "# comment\ndialog_bg = Black\ndialog_fg = rgb(255, 0, 0)\nbogus = White\ndialog_border = notacolor\n",
+        )
+        .unwrap();
+        let t = Theme::from_file(&path).unwrap();
+        // Specified keys applied.
+        assert_eq!(t.dialog_bg, Color::Black);
+        assert_eq!(t.dialog_fg, Color::Rgb(255, 0, 0));
+        // Unspecified / invalid keys keep the default.
+        assert_eq!(t.dialog_border, Theme::default().dialog_border);
+        assert_eq!(t.dialog_title_fg, Theme::default().dialog_title_fg);
+        // Missing file -> None (caller falls back to default).
+        assert!(Theme::from_file(&dir.join("missing.theme")).is_none());
+    }
+
+    #[test]
+    fn theme_files_in_config_dir_parse() {
+        // Sanity check for every installed theme (~/.config/rustama/*.theme):
+        // each non-comment line must be a recognized key with a parseable
+        // color, and the file must load as a whole.
+        let Some(dir) = crate::config::conf_dir() else {
+            return;
+        };
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return; // no config dir / no themes — nothing to check
+        };
+        const KNOWN_KEYS: &[&str] = &[
+            "dialog_border", "dialog_bg", "dialog_fg", "dialog_title_fg",
+            "dialog_focus_bg", "dialog_input_fg", "list_selected_bg",
+            "list_selected_fg", "dir_fg", "file_fg", "path_fg", "thinking_fg",
+            "menu_selected_bg", "menu_selected_fg", "menu_unselected_bg",
+            "menu_unselected_fg", "menu_border_fg",
+        ];
+        let mut checked = 0;
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !name.ends_with(".theme") {
+                continue;
+            }
+            let path = entry.path();
+            let content =
+                std::fs::read_to_string(&path).expect("readable .theme file in config dir");
+            for line in content.lines() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+                    continue;
+                }
+                let (k, v) = line
+                    .split_once('=')
+                    .unwrap_or_else(|| panic!("bad line in {}: {}", name, line));
+                assert!(parse_color(v.trim()).is_some(), "bad color in {}: {}", name, v);
+                assert!(
+                    KNOWN_KEYS.contains(&k.trim()),
+                    "unknown key in {}: {}",
+                    name,
+                    k
+                );
+            }
+            // The whole file must load.
+            assert!(Theme::from_file(&path).is_some(), "unparseable theme: {}", name);
+            checked += 1;
+        }
+        // With no themes installed the test is a silent no-op — that's
+        // fine (it only guards files that actually exist).
+        println!("validated {} theme file(s)", checked);
     }
 
     #[test]
