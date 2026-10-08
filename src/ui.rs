@@ -49,6 +49,8 @@ pub struct Theme {
     /// Menu bar / submenu item when not selected.
     pub menu_unselected_bg: Color,
     pub menu_unselected_fg: Color,
+    /// Submenu frame and separator line (spacer) — shared so they match.
+    pub menu_border_fg: Color,
 }
 
 impl Theme {
@@ -71,6 +73,7 @@ impl Theme {
             menu_selected_fg: Color::White,
             menu_unselected_bg: MC_GREEN,
             menu_unselected_fg: Color::White,
+            menu_border_fg: Color::White,
         }
     }
 
@@ -92,6 +95,7 @@ impl Theme {
             menu_selected_fg: Color::White,
             menu_unselected_bg: MC_GREEN,
             menu_unselected_fg: Color::White,
+            menu_border_fg: Color::White,
         }
     }
 }
@@ -1121,7 +1125,7 @@ impl MainMenu {
     pub fn item_names(&self) -> Vec<&'static str> {
         match self.active {
             ActiveMenu::File => vec!["New", "Load", "Save", "Export...", "\u{2500}", "Exit"],
-            ActiveMenu::Edit => vec!["Set Model", "Workflow...", "\u{2500}", "Settings..."],
+            ActiveMenu::Edit => vec!["Set Model", "Workflow... F5", "\u{2500}", "Settings..."],
             ActiveMenu::View => vec!["Terminal", "Hintbar"],
             ActiveMenu::Help => vec!["About"],
             ActiveMenu::None => vec![],
@@ -1394,7 +1398,7 @@ impl MainMenu {
                     ListItem::new(Line::from(Span::styled(
                         line,
                         Style::default()
-                            .fg(Color::DarkGray)
+                            .fg(theme.menu_border_fg)
                             .bg(theme.menu_unselected_bg),
                     )))
                 } else {
@@ -1415,7 +1419,7 @@ impl MainMenu {
         let list = List::new(list_items).block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::White))
+                .border_style(Style::default().fg(theme.menu_border_fg))
                 .style(Style::default().bg(theme.menu_unselected_bg)),
         );
 

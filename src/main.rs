@@ -2,7 +2,8 @@ use std::io;
 use std::time::Duration;
 
 use ratatui::crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, MouseButton, MouseEventKind,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, MouseButton, MouseEventKind,
 };
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
@@ -28,12 +29,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::panic::set_hook(Box::new(move |info| {
         let _ = disable_raw_mode();
         let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
+        let _ = execute!(io::stdout(), DisableBracketedPaste);
         original_hook(info);
     }));
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableBracketedPaste
+    )?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
@@ -53,7 +60,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     execute!(
         terminal.backend_mut(),
         LeaveAlternateScreen,
-        DisableMouseCapture
+        DisableMouseCapture,
+        DisableBracketedPaste
     )?;
     terminal.show_cursor()?;
 
@@ -162,6 +170,13 @@ where
     match ev {
         Event::Key(key) => {
             app.handle_global_key(key);
+        }
+        // Bracketed paste: the terminal wraps pasted text in special
+        // escape sequences so it arrives as ONE event, not as individual
+        // keystrokes — newlines in the text are kept as literal newline
+        // characters and never trigger the Enter/"send to model" path.
+        Event::Paste(text) => {
+            app.handle_paste(&text);
         }
         Event::Mouse(mouse) => match mouse.kind {
             MouseEventKind::ScrollUp => app.scroll_up(),
@@ -1034,7 +1049,7 @@ fn render_hintbar(f: &mut Frame, app: &App, area: Rect) {
 
     let text = match app.input_mode {
         InputMode::Normal => format!(
-            " F9:Menu  F10:Quit  Ctrl+S:Save  Mouse:Scroll{}{}{}{}",
+            " F5:Workflow  F9:Menu  F10:Quit  Ctrl+S:Save  Mouse:Scroll{}{}{}{}",
             focus_label, terminal_hint, resize_hint, stop_hint
         ),
         InputMode::Input => format!(
@@ -1059,6 +1074,35 @@ fn render_hintbar(f: &mut Frame, app: &App, area: Rect) {
 /// — with white-on-black numbers and MC's turquoise-green bg labels.
 /// The ten fields fill the terminal width exactly and stay as close
 /// to equal as the labels allow (see [`keybar_field_widths`]).
+/// Build the ten keybar (num, label) pairs from the ten label strings,
+/// so the strip can be defined by editing ten plain words instead of a
+/// hardcoded array. Arguments are, in order, the labels for keys 1-10.
+fn keybar_labels(
+    f1: &'static str,
+    f2: &'static str,
+    f3: &'static str,
+    f4: &'static str,
+    f5: &'static str,
+    f6: &'static str,
+    f7: &'static str,
+    f8: &'static str,
+    f9: &'static str,
+    f10: &'static str,
+) -> [(&'static str, &'static str); 10] {
+    [
+        ("1", f1),
+        ("2", f2),
+        ("3", f3),
+        ("4", f4),
+        ("5", f5),
+        ("6", f6),
+        ("7", f7),
+        ("8", f8),
+        ("9", f9),
+        ("10", f10),
+    ]
+}
+
 fn render_keybar(f: &mut Frame, app: &App, area: Rect) {
     const NUM_STYLE: Style = Style::new().fg(Color::White).bg(Color::Black);
     const LABEL_STYLE: Style = Style::new().fg(Color::Black).bg(MC_GREEN);
@@ -1071,18 +1115,22 @@ fn render_keybar(f: &mut Frame, app: &App, area: Rect) {
         "Term"
     };
     let labels: [(&str, &str); 10] = if app.focus == Focus::Terminal {
-        [("1", "Help"), ("2", " "),("3", " "),("4", " "),("5", " "), ("6", " "),("7", "Stop"),("8", f8_label), ("9", "PullDn"), ("10", "Exit")]
+        keybar_labels(
+            "Help", " ", " ", " ", " ", " ", "Stop", f8_label, "PullDn", "Exit",
+        )
     } else {
-        [("1", "Help"),
-         ("2", "TBDMenu"),
-         ("3", "TBD"),
-         ("4", "TBD"),
-         ("5", "TBDWorkflow"),
-         ("6", "TBD"),
-         ("7", "Stop"),
-         ("8", f8_label),
-         ("9", "PullDn"),
-         ("10", "Exit")]
+        keybar_labels(
+            "Help",
+            "TBDMenu",
+            "TBD",
+            "TBD",
+            "TBDWorkflow",
+            "TBD",
+            "Stop",
+            f8_label,
+            "PullDn",
+            "Exit",
+        )
     };
 
     let widths = keybar_field_widths(&labels, area.width);

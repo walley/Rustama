@@ -1561,6 +1561,12 @@ impl App {
                 self.open_quit_confirm();
                 return;
             }
+            KeyCode::F(5) => {
+                // Workflow changer — opens the workflow dialog
+                // (also reachable via menu → edit/workflow).
+                self.open_workflow_dialog();
+                return;
+            }
             KeyCode::F(6) => {
               //currentrly nothing
               return;
@@ -1650,7 +1656,9 @@ impl App {
 
     fn handle_output_key(&mut self, key: KeyEvent) {
         match key.code {
-//            KeyCode::Tab => should be:cycles through windows, was menu, needs to be properly chaged
+            KeyCode::Tab => {
+                self.cycle_focus();
+            }
             KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.open_export_dialog();
             }
@@ -1686,6 +1694,71 @@ impl App {
                 self.focus = Focus::Input;
             }
             _ => {}
+        }
+    }
+
+    /// Cycle keyboard focus through the visible windows:
+    /// Output → Terminal (if visible) → back to Output.
+    fn cycle_focus(&mut self) {
+        let terminal_visible = self.terminal_state.visible && self.terminal_state.is_running();
+        match self.focus {
+            Focus::Output => {
+                if terminal_visible {
+                    self.focus = Focus::Terminal;
+                    self.status_message =
+                        "Terminal focused — keystrokes go to the shell. F8/^G: close terminal"
+                            .to_string();
+                } else {
+                    self.focus = Focus::Input;
+                    self.input_mode = InputMode::Input;
+                    self.status_message = "Input focused".to_string();
+                }
+            }
+            Focus::Terminal | Focus::Input => {
+                self.focus = Focus::Output;
+                self.input_mode = InputMode::Normal;
+                self.status_message = "Output focused".to_string();
+            }
+        }
+    }
+
+    /// Insert pasted text (bracketed paste from the terminal, or the
+    /// Ctrl+V clipboard path). Newlines in the pasted text become literal
+    /// newlines in the textarea — they must NOT be interpreted as the
+    /// Enter key (which sends the input to the model).
+    fn insert_paste_text(&mut self, text: &str) {
+        let len = text.len();
+        // Normalize CRLF/CR from clipboard/selection sources to '\n'.
+        for ch in text.chars().filter(|&c| c != '\r') {
+            if ch == '\n' {
+                self.textarea.insert_newline();
+            } else {
+                self.textarea.insert_char(ch);
+            }
+        }
+        self.status_message = format!("Pasted {} bytes", len);
+    }
+
+    /// Bracketed-paste event from the terminal. In terminal focus mode the
+    /// pasted bytes go straight to the PTY (newlines become CR so the child
+    /// sees line submissions); otherwise only the chat input accepts pasted
+    /// text — newlines stay literal and never trigger "send to model".
+    pub fn handle_paste(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        if self.focus == Focus::Terminal {
+            // The PTY speaks raw TTY: line endings are carriage returns.
+            let data = if text.contains('\r') {
+                text.to_string()
+            } else {
+                text.replace('\n', "\r")
+            };
+            let _ = self.terminal_state.send_raw(&data);
+            return;
+        }
+        if self.input_mode == InputMode::Input && self.focus == Focus::Input {
+            self.insert_paste_text(text);
         }
     }
 
@@ -1727,11 +1800,7 @@ impl App {
                 if let Some(ref mut cb) = self.clipboard {
                     match cb.get_text() {
                         Ok(text) => {
-                            let len = text.len();
-                            for ch in text.chars() {
-                                self.textarea.insert_char(ch);
-                            }
-                            self.status_message = format!("Pasted {} bytes", len);
+                            self.insert_paste_text(&text);
                         }
                         Err(e) => self.status_message = format!("Clipboard read: {}", e),
                     }
