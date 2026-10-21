@@ -1108,10 +1108,10 @@ fn keybar_labels(
     ]
 }
 
-fn render_keybar(f: &mut Frame, app: &App, area: Rect) {
-    const NUM_STYLE: Style = Style::new().fg(Color::White).bg(Color::Black);
-    const LABEL_STYLE: Style = Style::new().fg(Color::Black).bg(MC_GREEN);
-
+/// The ten keybar (num, label) pairs for the app's current state.
+/// Shared by `render_keybar` (main.rs) and the keybar mouse hit-test
+/// (`App::handle_keybar_click`, app.rs) so the two always agree.
+pub(crate) fn keybar_labels_for(app: &App) -> [(&'static str, &'static str); 10] {
     // F8 toggles the embedded terminal: "Term" opens (+focuses) it,
     // "CloseTerm" closes it (also reachable via ^G while focused).
     let f8_label = if app.terminal_state.is_running() {
@@ -1119,24 +1119,31 @@ fn render_keybar(f: &mut Frame, app: &App, area: Rect) {
     } else {
         "Term"
     };
-    let labels: [(&str, &str); 10] = if app.focus == Focus::Terminal {
+    if app.focus == Focus::Terminal {
         keybar_labels(
-            "Help", " ", " ", " ", " ", " ", "Stop", f8_label, "PullDn", "Exit",
+            "Help", " ", " ", " ", " ", "Workflow", "Stop", f8_label, "PullDn", "Exit",
         )
     } else {
         keybar_labels(
             "Help",
-            "TBDMenu",
-            "TBD",
-            "TBD",
-            "TBDWorkflow",
-            "TBD",
+            "Menu",
+            " ",
+            " ",
+            " ",
+            "Workflow",
             "Stop",
             f8_label,
             "PullDn",
             "Exit",
         )
-    };
+    }
+}
+
+fn render_keybar(f: &mut Frame, app: &App, area: Rect) {
+    const NUM_STYLE: Style = Style::new().fg(Color::White).bg(Color::Black);
+    const LABEL_STYLE: Style = Style::new().fg(Color::Black).bg(MC_GREEN);
+
+    let labels = keybar_labels_for(app);
 
     let widths = keybar_field_widths(&labels, area.width);
 
@@ -1181,7 +1188,7 @@ fn render_keybar(f: &mut Frame, app: &App, area: Rect) {
 ///    terminal is too narrow for every label (sum of minimums exceeds
 ///    the width) the fields stay at their minimums and the strip is
 ///    clipped by the renderer.
-fn keybar_field_widths(labels: &[(&str, &str)], width: u16) -> Vec<u16> {
+pub(crate) fn keybar_field_widths(labels: &[(&str, &str)], width: u16) -> Vec<u16> {
     let n = labels.len();
     let even = width / n as u16;
     let rem = width % n as u16;
@@ -2474,6 +2481,19 @@ mod keybar_tests {
         for (w, n) in widths.iter().zip(need.iter()) {
             assert!(w >= n, "field {} below minimum {}", w, n);
         }
+    }
+
+    #[test]
+    fn keybar_click_opens_the_clicked_keys_action() {
+        let mut app = test_app();
+        // 80 cols, 10 equal fields: F9 covers x=64..71.
+        app.handle_keybar_click(67, 80);
+        assert!(app.main_menu.is_open(), "clicking the F9 field opens the menu");
+
+        // Clicks in field 1..=5 have no action attached (yet).
+        let mut app = test_app();
+        app.handle_keybar_click(5, 80);
+        assert!(!app.main_menu.is_open());
     }
 
     #[test]

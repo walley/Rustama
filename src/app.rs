@@ -1349,13 +1349,49 @@ pub struct App {
     /// Most recent file edited/written by a tool — default target of
     /// `lsp_diagnostics` when called without a `path`.
     pub last_edited_file: Option<PathBuf>,
+    /// Debounce guard for `autosave_session` — prevents hammering disk
+    /// during retry loops (e.g. repeated 400 errors). At most one write
+    /// per second.
+    last_autosave: Option<std::time::Instant>,
+    /// Resolved session directory (from config `session_dir` or
+    /// default `<DOCUMENTS>/rustama`).
+    session_dir: PathBuf,
+    /// Resolved log directory (from config `log_directory`,
+    /// default `<session_dir>/logs`).
+    #[allow(dead_code)]
+    log_directory: PathBuf,
 }
 
 impl App {
     pub fn new(cfg: Config) -> Self {
         let textarea = TextArea::default();
         let clipboard = Clipboard::new().ok();
-        rotate_log_file(&cfg.logfile);
+
+        // Resolve session directory: config override, else default
+        // <DOCUMENTS>/rustama (xdg) or ~/rustama.
+        let session_dir = match &cfg.session_dir {
+            Some(d) if !d.trim().is_empty() => PathBuf::from(d.trim()),
+            _ => sessions_dir(),
+        };
+
+        // Resolve log directory: config override relative to session_dir,
+        // default <session_dir>/logs.
+        let log_directory = session_dir.join(&cfg.log_directory);
+        let _ = std::fs::create_dir_all(&log_directory);
+
+        // Generate session id first so we can embed it in the log file
+        // name — multiple concurrent Rustama instances then write to
+        // separate log files instead of clobbering each other.
+        let session_id = generate_session_id();
+
+        // Log file lives inside the log directory, named with the session
+        // id: rustama-<session_id>.log
+        let log_file = log_directory
+            .join(format!("rustama-{}.log", session_id))
+            .to_string_lossy()
+            .to_string();
+
+        rotate_log_file(&log_file);
         let model_params_store = load_model_params();
         let cloud_models = load_cloud_models_with_base(&model_params_store.default);
         let params = params_for_model(&cfg.model, &cloud_models, &model_params_store);
@@ -1456,7 +1492,7 @@ impl App {
             settings_cursor: 0,
             proxy: cfg.proxy.clone(),
             is_logging: cfg.logging,
-            log_file: cfg.logfile,
+            log_file,
             token_stats: TokenStats::default(),
             session_usage: TokenStats::default(),
             cloud_models,
@@ -1481,7 +1517,7 @@ impl App {
             cached_width: 0,
             terminal_height: 24,
             output_width: 0,
-            session_id: generate_session_id(),
+            session_id,
             session_name: String::new(),
             terminal_state: TerminalState {
                 width_pct: cfg.terminal_width_pct,
@@ -1507,6 +1543,9 @@ impl App {
             lsp_workspace: cfg.lsp_workspace.clone(),
             lsp_auto_diagnostics: cfg.lsp_auto_diagnostics,
             last_edited_file: None,
+            last_autosave: None,
+            session_dir,
+            log_directory,
         };
         app.session_name = app.session_id.clone();
         log_to_file(
@@ -1568,42 +1607,14 @@ impl App {
         }
 
         match key.code {
-            KeyCode::F(7) => {
-                // "Stop" — interrupt the in-flight request (streaming
-                // answer, tool round, or retry countdown).
-                self.stop_request();
+            // F6 (Workflow), F7 (Stop), F8 (Term/CloseTerm), F9 (Menu),
+            // F10 (Exit) — shared with the keybar mouse hit-test
+            // (`function_key_action`). Note: while the terminal panel
+            // holds keyboard focus these keys go to the PTY instead
+            // (see the terminal-focus block above).
+            KeyCode::F(n) if (6..=10).contains(&n) => {
+                self.function_key_action(n);
                 return;
-            }
-            KeyCode::F(9) => {
-                self.open_menu();
-                return;
-            }
-            KeyCode::F(8) => {
-                // Terminal toggle: open + focus when not running,
-                // close when running (keybar: "Term" / "CloseTerm").
-                if self.terminal_state.is_running() {
-                    self.terminal_state.close();
-                    self.status_message = "Terminal closed".to_string();
-                } else {
-                    let result = self.terminal_state.open("bash");
-                    self.focus = Focus::Terminal;
-                    self.status_message = result;
-                }
-                return;
-            }
-            KeyCode::F(10) => {
-                self.open_quit_confirm();
-                return;
-            }
-            KeyCode::F(5) => {
-                // Workflow changer — opens the workflow dialog
-                // (also reachable via menu → edit/workflow).
-                self.open_workflow_dialog();
-                return;
-            }
-            KeyCode::F(6) => {
-              //currentrly nothing
-              return;
             }
             KeyCode::Char('t' | 'T') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 if self.terminal_state.is_running() {
@@ -2704,6 +2715,36 @@ impl App {
 
     /// Drains pending stream chunks. Returns true when anything was
     /// consumed (i.e. the UI needs a redraw).
+    /// Handle a stalled turn (empty response / dead stream) by auto-sending
+    /// "continue", reusing the same budget as the mid-thought auto-continue
+    /// mechanism (MAX_AUTO_CONTINUES). Returns true when a retry was kicked
+    /// off (the caller should `break` out of the stream loop without
+    /// clearing `response_rx`/`is_loading`).
+    fn maybe_auto_continue(&mut self, reason: &str) -> bool {
+        if self.auto_continue_count >= MAX_AUTO_CONTINUES {
+            self.messages.push(ChatMessage::app(format!(
+                "Auto-continue limit ({}) reached — type \"continue\" to keep going.",
+                MAX_AUTO_CONTINUES
+            )));
+            return false;
+        }
+        self.auto_continue_count += 1;
+        self.log_event(
+            "AUTO_CONTINUE",
+            &format!(
+                "attempt {}/{} ({})",
+                self.auto_continue_count, MAX_AUTO_CONTINUES, reason
+            ),
+        );
+        self.messages.push(ChatMessage::app(format!(
+            "{} — auto-sending \"continue\" ({}/{}).",
+            reason, self.auto_continue_count, MAX_AUTO_CONTINUES
+        )));
+        self.set_auto_scroll();
+        self.send_to_ollama_async_with(Some("continue".to_string()));
+        true
+    }
+
     pub fn check_responses(&mut self) -> bool {
         let mut changed = false;
         if let Some(rx) = &self.response_rx {
@@ -2979,6 +3020,8 @@ impl App {
                                     MAX_AUTO_CONTINUES
                                 )));
                             }
+                        } else if self.maybe_auto_continue("Empty response from model") {
+                            break;
                         } else {
                             self.messages.push(ChatMessage::app(
                                 "Error: Empty response from model".to_string(),
@@ -3013,7 +3056,21 @@ impl App {
                                 "⚠ Stream ended unexpectedly (partial response shown)".to_string(),
                             ));
                         } else {
-                            self.messages.push(ChatMessage::app(msg));
+                            // Hard HTTP errors (e.g. 400 payload too large) won't
+                            // succeed on retry — don't burn the auto-continue
+                            // budget on them; just surface the error.
+                            let is_http_error = msg.starts_with("HTTP ");
+                            if !is_http_error && self.maybe_auto_continue("Stream ended unexpectedly") {
+                                self.autosave_session();
+                                break;
+                            } else if !is_http_error {
+                                self.messages.push(ChatMessage::app(msg.clone()));
+                            }
+                            // For HTTP errors the message was already logged as
+                            // HTTP_ERROR; show it verbatim so the user sees why.
+                            if is_http_error {
+                                self.messages.push(ChatMessage::app(msg));
+                            }
                         }
                         self.autosave_session();
                         self.is_loading = false;
@@ -3157,6 +3214,18 @@ impl App {
                     tool_call_id,
                     ..
                 } => {
+                    // Cap tool result content so a single oversized result
+                    // (e.g. search_content matching huge log files) can't
+                    // bloat the API request past the payload limit.
+                    let content = if content.len() > 50_000 {
+                        format!(
+                            "{}... [truncated, {} bytes]",
+                            safe_prefix(content, 50_000),
+                            content.len()
+                        )
+                    } else {
+                        content.clone()
+                    };
                     let mut msg = serde_json::json!({
                         "role": "tool",
                         "content": content,
@@ -3210,6 +3279,7 @@ impl App {
             params,
             proxy,
             max_retries,
+            false, // tools already advertised in the initial request
             cancel.clone(),
         );
         self.response_rx = Some(rx);
@@ -3331,6 +3401,18 @@ impl App {
                     tool_call_id,
                     ..
                 } => {
+                    // Cap tool result content so a single oversized result
+                    // (e.g. search_content matching huge log files) can't
+                    // bloat the API request past the payload limit.
+                    let content = if content.len() > 50_000 {
+                        format!(
+                            "{}... [truncated, {} bytes]",
+                            safe_prefix(content, 50_000),
+                            content.len()
+                        )
+                    } else {
+                        content.clone()
+                    };
                     let mut msg = serde_json::json!({
                         "role": "tool",
                         "content": content,
@@ -3384,6 +3466,7 @@ impl App {
             params,
             proxy,
             max_retries,
+            true, // initial user request: advertise tools
             cancel.clone(),
         );
         self.response_rx = Some(rx);
@@ -3533,7 +3616,7 @@ impl App {
     }
 
     fn open_save_dialog(&mut self) {
-        let default_path = sessions_dir()
+        let default_path = self.session_dir
             .join(format!("{}.session.rustama", self.session_name))
             .to_string_lossy()
             .to_string();
@@ -3607,8 +3690,8 @@ impl App {
     }
 
     pub fn save_session(&self) -> Result<(), String> {
-        let sessions_dir = sessions_dir();
-        std::fs::create_dir_all(&sessions_dir).map_err(|e| e.to_string())?;
+        let sessions_dir = &self.session_dir;
+        std::fs::create_dir_all(sessions_dir).map_err(|e| e.to_string())?;
         let path = sessions_dir.join(format!("{}.session.rustama", self.session_name));
         let data = serde_json::json!({
             "session_id": self.session_id,
@@ -3626,6 +3709,17 @@ impl App {
     /// starting the app never litters the sessions directory.
     /// Failures are only logged — autosave must stay unobtrusive.
     pub fn autosave_session(&mut self) {
+        // Debounce: at most one session write per second. Prevents
+        // hammering disk during retry loops (e.g. repeated 400 errors
+        // that each autosave before returning).
+        let now = std::time::Instant::now();
+        if let Some(last) = self.last_autosave {
+            if now.duration_since(last) < std::time::Duration::from_secs(1) {
+                return;
+            }
+        }
+        self.last_autosave = Some(now);
+
         if !self.messages.iter().any(|m| matches!(m, ChatMessage::User { .. })) {
             return;
         }
@@ -3663,7 +3757,7 @@ impl App {
 
     pub fn load_session(&mut self, sess_id: &str) -> Result<(), String> {
         self.autosave_session();
-        let sessions_dir = sessions_dir();
+        let sessions_dir = &self.session_dir;
         let path = sessions_dir.join(format!("{}.session.rustama", sess_id));
         let json =
             std::fs::read_to_string(&path).map_err(|e| format!("Session not found: {}", e))?;
@@ -3684,7 +3778,7 @@ impl App {
 
     fn open_load_session_dialog(&mut self) {
         self.file_dialog_mode = FileDialogMode::LoadSession;
-        self.file_dialog_path = sessions_dir();
+        self.file_dialog_path = self.session_dir.clone();
         self.file_dialog_entries.clear();
         self.file_dialog_selection = 0;
         self.file_dialog_scroll = 0;
@@ -4030,6 +4124,13 @@ impl App {
             return;
         }
 
+        // Keybar (F-key strip) — the bottom row. Clicking a field runs
+        // the same action as pressing that F-key.
+        if row + 1 == height {
+            self.handle_keybar_click(col, width);
+            return;
+        }
+
         if row == 0 || self.main_menu.is_open() {
             let action = self.main_menu.handle_click(col, row);
             match action {
@@ -4096,6 +4197,59 @@ impl App {
                     self.selecting = true;
                 }
             }
+        }
+    }
+
+    /// Mouse hit-test for the keybar: maps a column to one of the ten
+    /// F-key fields (same label/width computation as `render_keybar`)
+    /// and dispatches the same action as the keyboard key. Dispatched
+    /// directly (not via `handle_global_key`) so it works even when the
+    /// terminal panel holds keyboard focus.
+    pub fn handle_keybar_click(&mut self, col: u16, width: u16) {
+        let labels = crate::keybar_labels_for(self);
+        let widths = crate::keybar_field_widths(&labels, width);
+        let mut x: u16 = 0;
+        for (i, w) in widths.iter().enumerate() {
+            if col < x.saturating_add(*w) {
+                self.function_key_action(i as u8 + 1);
+                return;
+            }
+            x = x.saturating_add(*w);
+        }
+    }
+
+    /// Action behind keybar key `n` (1..=10). Shared by the F-key
+    /// handler and keybar mouse clicks.
+    fn function_key_action(&mut self, n: u8) {
+        match n {
+            6 => {
+                // Workflow changer — opens the workflow dialog.
+                self.open_workflow_dialog();
+            }
+            7 => {
+                // "Stop" — interrupt the in-flight request.
+                self.stop_request();
+            }
+            8 => {
+                // Terminal toggle: open + focus when not running,
+                // close when running (keybar: "Term" / "CloseTerm").
+                if self.terminal_state.is_running() {
+                    self.terminal_state.close();
+                    self.status_message = "Terminal closed".to_string();
+                } else {
+                    let result = self.terminal_state.open("bash");
+                    self.focus = Focus::Terminal;
+                    self.status_message = result;
+                }
+            }
+            9 => {
+                self.open_menu();
+            }
+            10 => {
+                self.open_quit_confirm();
+            }
+            // 1-5: currently no action.
+            _ => {}
         }
     }
 
@@ -6607,6 +6761,47 @@ mod usage_tests {
         assert_eq!(stats.prompt_tokens, 0);
         assert_eq!(stats.response_tokens, 0);
     }
+
+    #[test]
+    fn maybe_auto_continue_works_without_tools() {
+        // After removing the `uses_tools()` guard, auto-continue should
+        // proceed even in plain Chat mode (no tools). Use MAX-1 to avoid
+        // tripping the limit guard (the function still spawns a background
+        // request thread, which is fine in a test — it will just fail to
+        // connect and log an error).
+        let mut app = test_app();
+        app.chat_mode = ChatMode::Chat;
+        app.auto_continue_count = MAX_AUTO_CONTINUES - 1;
+        assert!(app.maybe_auto_continue("Empty response from model"));
+        assert_eq!(app.auto_continue_count, MAX_AUTO_CONTINUES);
+    }
+
+    #[test]
+    fn maybe_auto_continue_respects_limit() {
+        let mut app = test_app();
+        app.auto_continue_count = MAX_AUTO_CONTINUES;
+        assert!(!app.maybe_auto_continue("Stream ended unexpectedly"));
+        assert!(app.messages.iter().any(|m| matches!(
+            m,
+            ChatMessage::App { text, .. } if text.contains("Auto-continue limit")
+        )));
+    }
+
+    #[test]
+    fn autosave_session_is_debounced() {
+        let mut app = test_app();
+        app.messages.push(ChatMessage::user("test".to_string()));
+
+        // Seed last_autosave to "now" so the next call is within the
+        // debounce window.
+        app.last_autosave = Some(std::time::Instant::now());
+        let before = app.last_autosave.unwrap();
+
+        // Should be debounced — last_autosave unchanged.
+        app.autosave_session();
+        let after = app.last_autosave.unwrap();
+        assert_eq!(before, after, "second autosave should be debounced");
+    }
 }
 
 #[cfg(test)]
@@ -7986,15 +8181,45 @@ fn grep_regex(pattern: &str, path: &str, include: &str) -> Result<Vec<String>, S
     let re = regex::Regex::new(pattern).map_err(|e| format!("Invalid regex: {}", e))?;
     let glob_pattern = format!("{}/{}", path, include);
 
+    // Files we never want to search: app logs contain REQUEST/RESPONSE
+    // payloads (including full tool schemas) and can be hundreds of MB.
+    // Searching them returns huge lines that bloat tool results and can
+    // push API request payloads over the size limit.
+    const EXCLUDED_NAMES: &[&str] = &["rustama.log", "rustama-lsp.log"];
+
     let mut results = Vec::new();
+    let mut total_bytes = 0usize;
+    const MAX_RESULT_BYTES: usize = 50_000; // same cap as fetch_url
+
     if let Ok(entries) = glob::glob(&glob_pattern) {
         for entry in entries.flatten() {
-            if entry.is_file()
-                && let Ok(content) = std::fs::read_to_string(&entry)
-            {
+            let name = entry
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            if EXCLUDED_NAMES.iter().any(|e| name.starts_with(e)) {
+                continue;
+            }
+            if entry.is_file() && let Ok(content) = std::fs::read_to_string(&entry) {
                 for (line_num, line) in content.lines().enumerate() {
                     if re.is_match(line) {
-                        results.push(format!("{}:{}: {}", entry.display(), line_num + 1, line));
+                        let entry_line = format!("{}:{}: {}", entry.display(), line_num + 1, line);
+                        // Truncate overly long lines (e.g. log lines that embed
+                        // entire JSON payloads on one line).
+                        let entry_line = if entry_line.len() > 2000 {
+                            format!("{}... [truncated, {} bytes]", &entry_line[..2000], entry_line.len())
+                        } else {
+                            entry_line
+                        };
+                        if total_bytes + entry_line.len() > MAX_RESULT_BYTES {
+                            results.push(format!(
+                                "...[search results truncated at {} bytes total]",
+                                MAX_RESULT_BYTES
+                            ));
+                            return Ok(results);
+                        }
+                        total_bytes += entry_line.len();
+                        results.push(entry_line);
                     }
                 }
             }
@@ -9300,6 +9525,7 @@ fn build_chat_body(
     mode: ChatMode,
     api_messages: &[serde_json::Value],
     params: &ModelParams,
+    include_tools: bool,
 ) -> serde_json::Value {
     if let Some(cloud) = cloud_model {
         let mut body = serde_json::json!({
@@ -9310,8 +9536,10 @@ fn build_chat_body(
         if let Some(max_tokens) = params.max_output_tokens {
             body["max_tokens"] = serde_json::json!(max_tokens);
         }
-        if let Some(tools) = tools_for_mode(mode) {
-            body["tools"] = serde_json::json!(tools);
+        if include_tools {
+            if let Some(tools) = tools_for_mode(mode) {
+                body["tools"] = serde_json::json!(tools);
+            }
         }
         body["temperature"] = serde_json::json!(params.temperature);
         body["top_p"] = serde_json::json!(params.top_p);
@@ -9337,8 +9565,10 @@ fn build_chat_body(
             "messages": api_messages,
             "stream": true,
         });
-        if let Some(tools) = tools_for_mode(mode) {
-            body["tools"] = serde_json::json!(tools);
+        if include_tools {
+            if let Some(tools) = tools_for_mode(mode) {
+                body["tools"] = serde_json::json!(tools);
+            }
         }
         let mut options = serde_json::json!({});
         options["temperature"] = serde_json::json!(params.temperature);
@@ -9402,6 +9632,7 @@ fn stream_chat_request(
     params: ModelParams,
     proxy: Option<String>,
     max_retries: u32,
+    include_tools: bool,
     cancel: Arc<AtomicBool>,
 ) -> mpsc::Receiver<StreamChunk> {
     let (tx, rx) = mpsc::channel();
@@ -9415,7 +9646,7 @@ fn stream_chat_request(
         rt.block_on(async {
             let client = build_reqwest_client(&proxy);
 
-            let body = build_chat_body(&model, cloud_model.as_ref(), mode, &api_messages, &params);
+            let body = build_chat_body(&model, cloud_model.as_ref(), mode, &api_messages, &params, include_tools);
             let (api_url, headers) = if let Some(ref cloud) = cloud_model {
                 let mut headers = reqwest::header::HeaderMap::new();
                 headers.insert(
@@ -9659,7 +9890,7 @@ mod chat_body_tests {
             seed: Some(42),
             num_ctx: Some(202752),
         };
-        let body = build_chat_body("llama3.2:3b", None, ChatMode::Coder, &msgs(), &params);
+        let body = build_chat_body("llama3.2:3b", None, ChatMode::Coder, &msgs(), &params, true);
         assert_eq!(body["model"], "llama3.2:3b");
         let o = &body["options"];
         assert_eq!(o["temperature"], 0.7);
@@ -9677,7 +9908,7 @@ mod chat_body_tests {
     #[test]
     fn ollama_body_defaults_send_only_basics() {
         let params = ModelParams::default();
-        let body = build_chat_body("m", None, ChatMode::Chat, &msgs(), &params);
+        let body = build_chat_body("m", None, ChatMode::Chat, &msgs(), &params, true);
         let o = &body["options"];
         assert_eq!(o["temperature"], 1.0);
         assert_eq!(o["top_p"], 0.9);
@@ -9696,17 +9927,17 @@ mod chat_body_tests {
         let mut params = ModelParams::default();
         params.reasoning_effort = Some("off".to_string());
         assert_eq!(
-            build_chat_body("m", None, ChatMode::Chat, &msgs(), &params)["think"],
+            build_chat_body("m", None, ChatMode::Chat, &msgs(), &params, true)["think"],
             false
         );
         params.reasoning_effort = Some("on".to_string());
         assert_eq!(
-            build_chat_body("m", None, ChatMode::Chat, &msgs(), &params)["think"],
+            build_chat_body("m", None, ChatMode::Chat, &msgs(), &params, true)["think"],
             true
         );
         params.reasoning_effort = Some("low".to_string());
         assert_eq!(
-            build_chat_body("m", None, ChatMode::Chat, &msgs(), &params)["think"],
+            build_chat_body("m", None, ChatMode::Chat, &msgs(), &params, true)["think"],
             "low"
         );
     }
@@ -9725,7 +9956,7 @@ mod chat_body_tests {
             seed: Some(7),
             num_ctx: Some(9999), // not an OpenAI concept — must not be sent
         };
-        let body = build_chat_body("test-cloud", Some(&cloud), ChatMode::Coder, &msgs(), &params);
+        let body = build_chat_body("test-cloud", Some(&cloud), ChatMode::Coder, &msgs(), &params, true);
         assert_eq!(body["model"], "test-cloud");
         assert_eq!(body["temperature"], 0.6);
         assert_eq!(body["top_p"], 0.95);
@@ -9745,7 +9976,7 @@ mod chat_body_tests {
     fn cloud_body_skips_unset_and_toggle_effort() {
         let cloud = cloud();
         let mut params = ModelParams::default();
-        let body = build_chat_body("test-cloud", Some(&cloud), ChatMode::Coder, &msgs(), &params);
+        let body = build_chat_body("test-cloud", Some(&cloud), ChatMode::Coder, &msgs(), &params, true);
         assert!(body.get("max_tokens").is_none());
         assert!(body.get("frequency_penalty").is_none());
         assert!(body.get("presence_penalty").is_none());
@@ -9754,7 +9985,7 @@ mod chat_body_tests {
 
         // "off"/"on" are toggles, not levels — cloud APIs reject them.
         params.reasoning_effort = Some("off".to_string());
-        let body = build_chat_body("test-cloud", Some(&cloud), ChatMode::Coder, &msgs(), &params);
+        let body = build_chat_body("test-cloud", Some(&cloud), ChatMode::Coder, &msgs(), &params, true);
         assert!(body.get("reasoning_effort").is_none());
     }
 

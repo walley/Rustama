@@ -34,6 +34,10 @@ pub struct Config {
     /// Show the hint bar (key hints / focus indicator) on the
     /// second-to-last terminal line. Default: off.
     pub hintbar: bool,
+    /// Directory for session files. Default: <DOCUMENTS>/rustama or ~/rustama.
+    pub session_dir: Option<String>,
+    /// Directory for log files. Default: <session_dir>/logs.
+    pub log_directory: String,
     /// Launch a rust-analyzer LSP server for compiler feedback
     /// (`lsp_diagnostics` tool). Default: off — it is a heavy process.
     pub lsp: bool,
@@ -277,6 +281,8 @@ impl Default for Config {
             lsp_server: "rust-analyzer".to_string(),
             lsp_workspace: String::new(),
             lsp_auto_diagnostics: true,
+            session_dir: None,
+            log_directory: "logs".to_string(),
         }
     }
 }
@@ -348,6 +354,8 @@ impl Config {
                         "lsp_auto_diagnostics".to_string(),
                         if dflt.lsp_auto_diagnostics { "on" } else { "off" }.to_string(),
                     ),
+                    ("session_dir".to_string(), dflt.session_dir.clone().unwrap_or_default()),
+                    ("log_directory".to_string(), dflt.log_directory.clone()),
                 ];
 
                 let mut updated = content.clone();
@@ -445,6 +453,10 @@ impl Config {
              # Append LSP diagnostics to edit_file/write_file results\n\
              # (on/off, default: on)\n\
              lsp_auto_diagnostics = {}\n\n\
+             # Directory for session files (default: <DOCUMENTS>/rustama)\n\
+             session_dir = {}\n\n\
+             # Directory for log files (default: <session_dir>/logs)\n\
+             log_directory = {}\n\n\
              # NOTE: model parameters (temperature, top_p, top_k,\n\
              # frequency_penalty, presence_penalty, max_output_tokens,\n\
              # reasoning_effort, seed) are per-model now — see\n\
@@ -467,6 +479,8 @@ impl Config {
             self.lsp_server,
             self.lsp_workspace,
             if self.lsp_auto_diagnostics { "on" } else { "off" },
+            self.session_dir.clone().unwrap_or_default(),
+            self.log_directory.clone(),
         )
     }
 
@@ -566,6 +580,18 @@ impl Config {
         }
         if let Some(v) = values.get("lsp_auto_diagnostics") {
             cfg.lsp_auto_diagnostics = parse_bool(v);
+        }
+        if let Some(v) = values.get("session_dir") {
+            let v = v.trim();
+            if !v.is_empty() {
+                cfg.session_dir = Some(v.to_string());
+            }
+        }
+        if let Some(v) = values.get("log_directory") {
+            let v = v.trim();
+            if !v.is_empty() {
+                cfg.log_directory = v.to_string();
+            }
         }
 
         cfg
@@ -713,6 +739,8 @@ impl Config {
             "lsp_auto_diagnostics = {}",
             if self.lsp_auto_diagnostics { "on" } else { "off" }
         ));
+        lines.push(format!("session_dir = {}", self.session_dir.clone().unwrap_or_default()));
+        lines.push(format!("log_directory = {}", self.log_directory));
         fs::write(&conf_path, lines.join("\n")).map_err(|e| e.to_string())?;
         Ok(())
     }
