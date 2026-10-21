@@ -3279,7 +3279,6 @@ impl App {
             params,
             proxy,
             max_retries,
-            false, // tools already advertised in the initial request
             cancel.clone(),
         );
         self.response_rx = Some(rx);
@@ -3466,7 +3465,6 @@ impl App {
             params,
             proxy,
             max_retries,
-            true, // initial user request: advertise tools
             cancel.clone(),
         );
         self.response_rx = Some(rx);
@@ -9534,7 +9532,6 @@ fn build_chat_body(
     mode: ChatMode,
     api_messages: &[serde_json::Value],
     params: &ModelParams,
-    include_tools: bool,
 ) -> serde_json::Value {
     if let Some(cloud) = cloud_model {
         let mut body = serde_json::json!({
@@ -9545,10 +9542,8 @@ fn build_chat_body(
         if let Some(max_tokens) = params.max_output_tokens {
             body["max_tokens"] = serde_json::json!(max_tokens);
         }
-        if include_tools {
-            if let Some(tools) = tools_for_mode(mode) {
-                body["tools"] = serde_json::json!(tools);
-            }
+        if let Some(tools) = tools_for_mode(mode) {
+            body["tools"] = serde_json::json!(tools);
         }
         body["temperature"] = serde_json::json!(params.temperature);
         body["top_p"] = serde_json::json!(params.top_p);
@@ -9574,10 +9569,8 @@ fn build_chat_body(
             "messages": api_messages,
             "stream": true,
         });
-        if include_tools {
-            if let Some(tools) = tools_for_mode(mode) {
-                body["tools"] = serde_json::json!(tools);
-            }
+        if let Some(tools) = tools_for_mode(mode) {
+            body["tools"] = serde_json::json!(tools);
         }
         let mut options = serde_json::json!({});
         options["temperature"] = serde_json::json!(params.temperature);
@@ -9641,7 +9634,6 @@ fn stream_chat_request(
     params: ModelParams,
     proxy: Option<String>,
     max_retries: u32,
-    include_tools: bool,
     cancel: Arc<AtomicBool>,
 ) -> mpsc::Receiver<StreamChunk> {
     let (tx, rx) = mpsc::channel();
@@ -9655,7 +9647,7 @@ fn stream_chat_request(
         rt.block_on(async {
             let client = build_reqwest_client(&proxy);
 
-            let body = build_chat_body(&model, cloud_model.as_ref(), mode, &api_messages, &params, include_tools);
+            let body = build_chat_body(&model, cloud_model.as_ref(), mode, &api_messages, &params);
             let (api_url, headers) = if let Some(ref cloud) = cloud_model {
                 let mut headers = reqwest::header::HeaderMap::new();
                 headers.insert(
@@ -9899,7 +9891,7 @@ mod chat_body_tests {
             seed: Some(42),
             num_ctx: Some(202752),
         };
-        let body = build_chat_body("llama3.2:3b", None, ChatMode::Coder, &msgs(), &params, true);
+        let body = build_chat_body("llama3.2:3b", None, ChatMode::Coder, &msgs(), &params);
         assert_eq!(body["model"], "llama3.2:3b");
         let o = &body["options"];
         assert_eq!(o["temperature"], 0.7);
@@ -9917,7 +9909,7 @@ mod chat_body_tests {
     #[test]
     fn ollama_body_defaults_send_only_basics() {
         let params = ModelParams::default();
-        let body = build_chat_body("m", None, ChatMode::Chat, &msgs(), &params, true);
+        let body = build_chat_body("m", None, ChatMode::Chat, &msgs(), &params);
         let o = &body["options"];
         assert_eq!(o["temperature"], 1.0);
         assert_eq!(o["top_p"], 0.9);
@@ -9936,17 +9928,17 @@ mod chat_body_tests {
         let mut params = ModelParams::default();
         params.reasoning_effort = Some("off".to_string());
         assert_eq!(
-            build_chat_body("m", None, ChatMode::Chat, &msgs(), &params, true)["think"],
+            build_chat_body("m", None, ChatMode::Chat, &msgs(), &params)["think"],
             false
         );
         params.reasoning_effort = Some("on".to_string());
         assert_eq!(
-            build_chat_body("m", None, ChatMode::Chat, &msgs(), &params, true)["think"],
+            build_chat_body("m", None, ChatMode::Chat, &msgs(), &params)["think"],
             true
         );
         params.reasoning_effort = Some("low".to_string());
         assert_eq!(
-            build_chat_body("m", None, ChatMode::Chat, &msgs(), &params, true)["think"],
+            build_chat_body("m", None, ChatMode::Chat, &msgs(), &params)["think"],
             "low"
         );
     }
@@ -9965,7 +9957,7 @@ mod chat_body_tests {
             seed: Some(7),
             num_ctx: Some(9999), // not an OpenAI concept — must not be sent
         };
-        let body = build_chat_body("test-cloud", Some(&cloud), ChatMode::Coder, &msgs(), &params, true);
+        let body = build_chat_body("test-cloud", Some(&cloud), ChatMode::Coder, &msgs(), &params);
         assert_eq!(body["model"], "test-cloud");
         assert_eq!(body["temperature"], 0.6);
         assert_eq!(body["top_p"], 0.95);
@@ -9985,7 +9977,7 @@ mod chat_body_tests {
     fn cloud_body_skips_unset_and_toggle_effort() {
         let cloud = cloud();
         let mut params = ModelParams::default();
-        let body = build_chat_body("test-cloud", Some(&cloud), ChatMode::Coder, &msgs(), &params, true);
+        let body = build_chat_body("test-cloud", Some(&cloud), ChatMode::Coder, &msgs(), &params);
         assert!(body.get("max_tokens").is_none());
         assert!(body.get("frequency_penalty").is_none());
         assert!(body.get("presence_penalty").is_none());
@@ -9994,7 +9986,7 @@ mod chat_body_tests {
 
         // "off"/"on" are toggles, not levels — cloud APIs reject them.
         params.reasoning_effort = Some("off".to_string());
-        let body = build_chat_body("test-cloud", Some(&cloud), ChatMode::Coder, &msgs(), &params, true);
+        let body = build_chat_body("test-cloud", Some(&cloud), ChatMode::Coder, &msgs(), &params);
         assert!(body.get("reasoning_effort").is_none());
     }
 
