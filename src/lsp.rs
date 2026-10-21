@@ -126,6 +126,9 @@ pub struct LspClient {
     /// Directory for the LSP server's stderr log file (rustama-lsp.log).
     /// Defaults to current directory; set via `set_log_path()`.
     log_path: PathBuf,
+    /// Session id embedded in the LSP log filename so concurrent instances
+    /// don't clobber each other's logs.
+    session_id: String,
 }
 
 impl std::fmt::Debug for LspClient {
@@ -164,6 +167,7 @@ impl LspClient {
             root: PathBuf::new(),
             server_bin: String::new(),
             log_path: PathBuf::new(),
+            session_id: String::new(),
         }
     }
 
@@ -179,6 +183,11 @@ impl LspClient {
     /// Call before `start()`.
     pub fn set_log_path(&mut self, path: PathBuf) {
         self.log_path = path;
+    }
+
+    /// Set the session id embedded in the LSP log filename.
+    pub fn set_session_id(&mut self, id: &str) {
+        self.session_id = id.to_string();
     }
 
     /// Spawns `server_bin` rooted at `root` and performs the LSP handshake.
@@ -204,8 +213,9 @@ impl LspClient {
 
     fn start_inner(&mut self) -> Result<(), String> {
         // rust-analyzer logs useful progress/crash info to stderr — keep
-        // it in the configured log directory instead of discarding it.
-        let log_file = self.log_path.join("rustama-lsp.log");
+        // it in the configured log directory, named with the session id so
+        // concurrent instances write to separate files.
+        let log_file = self.log_path.join(format!("rustama-lsp-{}.log", self.session_id));
         let stderr: Stdio = std::fs::File::create(&log_file)
             .map(Stdio::from)
             .unwrap_or(Stdio::null());

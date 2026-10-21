@@ -1549,6 +1549,7 @@ impl App {
         };
         // Point LSP server stderr at the configured log directory.
         app.lsp.set_log_path(log_directory);
+        app.lsp.set_session_id(&app.session_id);
         app.session_name = app.session_id.clone();
         log_to_file(
             app.is_logging,
@@ -3781,6 +3782,7 @@ impl App {
         rotate_log_file(log_path.to_string_lossy().as_ref());
         self.session_id = sess_id.to_string();
         self.log_file = log_path.to_string_lossy().to_string();
+        self.lsp.set_session_id(sess_id);
         self.status_message = format!("Loaded session {}", sess_id);
         Ok(())
     }
