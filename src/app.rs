@@ -3772,6 +3772,15 @@ impl App {
             self.model_name = model.to_string();
             self.apply_model_params();
         }
+        // Rotate the log file for this session so concurrent instances
+        // and re-opened sessions don't clobber each other's logs. The log
+        // file name matches the session file name: rustama-<session_id>.log
+        let log_path = self
+            .log_directory
+            .join(format!("rustama-{}.log", sess_id));
+        rotate_log_file(log_path.to_string_lossy().as_ref());
+        self.session_id = sess_id.to_string();
+        self.log_file = log_path.to_string_lossy().to_string();
         self.status_message = format!("Loaded session {}", sess_id);
         Ok(())
     }
