@@ -1545,8 +1545,10 @@ impl App {
             last_edited_file: None,
             last_autosave: None,
             session_dir,
-            log_directory,
+            log_directory: log_directory.clone(),
         };
+        // Point LSP server stderr at the configured log directory.
+        app.lsp.set_log_path(log_directory);
         app.session_name = app.session_id.clone();
         log_to_file(
             app.is_logging,

@@ -123,6 +123,9 @@ pub struct LspClient {
     stop_reader: Arc<AtomicBool>,
     root: PathBuf,
     server_bin: String,
+    /// Directory for the LSP server's stderr log file (rustama-lsp.log).
+    /// Defaults to current directory; set via `set_log_path()`.
+    log_path: PathBuf,
 }
 
 impl std::fmt::Debug for LspClient {
@@ -160,6 +163,7 @@ impl LspClient {
             stop_reader: Arc::new(AtomicBool::new(false)),
             root: PathBuf::new(),
             server_bin: String::new(),
+            log_path: PathBuf::new(),
         }
     }
 
@@ -169,6 +173,12 @@ impl LspClient {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Set the directory for `rustama-lsp.log` (LSP server stderr).
+    /// Call before `start()`.
+    pub fn set_log_path(&mut self, path: PathBuf) {
+        self.log_path = path;
     }
 
     /// Spawns `server_bin` rooted at `root` and performs the LSP handshake.
@@ -194,8 +204,9 @@ impl LspClient {
 
     fn start_inner(&mut self) -> Result<(), String> {
         // rust-analyzer logs useful progress/crash info to stderr — keep
-        // it in a file next to the app log instead of discarding it.
-        let stderr: Stdio = std::fs::File::create("rustama-lsp.log")
+        // it in the configured log directory instead of discarding it.
+        let log_file = self.log_path.join("rustama-lsp.log");
+        let stderr: Stdio = std::fs::File::create(&log_file)
             .map(Stdio::from)
             .unwrap_or(Stdio::null());
         let mut child = Command::new(&self.server_bin)
