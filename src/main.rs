@@ -18,6 +18,7 @@ mod config;
 mod lsp;
 mod markdown;
 mod primary_selection;
+mod tools;
 mod ui;
 use app::{App, ChatMessage, Focus, InputMode, ModelDialogFocus, SaveDialogFocus, SettingsFocus};
 use config::Config;
@@ -1241,14 +1242,16 @@ pub(crate) fn keybar_field_widths(labels: &[(&str, &str)], width: u16) -> Vec<u1
 }
 
 fn render_model_dialog(f: &mut Frame, app: &App, area: Rect) {
-    let model_count = app.available_models.len() as u16;
+    // Combined list: local Ollama models plus cloud models (marked ☁).
+    let entries = app.model_dialog_entries();
+    let model_count = entries.len() as u16;
     let (popup_area, list_area, info_y, btn_y, confirm_x, cancel_x) =
         ui::model_dialog_geometry(model_count, area);
 
     f.render_widget(Clear, popup_area);
     f.render_widget(dialog_block("Select Model", &app.theme), popup_area);
 
-    if app.available_models.is_empty() {
+    if entries.is_empty() {
         let loading = Paragraph::new(Line::from(Span::styled(
             "  Loading models...",
             Style::default()
@@ -1260,23 +1263,18 @@ fn render_model_dialog(f: &mut Frame, app: &App, area: Rect) {
     }
 
     // The framed, scrollable list of models. The current model is marked
-    // with "(current)" and drawn in the title color.
-    let items: Vec<(String, bool)> = app
-        .available_models
+    // with "(current)" and drawn in the title color; cloud models carry
+    // a ☁ marker and the cloud color.
+    let current = app.model_name.clone();
+    let items: Vec<(String, bool, bool)> = entries
         .iter()
-        .map(|name| {
-            let is_current = name == &app.model_name;
-            let display_name = if name.chars().count() > 46 {
-                format!("{}...", crate::app::safe_prefix(name, 43))
-            } else {
-                name.clone()
-            };
-            let label = if is_current {
-                format!("{} (current)", display_name)
-            } else {
-                display_name
-            };
-            (label, is_current)
+        .map(|(name, is_cloud)| {
+            let is_current = name == &current;
+            (
+                crate::app::App::model_dialog_label(name, *is_cloud, is_current),
+                is_current,
+                *is_cloud,
+            )
         })
         .collect();
     let listbox = ui::ListBox::new(
@@ -1289,14 +1287,28 @@ fn render_model_dialog(f: &mut Frame, app: &App, area: Rect) {
     listbox.render(f, list_area, &app.theme);
 
     // Info line: context window of the selected model (fetched live via
-    // /api/show; the same detection used to set num_ctx on confirm).
-    let selected_name = app.available_models.get(app.model_dialog_selection);
-    let info_text = match (&app.model_info, selected_name) {
-        (Some((name, Some(ctx))), Some(sel)) if name == sel => {
+    // /api/show for local models, from the config for cloud ones). Cloud
+    // entries also show their per-1M-token pricing when configured.
+    let selected = entries.get(app.model_dialog_selection);
+    let is_cloud_sel = selected.is_some_and(|(_, cloud)| *cloud);
+    let info_text = match (&app.model_info, selected) {
+        (Some((name, Some(ctx))), Some((sel, _))) if name == sel => {
             format!("Context: {} tokens", ctx)
         }
-        (Some((name, None)), Some(sel)) if name == sel => "Context: unknown".to_string(),
+        (Some((name, None)), Some((sel, _))) if name == sel => "Context: unknown".to_string(),
         _ => "Context: detecting...".to_string(),
+    };
+    let info_text = if is_cloud_sel {
+        // Pricing, when the model has it in cloud_models.conf.
+        let pricing = selected
+            .and_then(|(name, _)| app.cloud_models.iter().find(|m| &m.name == name))
+            .and_then(|m| m.pricing.short_summary());
+        match pricing {
+            Some(price) => format!("Cloud · {} · {}", info_text, price),
+            None => format!("Cloud · {}", info_text),
+        }
+    } else {
+        info_text
     };
     let info = Paragraph::new(Line::from(Span::styled(
         format!("  {}", info_text),
@@ -1362,7 +1374,7 @@ fn render_workflow_dialog(f: &mut Frame, app: &App, area: Rect) {
 
     // The mode list; the active mode is marked "(current)" and drawn in
     // the title color, like the current model in the model dialog.
-    let items: Vec<(String, bool)> = ChatMode::ALL
+    let items: Vec<(String, bool, bool)> = ChatMode::ALL
         .iter()
         .map(|m| {
             let is_current = *m == app.chat_mode;
@@ -1371,7 +1383,7 @@ fn render_workflow_dialog(f: &mut Frame, app: &App, area: Rect) {
             } else {
                 m.label().to_string()
             };
-            (label, is_current)
+            (label, is_current, false)
         })
         .collect();
     let listbox = ui::ListBox::new(

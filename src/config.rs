@@ -227,6 +227,30 @@ impl ModelPricing {
         self.input_per_mtok.is_some() || self.output_per_mtok.is_some()
     }
 
+    /// Compact one-line summary for pickers/info rows, e.g.
+    /// `$3/$15 per 1M` (in/out) or `$3/-$15 per 1M` when a rate is
+    /// missing. `None` when no rates are configured at all.
+    pub fn short_summary(&self) -> Option<String> {
+        if !self.is_configured() {
+            return None;
+        }
+        let fmt = |v: Option<f64>| {
+            v.map(|r| {
+                if r.fract() == 0.0 {
+                    format!("${}", r)
+                } else {
+                    format!("${:.2}", r)
+                }
+            })
+            .unwrap_or_else(|| "-".to_string())
+        };
+        Some(format!(
+            "{}/{} per 1M",
+            fmt(self.input_per_mtok),
+            fmt(self.output_per_mtok)
+        ))
+    }
+
     /// Cost in USD for one request's usage. Cached-read tokens are billed
     /// at the cached rate when set, otherwise at the plain input rate
     /// (they are part of prompt_tokens already — never double-counted).
@@ -828,6 +852,22 @@ mod pricing_tests {
         // cached tokens fall back to the plain input rate.
         let c = p.cost(1_000_000, 0, 400_000).unwrap();
         assert!((c - 3.0).abs() < 1e-9, "got {}", c);
+    }
+
+    #[test]
+    fn short_summary_shows_in_out_rates() {
+        assert_eq!(priced().short_summary().unwrap(), "$3/$15 per 1M");
+    }
+
+    #[test]
+    fn short_summary_none_without_rates() {
+        let p = ModelPricing {
+            input_per_mtok: None,
+            output_per_mtok: None,
+            cached_read_per_mtok: Some(0.30),
+            cache_write_per_mtok: None,
+        };
+        assert!(p.short_summary().is_none());
     }
 
     #[test]

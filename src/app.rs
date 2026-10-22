@@ -19,6 +19,7 @@ use crate::config::{
     CloudModel, Config, ModelParams, ModelParamsStore, load_agents_md,
     load_cloud_models_with_base, load_model_params, save_model_params,
 };
+use crate::tools::{cap_tool_result, execute_tool_call, parse_text_tool_calls};
 
 /// Spinner frame sets for the status-bar throbber. One is picked at
 /// random for every API request (see `App::reroll_spinner`).
@@ -3217,18 +3218,10 @@ impl App {
                     tool_call_id,
                     ..
                 } => {
-                    // Cap tool result content so a single oversized result
-                    // (e.g. search_content matching huge log files) can't
-                    // bloat the API request past the payload limit.
-                    let content = if content.len() > 50_000 {
-                        format!(
-                            "{}... [truncated, {} bytes]",
-                            safe_prefix(content, 50_000),
-                            content.len()
-                        )
-                    } else {
-                        content.clone()
-                    };
+                    // Last-resort cap: tools that can produce huge output
+                    // (search_content, fetch_url) cap themselves at the
+                    // source; this bounds everything else (e.g. bash).
+                    let content = cap_tool_result(content);
                     let mut msg = serde_json::json!({
                         "role": "tool",
                         "content": content,
@@ -3403,18 +3396,10 @@ impl App {
                     tool_call_id,
                     ..
                 } => {
-                    // Cap tool result content so a single oversized result
-                    // (e.g. search_content matching huge log files) can't
-                    // bloat the API request past the payload limit.
-                    let content = if content.len() > 50_000 {
-                        format!(
-                            "{}... [truncated, {} bytes]",
-                            safe_prefix(content, 50_000),
-                            content.len()
-                        )
-                    } else {
-                        content.clone()
-                    };
+                    // Last-resort cap: tools that can produce huge output
+                    // (search_content, fetch_url) cap themselves at the
+                    // source; this bounds everything else (e.g. bash).
+                    let content = cap_tool_result(content);
                     let mut msg = serde_json::json!({
                         "role": "tool",
                         "content": content,
@@ -4355,6 +4340,50 @@ impl App {
         self.fetch_models_async();
     }
 
+    /// Combined model list shown in the model dialog: local Ollama
+    /// models (fetched from `/api/tags`) first, then the cloud models
+    /// from `cloud_models.conf`. Each entry carries a cloud flag so the
+    /// UI can mark them. A name present in both places is listed once,
+    /// flagged as cloud — that is what selecting it actually uses.
+    pub fn model_dialog_entries(&self) -> Vec<(String, bool)> {
+        let mut entries: Vec<(String, bool)> = Vec::with_capacity(
+            self.available_models.len() + self.cloud_models.len(),
+        );
+        for name in &self.available_models {
+            let is_cloud = self.cloud_models.iter().any(|m| &m.name == name);
+            entries.push((name.clone(), is_cloud));
+        }
+        for m in &self.cloud_models {
+            if !entries.iter().any(|(n, _)| n == &m.name) {
+                entries.push((m.name.clone(), true));
+            }
+        }
+        entries
+    }
+
+    /// The dialog row label for a model: cloud models get a `☁` marker
+    /// and the current one a `(current)` tag. Long names are truncated
+    /// so label + markers always fit the 56-column dialog. Shared by
+    /// the render path (main.rs) and the click handler (app.rs) so the
+    /// drawn and hit-tested labels agree.
+    pub fn model_dialog_label(name: &str, is_cloud: bool, is_current: bool) -> String {
+        // 46 chars of name + up to " ☁" + " (current)" fit the inner width.
+        let display = if name.chars().count() > 46 {
+            format!("{}...", safe_prefix(name, 43))
+        } else {
+            name.to_string()
+        };
+        let mut label = if is_cloud {
+            format!("{} ☁", display)
+        } else {
+            display
+        };
+        if is_current {
+            label.push_str(" (current)");
+        }
+        label
+    }
+
     fn fetch_models_async(&mut self) {
         let url = self.ollama_url.clone();
         let (tx, rx) = mpsc::channel();
@@ -4404,10 +4433,11 @@ impl App {
                     changed = true;
                     self.available_models = models;
                     // Pre-select the current model if it's in the list
+                    // (combined list — cloud models included).
                     if let Some(idx) = self
-                        .available_models
+                        .model_dialog_entries()
                         .iter()
-                        .position(|m| m == &self.model_name)
+                        .position(|(m, _)| m == &self.model_name)
                     {
                         self.model_dialog_selection = idx;
                     }
@@ -4514,8 +4544,8 @@ impl App {
     /// `self.model_info` (polled by `check_model_responses`). Cloud
     /// models get no fetch — their ctx comes from the config.
     fn fetch_model_info_async(&mut self) {
-        let Some(model) = self
-            .available_models
+        let Some((model, _)) = self
+            .model_dialog_entries()
             .get(self.model_dialog_selection)
             .cloned()
         else {
@@ -4581,10 +4611,8 @@ impl App {
                 }
             }
             KeyCode::Up => {
-                if self.model_dialog_focus == ModelDialogFocus::List
-                    && !self.available_models.is_empty()
-                {
-                    let max = self.available_models.len();
+                let max = self.model_dialog_entries().len();
+                if self.model_dialog_focus == ModelDialogFocus::List && max > 0 {
                     // Wrap around: first entry -> last.
                     self.model_dialog_selection =
                         (self.model_dialog_selection + max - 1) % max;
@@ -4593,7 +4621,7 @@ impl App {
             }
             KeyCode::Down => {
                 if self.model_dialog_focus == ModelDialogFocus::List {
-                    let max = self.available_models.len();
+                    let max = self.model_dialog_entries().len();
                     if max > 0 {
                         // Wrap around: last entry -> first.
                         self.model_dialog_selection = (self.model_dialog_selection + 1) % max;
@@ -4603,7 +4631,7 @@ impl App {
             }
             KeyCode::Enter => match self.model_dialog_focus {
                 ModelDialogFocus::List => {
-                    if !self.available_models.is_empty() {
+                    if !self.model_dialog_entries().is_empty() {
                         self.model_dialog_focus = ModelDialogFocus::Confirm;
                     }
                 }
@@ -4621,7 +4649,11 @@ impl App {
     }
 
     fn confirm_model_selection(&mut self) {
-        if let Some(model) = self.available_models.get(self.model_dialog_selection) {
+        if let Some((model, _)) = self
+            .model_dialog_entries()
+            .get(self.model_dialog_selection)
+        {
+            let model = model.clone();
             self.model_name = model.clone();
             self.apply_model_params();
             self.ollama_ctx_length = None;
@@ -4637,7 +4669,8 @@ impl App {
 
     fn handle_model_dialog_click(&mut self, col: u16, row: u16, width: u16, height: u16) {
         let area = Rect::new(0, 0, width, height);
-        let model_count = self.available_models.len() as u16;
+        let entries = self.model_dialog_entries();
+        let model_count = entries.len() as u16;
         // Same geometry the render path uses — no duplicated constants.
         let (popup_area, list_area, _info_y, btn_y, confirm_x, cancel_x) =
             crate::ui::model_dialog_geometry(model_count, area);
@@ -4652,11 +4685,17 @@ impl App {
         }
 
         // Click inside the list box selects that model (and refreshes
-        // the context info shown below the list).
-        let items: Vec<(String, bool)> = self
-            .available_models
+        // the context info shown below the list). Labels match the
+        // rendered ones; hit_test only maps rows back to indices.
+        let items: Vec<(String, bool, bool)> = entries
             .iter()
-            .map(|n| (n.clone(), false))
+            .map(|(name, is_cloud)| {
+                (
+                    Self::model_dialog_label(name, *is_cloud, name == &self.model_name),
+                    name == &self.model_name,
+                    *is_cloud,
+                )
+            })
             .collect();
         let listbox = crate::ui::ListBox::new(
             items,
@@ -4783,9 +4822,9 @@ impl App {
             return;
         }
 
-        let items: Vec<(String, bool)> = ChatMode::ALL
+        let items: Vec<(String, bool, bool)> = ChatMode::ALL
             .iter()
-            .map(|m| (m.label().to_string(), false))
+            .map(|m| (m.label().to_string(), false, false))
             .collect();
         let listbox = crate::ui::ListBox::new(
             items,
@@ -6113,14 +6152,9 @@ impl App {
                     self.show_model_dialog = true;
                     self.model_dialog_focus = ModelDialogFocus::List;
                     self.model_dialog_selection = self
-                        .available_models
+                        .model_dialog_entries()
                         .iter()
-                        .position(|m| m == &self.model_name)
-                        .or_else(|| {
-                            self.cloud_models
-                                .iter()
-                                .position(|m| m.name == self.model_name)
-                        })
+                        .position(|(m, _)| m == &self.model_name)
                         .unwrap_or(0);
                     format!(
                         "Current model: {}. Select a new one in the dialog.",
@@ -7597,18 +7631,6 @@ fn build_reqwest_client(proxy: &Option<String>) -> reqwest::Client {
     builder.build().unwrap_or_else(|_| reqwest::Client::new())
 }
 
-fn build_blocking_client(proxy: &Option<String>) -> reqwest::blocking::Client {
-    let mut builder = reqwest::blocking::Client::builder();
-    if let Some(proxy_url) = proxy
-        && let Ok(proxy) = reqwest::Proxy::all(proxy_url)
-    {
-        builder = builder.proxy(proxy);
-    }
-    builder
-        .build()
-        .unwrap_or_else(|_| reqwest::blocking::Client::new())
-}
-
 #[allow(clippy::too_many_arguments)]
 /// Waits out a retry backoff, ticking the countdown into the status
 /// bar once per second. Returns `true` when the wait was cut short by
@@ -7778,548 +7800,6 @@ async fn send_with_retry(
         }
     }
     SendOutcome::Error(last_err.unwrap())
-}
-
-/// Builds a compact unified diff (`diff -u` style) between two file
-/// contents, with `context` unchanged lines around each change hunk.
-/// Used for the `edit_file` tool result so the model (and the user)
-/// sees exactly what changed instead of a bare "edited" confirmation.
-/// The chat UI colors lines starting with `+`/`-` green/red.
-fn unified_diff(old: &str, new: &str, path: &str, context: usize) -> String {
-    let old_lines: Vec<&str> = old.lines().collect();
-    let new_lines: Vec<&str> = new.lines().collect();
-
-    // Longest common subsequence over lines (files edited through the
-    // tool are small enough for an O(n*m) table).
-    let (n, m) = (old_lines.len(), new_lines.len());
-    let mut lcs = vec![vec![0usize; m + 1]; n + 1];
-    for i in (0..n).rev() {
-        for j in (0..m).rev() {
-            lcs[i][j] = if old_lines[i] == new_lines[j] {
-                lcs[i + 1][j + 1] + 1
-            } else {
-                lcs[i + 1][j].max(lcs[i][j + 1])
-            };
-        }
-    }
-
-    // Walk the LCS table into a flat op list: (kind, old_idx, new_idx).
-    enum Op {
-        Keep(usize, usize),
-        Del(usize),
-        Add(usize),
-    }
-    let mut ops = Vec::new();
-    let (mut i, mut j) = (0, 0);
-    while i < n && j < m {
-        if old_lines[i] == new_lines[j] {
-            ops.push(Op::Keep(i, j));
-            i += 1;
-            j += 1;
-        } else if lcs[i + 1][j] >= lcs[i][j + 1] {
-            ops.push(Op::Del(i));
-            i += 1;
-        } else {
-            ops.push(Op::Add(j));
-            j += 1;
-        }
-    }
-    while i < n {
-        ops.push(Op::Del(i));
-        i += 1;
-    }
-    while j < m {
-        ops.push(Op::Add(j));
-        j += 1;
-    }
-
-    // Mark ops that belong to a visible hunk (a change plus `context`
-    // unchanged lines on each side), then merge into hunks. The
-    // distance of a context line is measured in ops between it and the
-    // nearest change, so exactly `context` unchanged lines are kept.
-    let keep_flags: Vec<bool> = ops
-        .iter()
-        .enumerate()
-        .map(|(idx, op)| {
-            if !matches!(op, Op::Keep(..)) {
-                return true;
-            }
-            let near_before = (0..idx)
-                .rev()
-                .take(context)
-                .any(|k| !matches!(ops[k], Op::Keep(..)));
-            let near_after = (idx + 1..ops.len())
-                .take(context)
-                .any(|k| !matches!(ops[k], Op::Keep(..)));
-            near_before || near_after
-        })
-        .collect();
-
-    let mut out = format!("--- {}\n+++ {}\n", path, path);
-    let mut idx = 0;
-    while idx < ops.len() {
-        if !keep_flags[idx] {
-            idx += 1;
-            continue;
-        }
-        // Collect one hunk (consecutive flagged ops).
-        let start = idx;
-        let mut end = idx;
-        while end < ops.len() && keep_flags[end] {
-            end += 1;
-        }
-        let hunk = &ops[start..end];
-        let old_start = hunk
-            .iter()
-            .find_map(|o| match o {
-                Op::Keep(oi, _) | Op::Del(oi) => Some(*oi),
-                Op::Add(_) => None,
-            })
-            .map(|oi| oi + 1)
-            .unwrap_or(1);
-        let new_start = hunk
-            .iter()
-            .find_map(|o| match o {
-                Op::Keep(_, ni) | Op::Add(ni) => Some(*ni),
-                Op::Del(_) => None,
-            })
-            .map(|ni| ni + 1)
-            .unwrap_or(1);
-        let old_count = hunk
-            .iter()
-            .filter(|o| matches!(o, Op::Keep(..) | Op::Del(_)))
-            .count();
-        let new_count = hunk
-            .iter()
-            .filter(|o| matches!(o, Op::Keep(..) | Op::Add(_)))
-            .count();
-        out.push_str(&format!(
-            "@@ -{},{} +{},{} @@\n",
-            old_start, old_count, new_start, new_count
-        ));
-        for op in hunk {
-            match op {
-                Op::Keep(oi, _) => out.push_str(&format!(" {}\n", old_lines[*oi])),
-                Op::Del(oi) => out.push_str(&format!("-{}\n", old_lines[*oi])),
-                Op::Add(ni) => out.push_str(&format!("+{}\n", new_lines[*ni])),
-            }
-        }
-        idx = end;
-    }
-    out
-}
-
-fn execute_tool_call(name: &str, args_json: &str, proxy: &Option<String>) -> String {
-    let args: serde_json::Value = serde_json::from_str(args_json).unwrap_or(serde_json::json!({}));
-
-    match name {
-        "read_file" => {
-            let path = args["path"].as_str().unwrap_or("");
-            // 1-based first line; default: start of file.
-            let offset = args["offset"].as_u64().unwrap_or(1).max(1) as usize;
-            let limit = args["limit"].as_u64().map(|n| n as usize);
-            match std::fs::read_to_string(path) {
-                Ok(content) => {
-                    let total_lines = content.lines().count();
-                    if offset == 1 && limit.is_none() {
-                        return content;
-                    }
-                    let window: Vec<&str> = match limit {
-                        Some(n) => content.lines().skip(offset - 1).take(n).collect(),
-                        None => content.lines().skip(offset - 1).collect(),
-                    };
-                    if window.is_empty() {
-                        return format!(
-                            "(no lines in range: file has {} lines, offset {})",
-                            total_lines, offset
-                        );
-                    }
-                    let first = offset;
-                    let last = offset + window.len() - 1;
-                    let mut out = window.join("\n");
-                    if last < total_lines {
-                        out.push_str(&format!(
-                            "\n[... {} more lines — showing lines {}-{} of {}. Use offset/limit to read more.]",
-                            total_lines - last, first, last, total_lines
-                        ));
-                    } else {
-                        out.push_str(&format!(
-                            "\n[showing lines {}-{} of {}]",
-                            first, last, total_lines
-                        ));
-                    }
-                    out
-                }
-                Err(e) => format!("Error reading file: {}", e),
-            }
-        }
-        "write_file" => {
-            let path = args["path"].as_str().unwrap_or("");
-            let content = args["content"].as_str().unwrap_or("");
-            match std::fs::write(path, content) {
-                Ok(()) => format!("Successfully wrote {} bytes to {}", content.len(), path),
-                Err(e) => format!("Error writing file: {}", e),
-            }
-        }
-        "edit_file" => {
-            let path = args["path"].as_str().unwrap_or("");
-            let old = args["old_string"].as_str().unwrap_or("");
-            let new = args["new_string"].as_str().unwrap_or("");
-            match std::fs::read_to_string(path) {
-                Ok(content) => {
-                    if let Some(pos) = content.find(old) {
-                        let mut new_content = content.clone();
-                        new_content.replace_range(pos..pos + old.len(), new);
-                        match std::fs::write(path, &new_content) {
-                            Ok(()) => {
-                                let diff = unified_diff(&content, &new_content, path, 3);
-                                format!("Successfully edited {}\n{}", path, diff)
-                            }
-                            Err(e) => format!("Error writing file: {}", e),
-                        }
-                    } else {
-                        format!("Error: old_string not found in {}", path)
-                    }
-                }
-                Err(e) => format!("Error reading file: {}", e),
-            }
-        }
-        "bash" => {
-            let command = args["command"].as_str().unwrap_or("");
-            let trimmed = command.trim_start();
-            if trimmed.starts_with("sudo ") || trimmed == "sudo" {
-                return "Error: sudo is not permitted. You do not have elevated privileges and cannot run commands as root.".to_string();
-            }
-            use std::io::Read;
-            use std::process::Stdio;
-            match std::process::Command::new("sh")
-                .arg("-c")
-                .arg(command)
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .stdin(Stdio::null())
-                .spawn()
-            {
-                Ok(mut child) => {
-                    let start = std::time::Instant::now();
-                    let timeout = std::time::Duration::from_secs(30);
-                    loop {
-                        match child.try_wait() {
-                            Ok(Some(status)) => {
-                                let mut stdout = String::new();
-                                let mut stderr = String::new();
-                                if let Some(ref mut out) = child.stdout {
-                                    let _ = out.read_to_string(&mut stdout);
-                                }
-                                if let Some(ref mut err) = child.stderr {
-                                    let _ = err.read_to_string(&mut stderr);
-                                }
-                                let mut result = String::new();
-                                if !stdout.is_empty() {
-                                    result.push_str(&stdout);
-                                }
-                                if !stderr.is_empty() {
-                                    if !result.is_empty() {
-                                        result.push('\n');
-                                    }
-                                    result.push_str(&stderr);
-                                }
-                                if result.is_empty() {
-                                    result = format!("(exit {})", status);
-                                }
-                                return result;
-                            }
-                            Ok(None) => {
-                                if start.elapsed() > timeout {
-                                    let _ = child.kill();
-                                    let _ = child.wait();
-                                    return "(command timed out after 30s)".to_string();
-                                }
-                                std::thread::sleep(std::time::Duration::from_millis(50));
-                            }
-                            Err(e) => return format!("Error: {}", e),
-                        }
-                    }
-                }
-                Err(e) => format!("Error executing command: {}", e),
-            }
-        }
-        "list_files" => {
-            let path = args["path"].as_str().unwrap_or(".");
-            match std::fs::read_dir(path) {
-                Ok(entries) => {
-                    let mut files: Vec<String> = entries
-                        .filter_map(|e| e.ok())
-                        .map(|e| {
-                            let name = e.file_name().to_string_lossy().to_string();
-                            let is_dir = e.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
-                            if is_dir { format!("{}/", name) } else { name }
-                        })
-                        .collect();
-                    files.sort();
-                    files.join("\n")
-                }
-                Err(e) => format!("Error listing directory: {}", e),
-            }
-        }
-        "search_files" => {
-            let pattern = args["pattern"].as_str().unwrap_or("*");
-            let path = args["path"].as_str().unwrap_or(".");
-            let full_pattern = format!("{}/{}", path, pattern);
-            match glob::glob(&full_pattern) {
-                Ok(paths) => {
-                    let results: Vec<String> = paths
-                        .filter_map(|p| p.ok())
-                        .map(|p| p.display().to_string())
-                        .collect();
-                    if results.is_empty() {
-                        "No files found".to_string()
-                    } else {
-                        results.join("\n")
-                    }
-                }
-                Err(e) => format!("Error with glob pattern: {}", e),
-            }
-        }
-        "search_content" => {
-            let pattern = args["pattern"].as_str().unwrap_or("");
-            let path = args["path"].as_str().unwrap_or(".");
-            let include = args["include"].as_str().unwrap_or("*");
-
-            match grep_regex(pattern, path, include) {
-                Ok(results) => {
-                    if results.is_empty() {
-                        "No matches found".to_string()
-                    } else {
-                        results.join("\n")
-                    }
-                }
-                Err(e) => format!("Error searching: {}", e),
-            }
-        }
-        "fetch_url" => {
-            let url = args["url"].as_str().unwrap_or("");
-            if url.is_empty() {
-                "Error: no URL provided".to_string()
-            } else {
-                let client = build_blocking_client(proxy);
-                match client.get(url).send() {
-                    Ok(resp) => {
-                        let status = resp.status();
-                        if !status.is_success() {
-                            format!("HTTP error: {}", status)
-                        } else {
-                            match resp.text() {
-                                Ok(text) => {
-                                    if text.len() > 50000 {
-                                        let prefix = safe_prefix(&text, 50000);
-                                        format!(
-                                            "{}...[truncated, total {} bytes]",
-                                            prefix,
-                                            text.len()
-                                        )
-                                    } else {
-                                        text
-                                    }
-                                }
-                                Err(e) => format!("Error reading response: {}", e),
-                            }
-                        }
-                    }
-                    Err(e) => format!("Error fetching URL: {}", e),
-                }
-            }
-        }
-        "web_search" => {
-            let query = args["query"].as_str().unwrap_or("");
-            if query.is_empty() {
-                "Error: no search query provided".to_string()
-            } else {
-                let search_url = format!(
-                    "https://html.duckduckgo.com/html/?q={}",
-                    urlencoding::encode(query)
-                );
-                let client = build_blocking_client(proxy);
-                match client.get(&*search_url).send() {
-                    Ok(resp) => match resp.text() {
-                        Ok(html) => {
-                            let mut results = Vec::new();
-                            for line in html.lines() {
-                                if line.contains("result__snippet") || line.contains("result__a") {
-                                    let cleaned = line
-                                        .replace(
-                                            "<a rel=\"nofollow\" class=\"result__a\" href=\"",
-                                            "",
-                                        )
-                                        .replace("<a class=\"result__snippet\" href=\"", "")
-                                        .replace("</a>", "")
-                                        .replace("<span class=\"result__snippet\">", "")
-                                        .replace("</span>", "")
-                                        .replace("<b>", "")
-                                        .replace("</b>", "")
-                                        .trim()
-                                        .to_string();
-                                    if !cleaned.is_empty() && cleaned.len() > 5 {
-                                        results.push(cleaned);
-                                    }
-                                }
-                            }
-                            if results.is_empty() {
-                                "No results found".to_string()
-                            } else {
-                                results.join("\n")
-                            }
-                        }
-                        Err(e) => format!("Error reading search results: {}", e),
-                    },
-                    Err(e) => format!("Error performing search: {}", e),
-                }
-            }
-        }
-        _ => {
-            // Single source of truth: the unknown-tool error lists the
-            // same names the parser/dispatcher accept.
-            format!(
-                "Unknown tool: '{}'. Available tools: {}",
-                name,
-                TOOL_NAMES.join(", ")
-            )
-        }
-    }
-}
-
-fn grep_regex(pattern: &str, path: &str, include: &str) -> Result<Vec<String>, String> {
-    let re = regex::Regex::new(pattern).map_err(|e| format!("Invalid regex: {}", e))?;
-    let glob_pattern = format!("{}/{}", path, include);
-
-    // Files we never want to search: app logs contain REQUEST/RESPONSE
-    // payloads (including full tool schemas) and can be hundreds of MB.
-    // Searching them returns huge lines that bloat tool results and can
-    // push API request payloads over the size limit.
-    const EXCLUDED_NAMES: &[&str] = &["rustama.log", "rustama-lsp.log"];
-
-    let mut results = Vec::new();
-    let mut total_bytes = 0usize;
-    const MAX_RESULT_BYTES: usize = 50_000; // same cap as fetch_url
-
-    if let Ok(entries) = glob::glob(&glob_pattern) {
-        for entry in entries.flatten() {
-            let name = entry
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_default();
-            if EXCLUDED_NAMES.iter().any(|e| name.starts_with(e)) {
-                continue;
-            }
-            if entry.is_file() && let Ok(content) = std::fs::read_to_string(&entry) {
-                for (line_num, line) in content.lines().enumerate() {
-                    if re.is_match(line) {
-                        let entry_line = format!("{}:{}: {}", entry.display(), line_num + 1, line);
-                        // Truncate overly long lines (e.g. log lines that embed
-                        // entire JSON payloads on one line).
-                        let entry_line = if entry_line.len() > 2000 {
-                            format!("{}... [truncated, {} bytes]", &entry_line[..2000], entry_line.len())
-                        } else {
-                            entry_line
-                        };
-                        if total_bytes + entry_line.len() > MAX_RESULT_BYTES {
-                            results.push(format!(
-                                "...[search results truncated at {} bytes total]",
-                                MAX_RESULT_BYTES
-                            ));
-                            return Ok(results);
-                        }
-                        total_bytes += entry_line.len();
-                        results.push(entry_line);
-                    }
-                }
-            }
-        }
-    }
-    Ok(results)
-}
-
-const TOOL_NAMES: &[&str] = &[
-    "read_file",
-    "write_file",
-    "edit_file",
-    "bash",
-    "list_files",
-    "search_files",
-    "search_content",
-    "fetch_url",
-    "web_search",
-    "terminal_open",
-    "terminal_send",
-    "terminal_read",
-    "terminal_close",
-    "lsp_diagnostics",
-    "lsp_definition",
-    "lsp_symbol_info",
-    "lsp_references",
-    "lsp_completion",
-];
-
-fn parse_text_tool_calls(text: &str) -> Vec<serde_json::Value> {
-    let mut tool_calls = Vec::new();
-
-    let patterns = [
-        (
-            r#"\{"name"\s*:\s*"(\w+)"\s*,\s*"parameters"\s*:\s*(\{[^}]*\})\}"#,
-            "name",
-            "parameters",
-        ),
-        (
-            r#"\{"name"\s*:\s*"(\w+)"\s*,\s*"arguments"\s*:\s*(\{[^}]*\})\}"#,
-            "name",
-            "arguments",
-        ),
-    ];
-
-    for (regex_pattern, _name_key, _args_key) in &patterns {
-        if let Ok(re) = regex::Regex::new(regex_pattern) {
-            for cap in re.captures_iter(text) {
-                if let (Some(name_match), Some(args_match)) = (cap.get(1), cap.get(2)) {
-                    let name = name_match.as_str().to_string();
-                    let args_str = args_match.as_str().to_string();
-
-                    if TOOL_NAMES.contains(&name.as_str()) {
-                        let mut tc = serde_json::json!({
-                            "name": name,
-                        });
-                        tc["parameters"] =
-                            serde_json::from_str(&args_str).unwrap_or(serde_json::json!({}));
-                        tool_calls.push(tc);
-                    }
-                }
-            }
-        }
-    }
-
-    if !tool_calls.is_empty() {
-        return tool_calls;
-    }
-
-    if let Ok(re) = regex::Regex::new(r#"(\w+):\s*(\{.*\})"#) {
-        for cap in re.captures_iter(text) {
-            if let (Some(name_match), Some(args_match)) = (cap.get(1), cap.get(2)) {
-                let name = name_match.as_str().to_string();
-                let args_str = args_match.as_str().to_string();
-
-                if TOOL_NAMES.contains(&name.as_str())
-                    && let Ok(args_json) = serde_json::from_str::<serde_json::Value>(&args_str)
-                {
-                    let tc = serde_json::json!({
-                        "name": name,
-                        "parameters": args_json,
-                    });
-                    tool_calls.push(tc);
-                }
-            }
-        }
-    }
-
-    tool_calls
 }
 
 /// Upper bound on automatic "continue" nudges per user turn (see
@@ -8535,129 +8015,8 @@ mod menu_focus_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::{StreamChunk, execute_tool_call, retry_countdown, send_with_retry, unified_diff};
+    use super::{StreamChunk, retry_countdown, send_with_retry};
     use std::sync::atomic::AtomicBool;
-
-    #[test]
-    fn read_file_offset_limit() {
-        let dir = std::env::temp_dir();
-        let path = dir.join(format!("rustama-readfile-test-{}.txt", std::process::id()));
-        let content = (1..=10).map(|i| format!("line{}", i)).collect::<Vec<_>>().join("\n");
-        std::fs::write(&path, &content).unwrap();
-        let p = path.to_string_lossy().to_string();
-
-        // Whole file when no offset/limit given
-        let out = execute_tool_call("read_file", &serde_json::json!({"path": p}).to_string(), &None);
-        assert_eq!(out, content);
-
-        // limit only
-        let out = execute_tool_call(
-            "read_file",
-            &serde_json::json!({"path": p, "limit": 3}).to_string(),
-            &None,
-        );
-        assert!(out.starts_with("line1\nline2\nline3"), "got: {}", out);
-        assert!(out.contains("showing lines 1-3 of 10"), "got: {}", out);
-        assert!(out.contains("7 more lines"), "got: {}", out);
-
-        // offset + limit window
-        let out = execute_tool_call(
-            "read_file",
-            &serde_json::json!({"path": p, "offset": 4, "limit": 2}).to_string(),
-            &None,
-        );
-        assert!(out.starts_with("line4\nline5"), "got: {}", out);
-        assert!(out.contains("showing lines 4-5 of 10"), "got: {}", out);
-
-        // offset past end of file
-        let out = execute_tool_call(
-            "read_file",
-            &serde_json::json!({"path": p, "offset": 99}).to_string(),
-            &None,
-        );
-        assert!(out.contains("no lines in range"), "got: {}", out);
-
-        // window reaching EOF
-        let out = execute_tool_call(
-            "read_file",
-            &serde_json::json!({"path": p, "offset": 9, "limit": 50}).to_string(),
-            &None,
-        );
-        assert!(out.starts_with("line9\nline10"), "got: {}", out);
-        assert!(out.contains("showing lines 9-10 of 10"), "got: {}", out);
-        assert!(!out.contains("more lines"), "got: {}", out);
-
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn unified_diff_single_change_with_context() {
-        let old = "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten\n";
-        let new = "one\ntwo\nthree\nfour\nFIVE\nsix\nseven\neight\nnine\nten\n";
-        let diff = unified_diff(old, new, "f.txt", 3);
-        assert!(diff.starts_with("--- f.txt\n+++ f.txt\n"), "header: {}", diff);
-        // Change at line 5, ±3 context → hunk spans lines 2..8.
-        assert!(diff.contains("@@ -2,7 +2,7 @@"), "hunk header: {}", diff);
-        assert!(diff.contains(" two\n"), "context line: {}", diff);
-        assert!(diff.contains(" eight\n"), "context line: {}", diff);
-        assert!(diff.contains("-five\n"), "removed line: {}", diff);
-        assert!(diff.contains("+FIVE\n"), "added line: {}", diff);
-        // Context limits the hunk: lines 1, 9, 10 are outside ±3.
-        assert!(!diff.contains(" one\n"), "outside context: {}", diff);
-        assert!(!diff.contains(" nine\n"), "outside context: {}", diff);
-        assert!(!diff.contains(" ten\n"), "outside context: {}", diff);
-    }
-
-    #[test]
-    fn unified_diff_context_covers_whole_small_file() {
-        // A change in the middle of a 7-line file with context=3
-        // reaches both edges — one full-file hunk, like `diff -u -U3`.
-        let old = "one\ntwo\nthree\nfour\nfive\nsix\nseven\n";
-        let new = "one\ntwo\nthree\nFOUR\nfive\nsix\nseven\n";
-        let diff = unified_diff(old, new, "f.txt", 3);
-        assert!(diff.contains("@@ -1,7 +1,7 @@"), "hunk header: {}", diff);
-        assert!(diff.contains("-four\n"), "removed: {}", diff);
-        assert!(diff.contains("+FOUR\n"), "added: {}", diff);
-    }
-
-    #[test]
-    fn unified_diff_insert_and_delete() {
-        // Pure insertion at the top and deletion at the bottom.
-        let old = "a\nb\nc\nd\ne\nf\ng\nh\ni\nj\n";
-        let new = "NEW\na\nb\nc\nd\ne\nf\ng\nh\ni\n";
-        let diff = unified_diff(old, new, "f.txt", 1);
-        assert!(diff.contains("+NEW\n"), "insertion: {}", diff);
-        assert!(diff.contains("-j\n"), "deletion: {}", diff);
-        // Two separate hunks (change at line 1 and line 10, context 1).
-        assert_eq!(diff.matches("@@ ").count(), 2, "two hunks: {}", diff);
-    }
-
-    #[test]
-    fn unified_diff_no_change_has_no_hunks() {
-        let diff = unified_diff("x\ny\n", "x\ny\n", "f.txt", 3);
-        assert!(!diff.contains("@@"), "no hunks: {}", diff);
-    }
-
-    #[test]
-    fn edit_file_result_contains_diff() {
-        let dir = std::env::temp_dir();
-        let path = dir.join(format!("rustama-editfile-test-{}.txt", std::process::id()));
-        std::fs::write(&path, "alpha\nbeta\ngamma\n").unwrap();
-        let p = path.to_string_lossy().to_string();
-        let out = execute_tool_call(
-            "edit_file",
-            &serde_json::json!({"path": p, "old_string": "beta", "new_string": "BETA"})
-                .to_string(),
-            &None,
-        );
-        assert!(out.starts_with("Successfully edited"), "got: {}", out);
-        assert!(out.contains("--- "), "diff header: {}", out);
-        assert!(out.contains("@@ "), "hunk header: {}", out);
-        assert!(out.contains("-beta\n"), "removed line: {}", out);
-        assert!(out.contains("+BETA\n"), "added line: {}", out);
-        assert!(out.contains(" alpha\n"), "context line: {}", out);
-        let _ = std::fs::remove_file(&path);
-    }
 
     #[test]
     fn retry_countdown_sends_correct_messages() {
@@ -10030,6 +9389,7 @@ mod chat_body_tests {
 #[cfg(test)]
 mod lsp_tool_tests {
     use super::*;
+    use crate::tools::TOOL_NAMES;
 
     fn test_app() -> App {
         let cfg = crate::config::Config {
@@ -10457,5 +9817,155 @@ mod timestamp_tests {
         }
         assert!(checked > 0, "no sessions found in {}", dir.display());
         eprintln!("checked {} real session files", checked);
+    }
+}
+
+#[cfg(test)]
+mod model_dialog_cloud_tests {
+    use super::{App, KeyCode, KeyEvent, KeyModifiers, ModelDialogFocus, safe_prefix};
+    use crate::config::{CloudModel, Config, ModelParams, ModelPricing};
+
+    fn test_app() -> App {
+        let cfg = Config {
+            logging: false,
+            logfile: std::env::temp_dir()
+                .join(format!("rustama-test-{}.log", std::process::id()))
+                .to_string_lossy()
+                .to_string(),
+            ..Config::default()
+        };
+        App::new(cfg)
+    }
+
+    fn cloud(name: &str) -> CloudModel {
+        CloudModel {
+            name: name.to_string(),
+            api_url: "https://example.invalid/v1/chat/completions".to_string(),
+            api_key: "k".to_string(),
+            api_model: name.to_string(),
+            params: ModelParams::default(),
+            pricing: ModelPricing {
+                input_per_mtok: Some(3.0),
+                output_per_mtok: Some(15.0),
+                cached_read_per_mtok: None,
+                cache_write_per_mtok: None,
+            },
+        }
+    }
+
+    #[test]
+    fn combined_entries_list_ollama_then_cloud() {
+        let mut app = test_app();
+        app.available_models = vec!["llama3.2:3b".into(), "qwen3:8b".into()];
+        app.cloud_models = vec![cloud("mistral-small")];
+        let entries = app.model_dialog_entries();
+        assert_eq!(
+            entries,
+            vec![
+                ("llama3.2:3b".to_string(), false),
+                ("qwen3:8b".to_string(), false),
+                ("mistral-small".to_string(), true),
+            ]
+        );
+    }
+
+    #[test]
+    fn cloud_only_still_lists_entries() {
+        // Cloud models must appear in the dialog even when Ollama has no
+        // models (or has not answered yet).
+        let mut app = test_app();
+        app.available_models.clear();
+        app.cloud_models = vec![cloud("mistral-small"), cloud("kimi-k3")];
+        assert_eq!(app.model_dialog_entries().len(), 2);
+        assert!(app.model_dialog_entries().iter().all(|(_, c)| *c));
+    }
+
+    #[test]
+    fn duplicate_name_listed_once_as_cloud() {
+        // A name in both places is what selecting it uses (cloud wins),
+        // so it must be shown once, flagged cloud — not twice.
+        let mut app = test_app();
+        app.available_models = vec!["mistral-small".into()];
+        app.cloud_models = vec![cloud("mistral-small")];
+        assert_eq!(app.model_dialog_entries().len(), 1);
+        assert_eq!(app.model_dialog_entries()[0], ("mistral-small".to_string(), true));
+    }
+
+    #[test]
+    fn cloud_label_carries_marker_and_current_tag() {
+        assert_eq!(
+            App::model_dialog_label("mistral-small", true, false),
+            "mistral-small ☁"
+        );
+        assert_eq!(
+            App::model_dialog_label("mistral-small", true, true),
+            "mistral-small ☁ (current)"
+        );
+        assert_eq!(
+            App::model_dialog_label("llama3.2:3b", false, true),
+            "llama3.2:3b (current)"
+        );
+        assert_eq!(
+            App::model_dialog_label("llama3.2:3b", false, false),
+            "llama3.2:3b"
+        );
+    }
+
+    #[test]
+    fn cloud_label_fits_dialog_width() {
+        // Dialog is 56 cols; the label must stay within the inner width
+        // even with the ☁ and (current) markers appended.
+        let long = "a-very-long-cloud-model-name/turbo/edition".repeat(3);
+        let label = App::model_dialog_label(&long, true, true);
+        assert!(label.chars().count() <= 46 + 2 + 10, "label too wide: {}", label);
+        assert!(label.ends_with("☁ (current)"), "markers clipped: {}", label);
+        assert!(long.starts_with(safe_prefix(&long, 43)));
+    }
+
+    #[test]
+    fn confirm_selects_cloud_model_from_combined_list() {
+        let mut app = test_app();
+        app.available_models = vec!["llama3.2:3b".into()];
+        app.cloud_models = vec![cloud("mistral-small")];
+        app.show_model_dialog = true;
+        app.model_dialog_selection = 1; // the cloud entry
+        app.confirm_model_selection();
+        assert_eq!(app.model_name, "mistral-small");
+        assert!(!app.show_model_dialog);
+        assert!(
+            app.status_message.contains("mistral-small"),
+            "status: {}",
+            app.status_message
+        );
+    }
+
+    #[test]
+    fn keys_move_through_cloud_entries() {
+        // Down past the last Ollama model must land on the cloud entry,
+        // not stop at the Ollama-only boundary.
+        let mut app = test_app();
+        app.available_models = vec!["llama3.2:3b".into()];
+        app.cloud_models = vec![cloud("mistral-small")];
+        app.show_model_dialog = true;
+        app.model_dialog_focus = ModelDialogFocus::List;
+        app.handle_model_dialog_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.model_dialog_selection, 1);
+        app.handle_model_dialog_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        // Enter on List moves focus to Confirm; second Enter confirms.
+        assert_eq!(app.model_dialog_focus, ModelDialogFocus::Confirm);
+        app.handle_model_dialog_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.model_name, "mistral-small");
+    }
+
+    #[test]
+    fn enter_confirm_wraps_onto_cloud_entry() {
+        // Up from the first entry wraps to the last — a cloud model.
+        let mut app = test_app();
+        app.available_models = vec!["llama3.2:3b".into()];
+        app.cloud_models = vec![cloud("mistral-small")];
+        app.show_model_dialog = true;
+        app.model_dialog_focus = ModelDialogFocus::List;
+        app.handle_model_dialog_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.model_dialog_selection, 1);
     }
 }

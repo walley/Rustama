@@ -51,6 +51,9 @@ pub struct Theme {
     pub menu_unselected_fg: Color,
     /// Submenu frame and separator line (spacer) — shared so they match.
     pub menu_border_fg: Color,
+    /// Cloud-model rows in the model picker (magenta) — distinguishes
+    /// cloud providers from local Ollama models at a glance.
+    pub cloud_fg: Color,
 }
 
 impl Theme {
@@ -76,6 +79,7 @@ impl Theme {
             menu_unselected_bg: MC_GREEN,
             menu_unselected_fg: Color::White,
             menu_border_fg: Color::White,
+            cloud_fg: Color::Magenta,
         }
     }
 
@@ -194,6 +198,7 @@ fn apply_color(theme: &mut Theme, key: &str, color: Color) {
         "menu_unselected_bg" => theme.menu_unselected_bg = color,
         "menu_unselected_fg" => theme.menu_unselected_fg = color,
         "menu_border_fg" => theme.menu_border_fg = color,
+        "cloud_fg" => theme.cloud_fg = color,
         _ => {}
     }
 }
@@ -257,9 +262,10 @@ pub const LISTBOX_MAX_VISIBLE: u16 = 10;
 /// always match the drawn ones.
 #[derive(Debug, Clone)]
 pub struct ListBox {
-    /// `(label, is_current)` — the current entry is drawn in the
-    /// dialog-title color, the selected one black-on-cyan.
-    pub items: Vec<(String, bool)>,
+    /// `(label, is_current, is_cloud)` — the current entry is drawn in
+    /// the dialog-title color, cloud entries in the `cloud_fg` color,
+    /// the selected one black-on-cyan (highest priority).
+    pub items: Vec<(String, bool, bool)>,
     pub selection: usize,
     pub scroll: usize,
     pub focused: bool,
@@ -268,7 +274,7 @@ pub struct ListBox {
 
 impl ListBox {
     pub fn new(
-        items: Vec<(String, bool)>,
+        items: Vec<(String, bool, bool)>,
         selection: usize,
         scroll: usize,
         focused: bool,
@@ -335,7 +341,7 @@ impl ListBox {
         let mut list_items: Vec<ListItem> = self.items[start..end]
             .iter()
             .enumerate()
-            .map(|(i, (name, is_current))| {
+            .map(|(i, (name, is_current, is_cloud))| {
                 let real_idx = start + i;
                 let is_sel = real_idx == self.selection;
                 let name_style = if is_sel {
@@ -347,6 +353,10 @@ impl ListBox {
                     Style::default()
                         .fg(theme.dialog_title_fg)
                         .add_modifier(Modifier::BOLD)
+                } else if *is_cloud {
+                    // Cloud models get their own color so they stand
+                    // apart from local Ollama models.
+                    Style::default().fg(theme.cloud_fg)
                 } else {
                     Style::default().fg(theme.dialog_fg)
                 };
