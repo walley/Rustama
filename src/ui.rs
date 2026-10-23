@@ -511,6 +511,10 @@ pub struct Button {
     pub y: u16,
     pub width: u16,
     pub active: bool,
+    /// The left mouse button is currently held down on this button:
+    /// renders as an inverted version of the focus look ("pushed in").
+    /// Set between mouse-down and mouse-up; the action fires on release.
+    pub pressed: bool,
     pub fg: Color,
     pub bg: Color,
     pub hotkey: Option<char>,
@@ -529,10 +533,27 @@ impl Button {
             y,
             width,
             active,
+            pressed: false,
             fg,
             bg,
             hotkey: None,
         }
+    }
+
+    /// Builder: marks the button as held down by the mouse (pressed
+    /// look). The press alone never triggers the action — it fires on
+    /// mouse-up, only if the mouse is still over this button.
+    pub fn with_pressed(mut self, pressed: bool) -> Self {
+        self.pressed = pressed;
+        self
+    }
+
+    /// Like [`Button::with_pressed`], but the pressed look only shows
+    /// while the mouse (`col`, `row`) is actually still on the button —
+    /// dragging off un-highlights it, dragging back re-highlights it.
+    pub fn with_pressed_at(self, pressed: bool, col: u16, row: u16) -> Self {
+        let hovered = self.is_clicked(col, row);
+        self.with_pressed(pressed && hovered)
     }
 
     pub fn is_clicked(&self, col: u16, row: u16) -> bool {
@@ -554,7 +575,15 @@ impl Button {
             format!("[ {} ]", self.name)
         };
 
-        let style = if self.active {
+        let style = if self.pressed {
+            // Pressed: the focus look inverted — reads as "pushed in"
+            // and stays visible even when the button already had focus.
+            Style::default()
+                .fg(Color::Black)
+                .bg(self.bg)
+                .add_modifier(Modifier::BOLD)
+                .add_modifier(Modifier::REVERSED)
+        } else if self.active {
             Style::default()
                 .fg(Color::Black)
                 .bg(self.bg)
@@ -771,9 +800,12 @@ pub enum DialogItem {
 pub struct DialogButton {
     pub label: String,
     pub focused: bool,
+    /// The mouse is holding this button down (pressed look); the action
+    /// fires on mouse-up only if the pointer is still over it.
+    pub pressed: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DialogHit {
     Outside,
     TextInput,
@@ -839,13 +871,30 @@ impl FileActionDialog {
                 btns.push(DialogButton {
                     label: label.to_string(),
                     focused,
+                    pressed: false,
                 });
             }
             _ => {
                 self.items.push(DialogItem::Buttons(vec![DialogButton {
                     label: label.to_string(),
                     focused,
+                    pressed: false,
                 }]));
+            }
+        }
+    }
+
+    /// Marks the `index`-th button of the dialog's button row as held
+    /// down by the mouse (pressed look). Rendering only — hit-testing is
+    /// unaffected; the action itself fires on mouse-up.
+    pub fn set_button_pressed(&mut self, index: usize, pressed: bool) {
+        if let Some(DialogItem::Buttons(btns)) = self
+            .items
+            .iter_mut()
+            .find(|item| matches!(item, DialogItem::Buttons(_)))
+        {
+            if let Some(btn) = btns.get_mut(index) {
+                btn.pressed = pressed;
             }
         }
     }
@@ -1058,7 +1107,10 @@ impl FileActionDialog {
             // row always matches hit_test's clickable columns.
             let btn_widgets: Vec<Button> = btns
                 .iter()
-                .map(|b| Button::new(&b.label, 0, 0, b.focused, theme.dialog_fg, theme.dialog_focus_bg))
+                .map(|b| {
+                    Button::new(&b.label, 0, 0, b.focused, theme.dialog_fg, theme.dialog_focus_bg)
+                        .with_pressed(b.pressed)
+                })
                 .collect();
             let gap: u16 = 2;
             let total_btn_width: u16 = btn_widgets.iter().map(|b| b.width).sum::<u16>()
@@ -1750,7 +1802,9 @@ impl MessageBox {
         (popup_area, lines, btn_area)
     }
 
-    pub fn render(&self, f: &mut Frame, area: Rect, focused: bool, theme: &Theme) {
+    /// `pressed` — the OK button is currently held down by the mouse
+    /// (pressed look); the action fires on mouse-up.
+    pub fn render(&self, f: &mut Frame, area: Rect, focused: bool, pressed: bool, theme: &Theme) {
         let (popup_area, lines, btn_area) = self.layout(area);
 
         f.render_widget(Clear, popup_area);
@@ -1798,7 +1852,8 @@ impl MessageBox {
             focused,
             theme.dialog_fg,
             theme.dialog_focus_bg,
-        );
+        )
+        .with_pressed(pressed);
         let (display, style) = ok_btn.render();
         let btn_para = Paragraph::new(Line::from(Span::styled(display, style)));
         f.render_widget(btn_para, btn_area);
@@ -1922,7 +1977,16 @@ impl ConfirmationBox {
         (popup_area, lines, confirm_area, cancel_area)
     }
 
-    pub fn render(&self, f: &mut Frame, area: Rect, focus: ConfirmFocus, theme: &Theme) {
+    /// `pressed` — which button the mouse is currently holding down
+    /// (pressed look), if any; the action fires on mouse-up.
+    pub fn render(
+        &self,
+        f: &mut Frame,
+        area: Rect,
+        focus: ConfirmFocus,
+        pressed: Option<ConfirmFocus>,
+        theme: &Theme,
+    ) {
         let (popup_area, lines, confirm_area, cancel_area) = self.layout(area);
 
         f.render_widget(Clear, popup_area);
@@ -1950,7 +2014,8 @@ impl ConfirmationBox {
             focus == ConfirmFocus::Yes,
             theme.dialog_fg,
             theme.dialog_focus_bg,
-        );
+        )
+        .with_pressed(pressed == Some(ConfirmFocus::Yes));
         let no_btn = Button::new(
             &self.cancel_label,
             cancel_area.x,
@@ -1958,7 +2023,8 @@ impl ConfirmationBox {
             focus == ConfirmFocus::No,
             theme.dialog_fg,
             theme.dialog_focus_bg,
-        );
+        )
+        .with_pressed(pressed == Some(ConfirmFocus::No));
 
         let (yes_display, yes_style) = yes_btn.render();
         let (no_display, no_style) = no_btn.render();
@@ -2007,6 +2073,79 @@ impl ConfirmationBox {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pressed_dialog_button_renders_reversed_on_screen() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut d = FileActionDialog::new("T");
+        d.add_button("Cancel", false);
+        d.add_button("Save", true);
+        d.set_button_pressed(1, true);
+
+        let theme = Theme::default();
+        let backend = TestBackend::new(60, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| d.render(f, f.area(), &theme)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+
+        // The pressed "[ Save ]" cells must carry the REVERSED modifier,
+        // the un-pressed "[ Cancel ]" must not.
+        let mut save_pressed = None;
+        let mut cancel_pressed = None;
+        for y in 0..buf.area.height {
+            let line: String = (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect();
+            // ASCII labels: char index == cell index.
+            if let Some(idx) = line.find("[ Save ]") {
+                save_pressed = Some(buf[(idx as u16 + 2, y)].modifier.contains(Modifier::REVERSED));
+            }
+            if let Some(idx) = line.find("[ Cancel ]") {
+                cancel_pressed = Some(buf[(idx as u16 + 2, y)].modifier.contains(Modifier::REVERSED));
+            }
+        }
+        assert_eq!(save_pressed, Some(true), "pressed [ Save ] must render REVERSED");
+        assert_eq!(cancel_pressed, Some(false), "un-pressed [ Cancel ] must not");
+    }
+
+    #[test]
+    fn pressed_button_renders_inverted_focus_style() {
+        // Pressed look = the focus look inverted ("pushed in"), so it is
+        // always visible — even when the button already had focus — and
+        // it does not depend on the focus state.
+        let focused = Button::new("OK", 0, 0, true, Color::Black, Color::Cyan);
+        let pressed = Button::new("OK", 0, 0, true, Color::Black, Color::Cyan).with_pressed(true);
+        let unfocused_pressed =
+            Button::new("OK", 0, 0, false, Color::Black, Color::Cyan).with_pressed(true);
+        let (_, focus_style) = focused.render();
+        let (_, pressed_style) = pressed.render();
+        let (_, unfocused_pressed_style) = unfocused_pressed.render();
+        assert_ne!(focus_style, pressed_style, "press must be visible on a focused button");
+        assert_eq!(
+            pressed_style, unfocused_pressed_style,
+            "pressed look must not depend on focus"
+        );
+        assert!(pressed_style.add_modifier.contains(Modifier::REVERSED));
+        assert!(focus_style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn file_action_dialog_renders_pressed_button_flag() {
+        let mut d = FileActionDialog::new("T");
+        d.add_button("Cancel", false);
+        d.add_button("Save", true);
+        d.set_button_pressed(1, true);
+
+        let DialogItem::Buttons(btns) =
+            d.items.iter().find(|i| matches!(i, DialogItem::Buttons(_))).unwrap()
+        else {
+            unreachable!()
+        };
+        assert!(!btns[0].pressed);
+        assert!(btns[1].pressed, "set_button_pressed must flag the right button");
+        // Out-of-range index is a harmless no-op.
+        d.set_button_pressed(9, true);
+    }
 
     #[test]
     fn settings_dialog_buttons_inside_border() {

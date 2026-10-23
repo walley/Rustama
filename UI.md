@@ -80,6 +80,7 @@ pub struct Button {
     pub y: u16,
     pub width: u16,     // name.len() + 4
     pub active: bool,
+    pub pressed: bool,  // mouse is holding this button down (inverted look)
     pub fg: Color,
     pub bg: Color,
     pub hotkey: Option<char>,
@@ -89,13 +90,16 @@ pub struct Button {
 **Methods:**
 
 - `Button::new(name, x, y, active, fg, bg) -> Button` — creates a button; width is computed automatically.
+- `with_pressed(pressed) -> Button` — builder: marks the button as held down by the mouse.
+- `with_pressed_at(pressed, col, row) -> Button` — builder: pressed look only while the mouse is still on the button.
 - `is_clicked(col, row) -> bool` — hit test for mouse clicks.
 - `render() -> (String, Style)` — returns the display text and style; the caller renders it with a `Paragraph`.
 
 **Behavior:**
 
-- When `active` is `true`: black bold text on `bg` (highlighted).
-- When `active` is `false`: plain text in `fg`.
+- When `pressed` is `true`: the focus look inverted (bold `REVERSED`) — the "pushed in" look shown between mouse-down and mouse-up.
+- When `pressed` is `false` and `active` is `true`: black bold text on `bg` (highlighted).
+- When `pressed` and `active` are both `false`: plain text in `fg`.
 - If `hotkey` is set and the character occurs in `name`, that letter is uppercased in the display, e.g. hotkey `c` on `"Cancel"` renders as `[Cancel]` with the `C` emphasized.
 
 **Usage (send button in `main.rs`):**
@@ -334,7 +338,7 @@ pub struct MessageBox {
 **Methods:**
 
 - `MessageBox::new(title, message) -> MessageBox`
-- `render(f, area, focused, theme)` — renders the box; `focused` highlights the OK button.
+- `render(f, area, focused, pressed, theme)` — renders the box; `focused` highlights the OK button, `pressed` shows the held-down look on it.
 - `hit_test(col, row, area) -> bool` — returns `true` when the OK button was clicked.
 
 **Layout behavior (multirow text support):**
@@ -389,7 +393,7 @@ pub enum ConfirmHit { Outside, Yes, No, None }  // hit_test result
 
 - `ConfirmationBox::new(title, message) -> ConfirmationBox` — default `Yes`/`No` labels.
 - `with_labels(confirm, cancel) -> ConfirmationBox` — builder override for the button labels.
-- `render(f, area, focus, theme)` — renders the box; the focused button is highlighted.
+- `render(f, area, focus, pressed, theme)` — renders the box; the focused button is highlighted, `pressed: Option<ConfirmFocus>` shows the held-down look on that button.
 - `hit_test(col, row, area) -> ConfirmHit` — `Outside` clicks can be used to cancel,
   `None` means inside the popup but on no button.
 
@@ -414,11 +418,11 @@ pub enum ConfirmHit { Outside, Yes, No, None }  // hit_test result
 **Usage (quit confirmation, from `main.rs` / `app.rs`):**
 
 ```rust
-// rendering
+// rendering (`pressed` = which button the mouse is holding down)
 let cb = ConfirmationBox::new("Confirm Quit", "Are you sure you want to quit?");
-cb.render(f, area, app.quit_confirm_focus, &app.theme);
+cb.render(f, area, app.quit_confirm_focus, pressed, &app.theme);
 
-// mouse handling
+// mouse handling (press highlights, release on the same button activates)
 match cb.hit_test(col, row, area) {
     ConfirmHit::Yes => { /* confirmed */ }
     ConfirmHit::No | ConfirmHit::Outside => { /* dismissed */ }

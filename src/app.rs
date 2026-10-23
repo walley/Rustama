@@ -1164,6 +1164,47 @@ fn decode_terminal_escapes(input: &str) -> String {
     out
 }
 
+/// Identifies the dialog button the left mouse button is currently held
+/// down on. Set on mouse-down over a button, cleared on mouse-up; the
+/// button's action fires on release **only** when the mouse is still
+/// over the same button — releasing anywhere else cancels the action
+/// (standard press/release button semantics, like mc or any GUI).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PressedButton {
+    /// Save/Export dialog (`FileActionDialog`), button index
+    /// (0 = Cancel, 1 = Save/Export).
+    SaveDialogButton(usize),
+    /// Load File / Load Session dialog, button index (0 = Cancel, 1 = Open/Load).
+    FileDialogButton(usize),
+    /// Theme dialog, button index (0 = Cancel, 1 = Preview, 2 = Load, 3 = Default).
+    ThemeDialogButton(usize),
+    ModelDialogConfirm,
+    ModelDialogCancel,
+    WorkflowDialogConfirm,
+    WorkflowDialogCancel,
+    SettingsDialogSave,
+    SettingsDialogCancel,
+    QuitConfirmYes,
+    QuitConfirmNo,
+    /// The OK button of a [`MessageBox`] (About / Retry Paused).
+    MessageBoxOk,
+    /// The `[ send ► ]` button on the input box.
+    Send,
+    /// A keybar F-key field (1..=10).
+    Keybar(u8),
+}
+
+/// Which half of a mouse click the dialog click handlers are
+/// processing. On [`ClickPhase::Press`] a button only lights up
+/// (pressed look + focus moves to it); its action runs on
+/// [`ClickPhase::Release`] — and only when the mouse is still over that
+/// same button.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClickPhase {
+    Press,
+    Release,
+}
+
 pub struct App {
     pub messages: Vec<ChatMessage>,
     pub textarea: TextArea<'static>,
@@ -1172,6 +1213,14 @@ pub struct App {
     pub auto_scroll: bool,
     pub scrollbar_dragging: bool,
     pub scrollbar_drag_start: Option<u16>,
+    /// Button currently held down by the left mouse button, if any.
+    /// Set on mouse-down, fired-or-cancelled on mouse-up — see
+    /// [`PressedButton`].
+    pub pressed_button: Option<PressedButton>,
+    /// Last known mouse position, tracked on every mouse event. Purely
+    /// cosmetic: a held-down button un-highlights when the mouse is
+    /// dragged off it (the release position alone decides the action).
+    pub mouse_pos: (u16, u16),
     pub should_quit: bool,
     pub input_mode: InputMode,
     pub focus: Focus,
@@ -1408,6 +1457,8 @@ impl App {
             auto_scroll: true,
             scrollbar_dragging: false,
             scrollbar_drag_start: None,
+            pressed_button: None,
+            mouse_pos: (0, 0),
             should_quit: false,
             input_mode: InputMode::Input,
             focus: Focus::Input,
@@ -3989,15 +4040,11 @@ impl App {
         }
     }
 
-    fn handle_save_dialog_click(&mut self, col: u16, row: u16, width: u16, height: u16) {
-        let area = Rect {
-            x: 0,
-            y: 0,
-            width,
-            height,
-        };
-
-        let dlg = match self.save_dialog_mode {
+    /// The save/export dialog as the click hit-test sees it. Kept as its
+    /// own builder so tests can hit-test the exact same geometry the
+    /// click handler uses.
+    fn save_dialog_clickable(&self) -> FileActionDialog {
+        match self.save_dialog_mode {
             SaveDialogMode::SaveSession => {
                 let mut d = FileActionDialog::new("Save Session");
                 d.add_text_input(
@@ -4036,34 +4083,70 @@ impl App {
                 d.add_button("Export", self.save_dialog_focus == SaveDialogFocus::Save);
                 d
             }
+        }
+    }
+
+    fn handle_save_dialog_click(
+        &mut self,
+        col: u16,
+        row: u16,
+        width: u16,
+        height: u16,
+        phase: ClickPhase,
+    ) {
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width,
+            height,
         };
+
+        let dlg = self.save_dialog_clickable();
 
         match dlg.hit_test(col, row, area) {
             DialogHit::Outside => {
-                self.show_format_dropdown = false;
+                if phase == ClickPhase::Press {
+                    self.show_format_dropdown = false;
+                }
             }
             DialogHit::TextInput => {
-                self.save_dialog_focus = SaveDialogFocus::Path;
+                if phase == ClickPhase::Press {
+                    self.save_dialog_focus = SaveDialogFocus::Path;
+                }
             }
             DialogHit::DropdownItem(_idx, item_idx) => {
-                self.save_dialog_focus = SaveDialogFocus::Format;
-                if let Some(i) = item_idx {
-                    self.export_format = match i {
-                        0 => ExportFormat::Markdown,
-                        _ => ExportFormat::PlainText,
-                    };
-                    self.show_format_dropdown = false;
-                } else {
-                    self.show_format_dropdown = !self.show_format_dropdown;
+                if phase == ClickPhase::Press {
+                    self.save_dialog_focus = SaveDialogFocus::Format;
+                    if let Some(i) = item_idx {
+                        self.export_format = match i {
+                            0 => ExportFormat::Markdown,
+                            _ => ExportFormat::PlainText,
+                        };
+                        self.show_format_dropdown = false;
+                    } else {
+                        self.show_format_dropdown = !self.show_format_dropdown;
+                    }
                 }
             }
             DialogHit::Button(bi) => {
-                let action_idx = 1;
-                if bi == action_idx {
-                    self.execute_export();
-                } else {
-                    self.show_format_dropdown = false;
-                    self.show_save_dialog = false;
+                let pressed_id = PressedButton::SaveDialogButton(bi);
+                if phase == ClickPhase::Press {
+                    // Press: focus + pressed highlight; the action waits
+                    // for mouse-up on the same button.
+                    self.save_dialog_focus = if bi == 1 {
+                        SaveDialogFocus::Save
+                    } else {
+                        SaveDialogFocus::Cancel
+                    };
+                    self.pressed_button = Some(pressed_id);
+                } else if self.pressed_button == Some(pressed_id) {
+                    let action_idx = 1;
+                    if bi == action_idx {
+                        self.execute_export();
+                    } else {
+                        self.show_format_dropdown = false;
+                        self.show_save_dialog = false;
+                    }
                 }
             }
             DialogHit::FileListItem(_) | DialogHit::None => {}
@@ -4079,51 +4162,52 @@ impl App {
     }
 
     pub fn handle_click(&mut self, col: u16, row: u16, width: u16, height: u16) {
+        // This is the PRESS half of a mouse click. Buttons only light up
+        // here (pressed look + focus); their actions run in
+        // `handle_mouse_up` — and only when the mouse is still over the
+        // same button. Everything else (selection, list rows, closing a
+        // dialog by clicking outside) still happens on press.
         if self.show_retry_paused {
-            let area = Rect::new(0, 0, width, height);
-            let mb = crate::ui::MessageBox::new("Retry Paused", &self.retry_paused_message);
-            if mb.hit_test(col, row, area) {
-                self.show_retry_paused = false;
-            }
+            self.handle_retry_paused_click(col, row, width, height, ClickPhase::Press);
             return;
         }
         if self.show_save_dialog {
-            self.handle_save_dialog_click(col, row, width, height);
+            self.handle_save_dialog_click(col, row, width, height, ClickPhase::Press);
             return;
         }
         if self.show_settings_dialog {
-            self.handle_settings_dialog_click(col, row, width, height);
+            self.handle_settings_dialog_click(col, row, width, height, ClickPhase::Press);
             return;
         }
         if self.show_theme_dialog {
-            self.handle_theme_dialog_click(col, row, width, height);
+            self.handle_theme_dialog_click(col, row, width, height, ClickPhase::Press);
             return;
         }
         if self.show_file_dialog {
-            self.handle_file_dialog_click(col, row, width, height);
+            self.handle_file_dialog_click(col, row, width, height, ClickPhase::Press);
             return;
         }
         if self.show_model_dialog {
-            self.handle_model_dialog_click(col, row, width, height);
+            self.handle_model_dialog_click(col, row, width, height, ClickPhase::Press);
             return;
         }
         if self.show_workflow_dialog {
-            self.handle_workflow_dialog_click(col, row, width, height);
+            self.handle_workflow_dialog_click(col, row, width, height, ClickPhase::Press);
             return;
         }
         if self.show_quit_confirm {
-            self.handle_quit_confirm_click(col, row, width, height);
+            self.handle_quit_confirm_click(col, row, width, height, ClickPhase::Press);
             return;
         }
         if self.show_about {
-            self.handle_about_dialog_click(col, row, width, height);
+            self.handle_about_dialog_click(col, row, width, height, ClickPhase::Press);
             return;
         }
 
         // Keybar (F-key strip) — the bottom row. Clicking a field runs
         // the same action as pressing that F-key.
         if row + 1 == height {
-            self.handle_keybar_click(col, width);
+            self.handle_keybar_click(col, width, ClickPhase::Press);
             return;
         }
 
@@ -4173,7 +4257,9 @@ impl App {
                         "⚠ Request in progress — wait for it to finish before sending"
                             .to_string();
                 } else {
-                    self.send_to_ollama_async();
+                    // Press on [ send ► ]: highlight only. The message is
+                    // sent on mouse-up if the mouse is still on the button.
+                    self.pressed_button = Some(PressedButton::Send);
                 }
                 return;
             }
@@ -4198,16 +4284,25 @@ impl App {
 
     /// Mouse hit-test for the keybar: maps a column to one of the ten
     /// F-key fields (same label/width computation as `render_keybar`)
-    /// and dispatches the same action as the keyboard key. Dispatched
-    /// directly (not via `handle_global_key`) so it works even when the
-    /// terminal panel holds keyboard focus.
-    pub fn handle_keybar_click(&mut self, col: u16, width: u16) {
+    /// and dispatches the same action as the keyboard key. Buttons here
+    /// follow press/release semantics too: the press only marks the
+    /// field, the action runs on release — and only if the mouse is
+    /// still over the same field. Dispatched directly (not via
+    /// `handle_global_key`) so it works even when the terminal panel
+    /// holds keyboard focus.
+    pub fn handle_keybar_click(&mut self, col: u16, width: u16, phase: ClickPhase) {
         let labels = crate::keybar_labels_for(self);
         let widths = crate::keybar_field_widths(&labels, width);
         let mut x: u16 = 0;
         for (i, w) in widths.iter().enumerate() {
             if col < x.saturating_add(*w) {
-                self.function_key_action(i as u8 + 1);
+                let key = i as u8 + 1;
+                let pressed_id = PressedButton::Keybar(key);
+                if phase == ClickPhase::Press {
+                    self.pressed_button = Some(pressed_id);
+                } else if self.pressed_button == Some(pressed_id) {
+                    self.function_key_action(key);
+                }
                 return;
             }
             x = x.saturating_add(*w);
@@ -4272,7 +4367,16 @@ impl App {
         }
     }
 
-    pub fn handle_mouse_up(&mut self) {
+    pub fn handle_mouse_up(&mut self, col: u16, row: u16, width: u16, height: u16) {
+        // RELEASE half of a mouse click: fire the pressed button's
+        // action if the mouse is still over it, otherwise cancel it.
+        // The press is always consumed, even when the dialog it belongs
+        // to has closed in the meantime (e.g. via a key press).
+        if self.pressed_button.is_some() {
+            self.release_pressed_button(col, row, width, height);
+        }
+        self.pressed_button = None;
+
         if self.selecting {
             self.selecting = false;
             if let Some(text) = self.selected_text()
@@ -4286,6 +4390,74 @@ impl App {
             }
         }
         self.scrollbar_drag_end();
+    }
+
+    /// Fires (or cancels) the action of the button the mouse was
+    /// holding down. Each dialog re-runs its hit-test so the action
+    /// only executes when the release lands on the very button that
+    /// was pressed.
+    fn release_pressed_button(&mut self, col: u16, row: u16, width: u16, height: u16) {
+        let Some(pressed) = self.pressed_button else {
+            return;
+        };
+        match pressed {
+            PressedButton::SaveDialogButton(_) => {
+                if self.show_save_dialog {
+                    self.handle_save_dialog_click(col, row, width, height, ClickPhase::Release);
+                }
+            }
+            PressedButton::FileDialogButton(_) => {
+                if self.show_file_dialog {
+                    self.handle_file_dialog_click(col, row, width, height, ClickPhase::Release);
+                }
+            }
+            PressedButton::ThemeDialogButton(_) => {
+                if self.show_theme_dialog {
+                    self.handle_theme_dialog_click(col, row, width, height, ClickPhase::Release);
+                }
+            }
+            PressedButton::ModelDialogConfirm | PressedButton::ModelDialogCancel => {
+                if self.show_model_dialog {
+                    self.handle_model_dialog_click(col, row, width, height, ClickPhase::Release);
+                }
+            }
+            PressedButton::WorkflowDialogConfirm | PressedButton::WorkflowDialogCancel => {
+                if self.show_workflow_dialog {
+                    self.handle_workflow_dialog_click(col, row, width, height, ClickPhase::Release);
+                }
+            }
+            PressedButton::SettingsDialogSave | PressedButton::SettingsDialogCancel => {
+                if self.show_settings_dialog {
+                    self.handle_settings_dialog_click(col, row, width, height, ClickPhase::Release);
+                }
+            }
+            PressedButton::QuitConfirmYes | PressedButton::QuitConfirmNo => {
+                if self.show_quit_confirm {
+                    self.handle_quit_confirm_click(col, row, width, height, ClickPhase::Release);
+                }
+            }
+            PressedButton::MessageBoxOk => {
+                if self.show_about {
+                    self.handle_about_dialog_click(col, row, width, height, ClickPhase::Release);
+                } else if self.show_retry_paused {
+                    self.handle_retry_paused_click(col, row, width, height, ClickPhase::Release);
+                }
+            }
+            PressedButton::Send => {
+                // Still on the send row (the whole input-box bottom
+                // border is the send button's clickable area)?
+                let input_bottom = height.saturating_sub(2 + self.bottom_rows());
+                let has_text = !self.textarea.lines().join("").trim().is_empty();
+                if row == input_bottom && has_text && !self.is_loading {
+                    self.send_to_ollama_async();
+                }
+            }
+            PressedButton::Keybar(_) => {
+                if row + 1 == height {
+                    self.handle_keybar_click(col, width, ClickPhase::Release);
+                }
+            }
+        }
     }
 
     fn selected_text(&self) -> Option<String> {
@@ -4667,7 +4839,14 @@ impl App {
         self.show_model_dialog = false;
     }
 
-    fn handle_model_dialog_click(&mut self, col: u16, row: u16, width: u16, height: u16) {
+    fn handle_model_dialog_click(
+        &mut self,
+        col: u16,
+        row: u16,
+        width: u16,
+        height: u16,
+        phase: ClickPhase,
+    ) {
         let area = Rect::new(0, 0, width, height);
         let entries = self.model_dialog_entries();
         let model_count = entries.len() as u16;
@@ -4680,7 +4859,9 @@ impl App {
             || row < popup_area.y
             || row >= popup_area.y + popup_area.height
         {
-            self.show_model_dialog = false;
+            if phase == ClickPhase::Press {
+                self.show_model_dialog = false;
+            }
             return;
         }
 
@@ -4705,11 +4886,13 @@ impl App {
             "Models",
         );
         if let Some(idx) = listbox.hit_test(row, list_area) {
-            if idx != self.model_dialog_selection {
+            if phase == ClickPhase::Press && idx != self.model_dialog_selection {
                 self.model_dialog_selection = idx;
                 self.fetch_model_info_async();
             }
-            self.model_dialog_focus = ModelDialogFocus::List;
+            if phase == ClickPhase::Press {
+                self.model_dialog_focus = ModelDialogFocus::List;
+            }
             return;
         }
 
@@ -4731,12 +4914,21 @@ impl App {
         );
 
         if confirm_btn.is_clicked(col, row) {
-            self.model_dialog_focus = ModelDialogFocus::Confirm;
-            self.confirm_model_selection();
+            if phase == ClickPhase::Press {
+                self.model_dialog_focus = ModelDialogFocus::Confirm;
+                self.pressed_button = Some(PressedButton::ModelDialogConfirm);
+            } else if self.pressed_button == Some(PressedButton::ModelDialogConfirm) {
+                self.confirm_model_selection();
+            }
             return;
         }
         if cancel_btn.is_clicked(col, row) {
-            self.show_model_dialog = false;
+            if phase == ClickPhase::Press {
+                self.model_dialog_focus = ModelDialogFocus::Cancel;
+                self.pressed_button = Some(PressedButton::ModelDialogCancel);
+            } else if self.pressed_button == Some(PressedButton::ModelDialogCancel) {
+                self.show_model_dialog = false;
+            }
         }
     }
 
@@ -4807,7 +4999,14 @@ impl App {
         }
     }
 
-    fn handle_workflow_dialog_click(&mut self, col: u16, row: u16, width: u16, height: u16) {
+    fn handle_workflow_dialog_click(
+        &mut self,
+        col: u16,
+        row: u16,
+        width: u16,
+        height: u16,
+        phase: ClickPhase,
+    ) {
         let area = Rect::new(0, 0, width, height);
         // Same geometry the render path uses — no duplicated constants.
         let (popup_area, list_area, _info_y, btn_y, confirm_x, cancel_x) =
@@ -4818,7 +5017,9 @@ impl App {
             || row < popup_area.y
             || row >= popup_area.y + popup_area.height
         {
-            self.show_workflow_dialog = false;
+            if phase == ClickPhase::Press {
+                self.show_workflow_dialog = false;
+            }
             return;
         }
 
@@ -4834,8 +5035,10 @@ impl App {
             "Mode",
         );
         if let Some(idx) = listbox.hit_test(row, list_area) {
-            self.workflow_dialog_selection = idx;
-            self.workflow_dialog_focus = WorkflowDialogFocus::List;
+            if phase == ClickPhase::Press {
+                self.workflow_dialog_selection = idx;
+                self.workflow_dialog_focus = WorkflowDialogFocus::List;
+            }
             return;
         }
 
@@ -4857,12 +5060,21 @@ impl App {
         );
 
         if confirm_btn.is_clicked(col, row) {
-            self.workflow_dialog_focus = WorkflowDialogFocus::Confirm;
-            self.confirm_workflow_selection();
+            if phase == ClickPhase::Press {
+                self.workflow_dialog_focus = WorkflowDialogFocus::Confirm;
+                self.pressed_button = Some(PressedButton::WorkflowDialogConfirm);
+            } else if self.pressed_button == Some(PressedButton::WorkflowDialogConfirm) {
+                self.confirm_workflow_selection();
+            }
             return;
         }
         if cancel_btn.is_clicked(col, row) {
-            self.show_workflow_dialog = false;
+            if phase == ClickPhase::Press {
+                self.workflow_dialog_focus = WorkflowDialogFocus::Cancel;
+                self.pressed_button = Some(PressedButton::WorkflowDialogCancel);
+            } else if self.pressed_button == Some(PressedButton::WorkflowDialogCancel) {
+                self.show_workflow_dialog = false;
+            }
         }
     }
 
@@ -5102,7 +5314,14 @@ impl App {
         self.status_message = "Settings saved".to_string();
     }
 
-    fn handle_settings_dialog_click(&mut self, col: u16, row: u16, width: u16, height: u16) {
+    fn handle_settings_dialog_click(
+        &mut self,
+        col: u16,
+        row: u16,
+        width: u16,
+        height: u16,
+        phase: ClickPhase,
+    ) {
         // Shared geometry: must agree with render_settings_dialog
         // (main.rs) — same popup size, same field rows, same button row.
         let layout = crate::ui::settings_dialog_layout(Rect::new(0, 0, width, height));
@@ -5119,7 +5338,9 @@ impl App {
             || row < dialog_y
             || row >= dialog_y + dialog_h
         {
-            self.show_settings_dialog = false;
+            if phase == ClickPhase::Press {
+                self.show_settings_dialog = false;
+            }
             return;
         }
 
@@ -5145,11 +5366,15 @@ impl App {
             let max_w = inner_w.saturating_sub(16);
             if row == field_y {
                 if matches!(*focus, SettingsFocus::Justify | SettingsFocus::Lsp) {
-                    self.settings_focus = *focus;
-                    self.toggle_settings_checkbox();
+                    if phase == ClickPhase::Press {
+                        self.settings_focus = *focus;
+                        self.toggle_settings_checkbox();
+                    }
                     return;
                 } else if col >= inner_x + 14 && col < inner_x + 14 + max_w + 2 {
-                    self.settings_focus = *focus;
+                    if phase == ClickPhase::Press {
+                        self.settings_focus = *focus;
+                    }
                     return;
                 }
             }
@@ -5165,13 +5390,31 @@ impl App {
         let btn_start_x = inner_x + (inner_w.saturating_sub(total_btn_w)) / 2;
 
         if row == btn_y {
-            if col >= btn_start_x && col < btn_start_x + save_w {
-                self.settings_focus = SettingsFocus::Save;
-                self.confirm_settings();
-                return;
-            }
-            if col >= btn_start_x + save_w + gap && col < btn_start_x + total_btn_w {
-                self.show_settings_dialog = false;
+            let save_hit = col >= btn_start_x && col < btn_start_x + save_w;
+            let cancel_hit =
+                col >= btn_start_x + save_w + gap && col < btn_start_x + total_btn_w;
+            if save_hit || cancel_hit {
+                let pressed_id = if save_hit {
+                    PressedButton::SettingsDialogSave
+                } else {
+                    PressedButton::SettingsDialogCancel
+                };
+                if phase == ClickPhase::Press {
+                    // Press: focus + pressed highlight; the action waits
+                    // for mouse-up on the same button.
+                    self.settings_focus = if save_hit {
+                        SettingsFocus::Save
+                    } else {
+                        SettingsFocus::Cancel
+                    };
+                    self.pressed_button = Some(pressed_id);
+                } else if self.pressed_button == Some(pressed_id) {
+                    if save_hit {
+                        self.confirm_settings();
+                    } else {
+                        self.show_settings_dialog = false;
+                    }
+                }
             }
         }
     }
@@ -5184,11 +5427,43 @@ impl App {
             .with_header(crate::ui::rustama_logo_lines())
     }
 
-    fn handle_about_dialog_click(&mut self, col: u16, row: u16, width: u16, height: u16) {
+    fn handle_about_dialog_click(
+        &mut self,
+        col: u16,
+        row: u16,
+        width: u16,
+        height: u16,
+        phase: ClickPhase,
+    ) {
         let area = Rect::new(0, 0, width, height);
         let mb = self.about_box();
         if mb.hit_test(col, row, area) {
-            self.show_about = false;
+            if phase == ClickPhase::Press {
+                self.pressed_button = Some(PressedButton::MessageBoxOk);
+            } else if self.pressed_button == Some(PressedButton::MessageBoxOk) {
+                self.show_about = false;
+            }
+        }
+    }
+
+    /// Retry Paused is a plain MessageBox: its OK button follows the
+    /// same press/release semantics as every other button.
+    fn handle_retry_paused_click(
+        &mut self,
+        col: u16,
+        row: u16,
+        width: u16,
+        height: u16,
+        phase: ClickPhase,
+    ) {
+        let area = Rect::new(0, 0, width, height);
+        let mb = crate::ui::MessageBox::new("Retry Paused", &self.retry_paused_message);
+        if mb.hit_test(col, row, area) {
+            if phase == ClickPhase::Press {
+                self.pressed_button = Some(PressedButton::MessageBoxOk);
+            } else if self.pressed_button == Some(PressedButton::MessageBoxOk) {
+                self.show_retry_paused = false;
+            }
         }
     }
 
@@ -5238,18 +5513,40 @@ impl App {
         }
     }
 
-    fn handle_quit_confirm_click(&mut self, col: u16, row: u16, width: u16, height: u16) {
+    fn handle_quit_confirm_click(
+        &mut self,
+        col: u16,
+        row: u16,
+        width: u16,
+        height: u16,
+        phase: ClickPhase,
+    ) {
         use crate::ui::ConfirmHit;
         let area = Rect::new(0, 0, width, height);
         let cb = crate::ui::ConfirmationBox::new("Confirm Quit", "Are you sure you want to quit?");
         match cb.hit_test(col, row, area) {
             ConfirmHit::Yes => {
-                self.autosave_session();
-                self.terminal_state.close();
-                self.should_quit = true;
+                if phase == ClickPhase::Press {
+                    self.quit_confirm_focus = crate::ui::ConfirmFocus::Yes;
+                    self.pressed_button = Some(PressedButton::QuitConfirmYes);
+                } else if self.pressed_button == Some(PressedButton::QuitConfirmYes) {
+                    self.autosave_session();
+                    self.terminal_state.close();
+                    self.should_quit = true;
+                }
             }
-            ConfirmHit::No | ConfirmHit::Outside => {
-                self.show_quit_confirm = false;
+            ConfirmHit::No => {
+                if phase == ClickPhase::Press {
+                    self.quit_confirm_focus = crate::ui::ConfirmFocus::No;
+                    self.pressed_button = Some(PressedButton::QuitConfirmNo);
+                } else if self.pressed_button == Some(PressedButton::QuitConfirmNo) {
+                    self.show_quit_confirm = false;
+                }
+            }
+            ConfirmHit::Outside => {
+                if phase == ClickPhase::Press {
+                    self.show_quit_confirm = false;
+                }
             }
             ConfirmHit::None => {}
         }
@@ -5466,6 +5763,21 @@ impl App {
         }
     }
 
+    /// Pressed-look flag for button `idx` of a `FileActionDialog`: true
+    /// only while that button is the one held down AND the mouse is
+    /// still hovering it — dragging off un-highlights (the release
+    /// position alone decides the action).
+    pub fn dialog_button_pressed(
+        &self,
+        dlg: &FileActionDialog,
+        area: Rect,
+        idx: usize,
+        id: PressedButton,
+    ) -> bool {
+        self.pressed_button == Some(id)
+            && dlg.hit_test(self.mouse_pos.0, self.mouse_pos.1, area) == DialogHit::Button(idx)
+    }
+
     /// Builds the FileActionDialog for the current file dialog state.
     /// Shared by rendering (main.rs) and mouse hit testing so the two
     /// always describe the same layout.
@@ -5505,26 +5817,58 @@ impl App {
         d.add_button("Cancel", self.file_dialog_focus == FileDialogFocus::Cancel);
         let open_label = if is_load_session { "Load" } else { "Open" };
         d.add_button(open_label, self.file_dialog_focus == FileDialogFocus::Open);
+        // Pressed look: held down AND still under the pointer.
+        d.set_button_pressed(
+            0,
+            self.dialog_button_pressed(&d, area, 0, PressedButton::FileDialogButton(0)),
+        );
+        d.set_button_pressed(
+            1,
+            self.dialog_button_pressed(&d, area, 1, PressedButton::FileDialogButton(1)),
+        );
         d
     }
 
-    fn handle_file_dialog_click(&mut self, col: u16, row: u16, width: u16, height: u16) {
+    fn handle_file_dialog_click(
+        &mut self,
+        col: u16,
+        row: u16,
+        width: u16,
+        height: u16,
+        phase: ClickPhase,
+    ) {
         let area = Rect::new(0, 0, width, height);
         let dlg = self.build_file_action_dialog(area);
         match dlg.hit_test(col, row, area) {
             DialogHit::Outside => {
-                self.show_file_dialog = false;
+                if phase == ClickPhase::Press {
+                    self.show_file_dialog = false;
+                }
             }
             DialogHit::FileListItem(idx) => {
-                self.file_dialog_selection = idx;
-                self.file_dialog_focus = FileDialogFocus::List;
+                if phase == ClickPhase::Press {
+                    self.file_dialog_selection = idx;
+                    self.file_dialog_focus = FileDialogFocus::List;
+                }
             }
             DialogHit::Button(bi) => {
-                if bi == 0 {
-                    self.show_file_dialog = false;
-                } else {
-                    self.file_dialog_focus = FileDialogFocus::Open;
-                    self.open_selected_file();
+                let pressed_id = PressedButton::FileDialogButton(bi);
+                if phase == ClickPhase::Press {
+                    // Press: focus + pressed highlight; the action waits
+                    // for mouse-up on the same button.
+                    self.file_dialog_focus = if bi == 0 {
+                        FileDialogFocus::Cancel
+                    } else {
+                        FileDialogFocus::Open
+                    };
+                    self.pressed_button = Some(pressed_id);
+                } else if self.pressed_button == Some(pressed_id) {
+                    if bi == 0 {
+                        self.show_file_dialog = false;
+                    } else {
+                        self.file_dialog_focus = FileDialogFocus::Open;
+                        self.open_selected_file();
+                    }
                 }
             }
             _ => {}
@@ -5741,24 +6085,65 @@ impl App {
             "Default",
             self.theme_dialog_focus == ThemeDialogFocus::Default,
         );
+        // Pressed look: held down AND still under the pointer.
+        for (i, id) in [
+            PressedButton::ThemeDialogButton(0),
+            PressedButton::ThemeDialogButton(1),
+            PressedButton::ThemeDialogButton(2),
+            PressedButton::ThemeDialogButton(3),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            d.set_button_pressed(i, self.dialog_button_pressed(&d, _area, i, id));
+        }
         d
     }
 
-    fn handle_theme_dialog_click(&mut self, col: u16, row: u16, width: u16, height: u16) {
+    fn handle_theme_dialog_click(
+        &mut self,
+        col: u16,
+        row: u16,
+        width: u16,
+        height: u16,
+        phase: ClickPhase,
+    ) {
         let area = Rect::new(0, 0, width, height);
         let dlg = self.build_theme_dialog(area);
         match dlg.hit_test(col, row, area) {
-            DialogHit::Outside => self.close_theme_dialog(true),
-            DialogHit::FileListItem(idx) => {
-                self.theme_dialog_selection = idx;
-                self.theme_dialog_focus = ThemeDialogFocus::List;
+            DialogHit::Outside => {
+                if phase == ClickPhase::Press {
+                    self.close_theme_dialog(true)
+                }
             }
-            DialogHit::Button(bi) => match bi {
-                0 => self.close_theme_dialog(true),
-                1 => self.preview_theme(),
-                2 => self.commit_theme_selection(),
-                _ => self.reset_theme_to_default(),
-            },
+            DialogHit::FileListItem(idx) => {
+                if phase == ClickPhase::Press {
+                    self.theme_dialog_selection = idx;
+                    self.theme_dialog_focus = ThemeDialogFocus::List;
+                }
+            }
+            DialogHit::Button(bi) => {
+                let pressed_id = PressedButton::ThemeDialogButton(bi);
+                if phase == ClickPhase::Press {
+                    // Press: focus + pressed highlight; the action waits
+                    // for mouse-up on the same button. Buttons in display
+                    // order: Cancel / Preview / Load / Default.
+                    self.theme_dialog_focus = match bi {
+                        0 => ThemeDialogFocus::Cancel,
+                        1 => ThemeDialogFocus::Preview,
+                        2 => ThemeDialogFocus::Load,
+                        _ => ThemeDialogFocus::Default,
+                    };
+                    self.pressed_button = Some(pressed_id);
+                } else if self.pressed_button == Some(pressed_id) {
+                    match bi {
+                        0 => self.close_theme_dialog(true),
+                        1 => self.preview_theme(),
+                        2 => self.commit_theme_selection(),
+                        _ => self.reset_theme_to_default(),
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -9677,6 +10062,294 @@ mod file_dialog_tests {
         app.scroll_up();
         assert_eq!(app.file_dialog_selection, 0);
         assert_eq!(app.file_dialog_scroll, 0);
+    }
+}
+
+#[cfg(test)]
+mod button_press_tests {
+    use super::*;
+    use crate::ui::ConfirmHit;
+
+    fn test_app() -> App {
+        let cfg = crate::config::Config {
+            logging: false,
+            logfile: std::env::temp_dir()
+                .join(format!("rustama-test-{}.log", std::process::id()))
+                .to_string_lossy()
+                .to_string(),
+            ..crate::config::Config::default()
+        };
+        App::new(cfg)
+    }
+
+    const W: u16 = 100;
+    const H: u16 = 30;
+
+    /// First screen cell whose save-dialog hit-test reports button `idx`
+    /// — the test clicks exactly what the click handler hit-tests.
+    fn save_button_pos(app: &App, idx: usize) -> (u16, u16) {
+        let area = Rect::new(0, 0, W, H);
+        let dlg = app.save_dialog_clickable();
+        for row in 0..H {
+            for col in 0..W {
+                if dlg.hit_test(col, row, area) == DialogHit::Button(idx) {
+                    return (col, row);
+                }
+            }
+        }
+        panic!("save dialog button {idx} not found");
+    }
+
+    #[test]
+    fn save_dialog_button_waits_for_mouse_release() {
+        let mut app = test_app();
+        app.open_save_dialog();
+        let (cx, cy) = save_button_pos(&app, 0); // [ Cancel ]
+
+        app.handle_click(cx, cy, W, H);
+        assert!(app.show_save_dialog, "press alone must not fire the action");
+        assert_eq!(app.save_dialog_focus, SaveDialogFocus::Cancel, "press moves focus");
+        assert_eq!(app.pressed_button, Some(PressedButton::SaveDialogButton(0)));
+
+        // Release over the same button: the action fires.
+        app.handle_mouse_up(cx, cy, W, H);
+        assert!(!app.show_save_dialog, "release over the button fires the action");
+        assert_eq!(app.pressed_button, None, "release consumes the press");
+    }
+
+    #[test]
+    fn save_dialog_action_cancelled_when_mouse_moves_off() {
+        let mut app = test_app();
+        app.open_save_dialog();
+        let (cancel_x, cancel_y) = save_button_pos(&app, 0);
+        let (save_x, save_y) = save_button_pos(&app, 1);
+
+        // Press Cancel, release over Save: the action is cancelled and
+        // the dialog stays open.
+        app.handle_click(cancel_x, cancel_y, W, H);
+        app.handle_mouse_up(save_x, save_y, W, H);
+        assert!(app.show_save_dialog, "release off the pressed button must cancel");
+        assert_eq!(app.pressed_button, None, "release always consumes the press");
+
+        // A fresh press + release on Cancel still works.
+        app.handle_click(cancel_x, cancel_y, W, H);
+        app.handle_mouse_up(cancel_x, cancel_y, W, H);
+        assert!(!app.show_save_dialog);
+    }
+
+    #[test]
+    fn file_dialog_open_button_press_does_not_navigate() {
+        let mut app = test_app();
+        app.show_file_dialog = true;
+        app.file_dialog_path = std::env::temp_dir();
+        app.refresh_file_list();
+        app.file_dialog_entries = vec![("..".to_string(), true), ("sub".to_string(), true)];
+
+        // Press [ Open ] (button 1) with a directory selected: press
+        // alone must not navigate into it.
+        let area = Rect::new(0, 0, W, H);
+        let dlg = app.build_file_action_dialog(area);
+        let mut pos = None;
+        'outer: for row in 0..H {
+            for col in 0..W {
+                if dlg.hit_test(col, row, area) == DialogHit::Button(1) {
+                    pos = Some((col, row));
+                    break 'outer;
+                }
+            }
+        }
+        let (ox, oy) = pos.expect("Open button not found");
+        app.handle_click(ox, oy, W, H);
+        assert!(app.show_file_dialog, "press alone must not open the selection");
+        assert_eq!(app.pressed_button, Some(PressedButton::FileDialogButton(1)));
+
+        // Release over [ Cancel ] instead: cancelled, still inside the
+        // same directory (path unchanged).
+        let dlg = app.build_file_action_dialog(area);
+        let mut cpos = None;
+        'outer2: for row in 0..H {
+            for col in 0..W {
+                if dlg.hit_test(col, row, area) == DialogHit::Button(0) {
+                    cpos = Some((col, row));
+                    break 'outer2;
+                }
+            }
+        }
+        let (cx, cy) = cpos.expect("Cancel button not found");
+        app.handle_mouse_up(cx, cy, W, H);
+        assert!(app.show_file_dialog, "release off the pressed button must cancel");
+        assert_eq!(app.file_dialog_path, std::env::temp_dir());
+    }
+
+    #[test]
+    fn model_dialog_confirm_requires_release_on_the_same_button() {
+        let mut app = test_app();
+        app.show_model_dialog = true;
+        app.available_models = vec!["model-a".to_string(), "model-b".to_string()];
+        app.model_dialog_selection = 1;
+        app.model_name = "model-a".to_string();
+
+        let area = Rect::new(0, 0, W, H);
+        let count = app.model_dialog_entries().len() as u16;
+        let (_, _, _, btn_y, confirm_x, cancel_x) = crate::ui::model_dialog_geometry(count, area);
+
+        // Press Confirm: focus + pressed state, but no switch yet.
+        app.handle_click(confirm_x, btn_y, W, H);
+        assert!(app.show_model_dialog, "press alone must not commit the model");
+        assert_eq!(app.model_name, "model-a");
+        assert_eq!(app.pressed_button, Some(PressedButton::ModelDialogConfirm));
+
+        // Release over Cancel: cancelled.
+        app.handle_mouse_up(cancel_x, btn_y, W, H);
+        assert!(app.show_model_dialog);
+        assert_eq!(app.model_name, "model-a");
+
+        // Press + release on Confirm: commits and closes.
+        app.handle_click(confirm_x, btn_y, W, H);
+        app.handle_mouse_up(confirm_x, btn_y, W, H);
+        assert!(!app.show_model_dialog);
+        assert_eq!(app.model_name, "model-b");
+    }
+
+    #[test]
+    fn quit_confirm_yes_requires_release_on_yes() {
+        let mut app = test_app();
+        // Keep autosave off the real sessions dir.
+        app.session_dir = std::env::temp_dir().join(format!("rustama-press-test-{}", std::process::id()));
+        app.open_quit_confirm();
+
+        let cb = crate::ui::ConfirmationBox::new("Confirm Quit", "Are you sure you want to quit?");
+        let area = Rect::new(0, 0, W, H);
+        let scan = |hit: ConfirmHit| -> (u16, u16) {
+            for row in 0..H {
+                for col in 0..W {
+                    if cb.hit_test(col, row, area) == hit {
+                        return (col, row);
+                    }
+                }
+            }
+            panic!("{hit:?} button not found");
+        };
+        let (yes_x, yes_y) = scan(ConfirmHit::Yes);
+        let (no_x, no_y) = scan(ConfirmHit::No);
+
+        // Press Yes, release over No: nothing happens.
+        app.handle_click(yes_x, yes_y, W, H);
+        assert!(!app.should_quit, "press alone must not quit");
+        assert_eq!(app.pressed_button, Some(PressedButton::QuitConfirmYes));
+        app.handle_mouse_up(no_x, no_y, W, H);
+        assert!(!app.should_quit);
+        assert!(app.show_quit_confirm, "cancelled release keeps the dialog open");
+
+        // Press + release on Yes: quits.
+        app.handle_click(yes_x, yes_y, W, H);
+        app.handle_mouse_up(yes_x, yes_y, W, H);
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn keybar_button_activates_on_release_and_cancels_off_field() {
+        let mut app = test_app();
+        let labels = crate::keybar_labels_for(&app);
+        let widths = crate::keybar_field_widths(&labels, W);
+        let f10_x: u16 = widths.iter().take(9).sum();
+        let ky = H - 1;
+
+        // Press F10 (quit confirm): highlight only.
+        app.handle_click(f10_x, ky, W, H);
+        assert!(!app.show_quit_confirm, "press alone must not open the dialog");
+        assert_eq!(app.pressed_button, Some(PressedButton::Keybar(10)));
+
+        // Release over F1: cancelled.
+        app.handle_mouse_up(0, ky, W, H);
+        assert!(!app.show_quit_confirm);
+
+        // Press + release on F10: opens the quit confirm.
+        app.handle_click(f10_x, ky, W, H);
+        app.handle_mouse_up(f10_x, ky, W, H);
+        assert!(app.show_quit_confirm);
+    }
+
+    #[test]
+    fn send_button_press_highlights_and_release_sends() {
+        let mut app = test_app();
+        // Keep the autosave off the real sessions dir.
+        app.session_dir = std::env::temp_dir().join(format!("rustama-press-test-{}", std::process::id()));
+        app.textarea.insert_str("hello");
+        let input_bottom = H.saturating_sub(2 + app.bottom_rows());
+
+        // Press on the send row: highlighted, nothing sent yet.
+        app.handle_click(5, input_bottom, W, H);
+        assert_eq!(app.pressed_button, Some(PressedButton::Send));
+        assert!(!app.is_loading, "press must not send");
+        assert!(
+            !app.messages.iter().any(|m| matches!(m, ChatMessage::User { .. })),
+            "press must not push a user message"
+        );
+
+        // Release off the send row: cancelled.
+        app.handle_mouse_up(5, input_bottom.saturating_sub(3), W, H);
+        assert!(!app.is_loading);
+
+        // Press + release on the send row: sends.
+        app.handle_click(5, input_bottom, W, H);
+        app.handle_mouse_up(5, input_bottom, W, H);
+        assert!(app.is_loading, "release on the send button sends");
+        assert!(matches!(app.messages.last(), Some(ChatMessage::User { .. })));
+    }
+
+    #[test]
+    fn click_on_empty_send_row_focuses_input_instead() {
+        let mut app = test_app();
+        let input_bottom = H.saturating_sub(2 + app.bottom_rows());
+        app.handle_click(5, input_bottom, W, H);
+        assert_eq!(app.pressed_button, None, "no text: no send button press");
+        assert_eq!(app.focus, Focus::Input);
+    }
+
+    #[test]
+    fn stale_press_after_dialog_closed_by_key_is_harmless() {
+        let mut app = test_app();
+        app.open_save_dialog();
+        let (cx, cy) = save_button_pos(&app, 0);
+
+        app.handle_click(cx, cy, W, H);
+        assert_eq!(app.pressed_button, Some(PressedButton::SaveDialogButton(0)));
+
+        // The dialog closes by other means while the mouse is held down.
+        app.show_save_dialog = false;
+
+        // Release: the action must not fire, and the press is consumed.
+        app.handle_mouse_up(cx, cy, W, H);
+        assert_eq!(app.pressed_button, None);
+        assert!(!app.show_save_dialog);
+    }
+
+    #[test]
+    fn pressed_look_unhighlights_when_mouse_drags_off() {
+        let mut app = test_app();
+        app.open_save_dialog();
+        let (cancel_x, cancel_y) = save_button_pos(&app, 0);
+        let (save_x, save_y) = save_button_pos(&app, 1);
+        let area = Rect::new(0, 0, W, H);
+        let id = PressedButton::SaveDialogButton(0);
+
+        app.handle_click(cancel_x, cancel_y, W, H);
+        // The event loop tracks the pointer on every mouse event.
+        app.mouse_pos = (cancel_x, cancel_y);
+        let dlg = app.save_dialog_clickable();
+        // Still on the button: pressed look.
+        assert!(app.dialog_button_pressed(&dlg, area, 0, id));
+        // Dragged onto the other button: un-highlighted (cosmetic) —
+        // but the press itself is untouched, so releasing back on
+        // Cancel still fires its action.
+        app.mouse_pos = (save_x, save_y);
+        let dlg = app.save_dialog_clickable();
+        assert!(!app.dialog_button_pressed(&dlg, area, 0, id));
+        assert_eq!(app.pressed_button, Some(id));
+        app.mouse_pos = (cancel_x, cancel_y);
+        app.handle_mouse_up(cancel_x, cancel_y, W, H);
+        assert!(!app.show_save_dialog, "release back on the button activates");
     }
 }
 

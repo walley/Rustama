@@ -179,23 +179,29 @@ where
         Event::Paste(text) => {
             app.handle_paste(&text);
         }
-        Event::Mouse(mouse) => match mouse.kind {
-            MouseEventKind::ScrollUp => app.scroll_up(),
-            MouseEventKind::ScrollDown => app.scroll_down(),
-            MouseEventKind::Down(MouseButton::Left) => {
-                let size = terminal.size()?;
-                app.handle_click(mouse.column, mouse.row, size.width, size.height);
+        Event::Mouse(mouse) => {
+            // Track the pointer so a held-down button un-highlights when
+            // dragged off (the release position alone decides the action).
+            app.mouse_pos = (mouse.column, mouse.row);
+            match mouse.kind {
+                MouseEventKind::ScrollUp => app.scroll_up(),
+                MouseEventKind::ScrollDown => app.scroll_down(),
+                MouseEventKind::Down(MouseButton::Left) => {
+                    let size = terminal.size()?;
+                    app.handle_click(mouse.column, mouse.row, size.width, size.height);
+                }
+                MouseEventKind::Up(MouseButton::Left) => {
+                    let size = terminal.size()?;
+                    app.handle_mouse_up(mouse.column, mouse.row, size.width, size.height);
+                }
+                MouseEventKind::Drag(MouseButton::Left) => {
+                    let size = terminal.size()?;
+                    let input_start = size.height.saturating_sub(6 + app.bottom_rows());
+                    app.handle_mouse_drag(mouse.row, input_start);
+                }
+                _ => {}
             }
-            MouseEventKind::Up(MouseButton::Left) => {
-                app.handle_mouse_up();
-            }
-            MouseEventKind::Drag(MouseButton::Left) => {
-                let size = terminal.size()?;
-                let input_start = size.height.saturating_sub(6 + app.bottom_rows());
-                app.handle_mouse_drag(mouse.row, input_start);
-            }
-            _ => {}
-        },
+        }
         _ => {}
     }
     Ok(())
@@ -270,12 +276,27 @@ fn ui(f: &mut Frame, app: &mut App) {
 
     if app.show_about {
         let mb = app.about_box();
-        mb.render(f, area, true, &app.theme);
+        // Pressed look: held down AND the pointer is still on the OK button.
+        let pressed = app.pressed_button == Some(app::PressedButton::MessageBoxOk)
+            && mb.hit_test(app.mouse_pos.0, app.mouse_pos.1, area);
+        mb.render(f, area, true, pressed, &app.theme);
     }
 
     if app.show_quit_confirm {
         let cb = ConfirmationBox::new("Confirm Quit", "Are you sure you want to quit?");
-        cb.render(f, area, app.quit_confirm_focus, &app.theme);
+        let pressed = match (
+            app.pressed_button,
+            cb.hit_test(app.mouse_pos.0, app.mouse_pos.1, area),
+        ) {
+            (Some(app::PressedButton::QuitConfirmYes), ui::ConfirmHit::Yes) => {
+                Some(ui::ConfirmFocus::Yes)
+            }
+            (Some(app::PressedButton::QuitConfirmNo), ui::ConfirmHit::No) => {
+                Some(ui::ConfirmFocus::No)
+            }
+            _ => None,
+        };
+        cb.render(f, area, app.quit_confirm_focus, pressed, &app.theme);
     }
 
     if app.show_model_dialog {
@@ -308,7 +329,10 @@ fn ui(f: &mut Frame, app: &mut App) {
 
     if app.show_retry_paused {
         let mb = ui::MessageBox::new("Retry Paused", &app.retry_paused_message);
-        mb.render(f, area, true, &app.theme);
+        // Pressed look: held down AND the pointer is still on the OK button.
+        let pressed = app.pressed_button == Some(app::PressedButton::MessageBoxOk)
+            && mb.hit_test(app.mouse_pos.0, app.mouse_pos.1, area);
+        mb.render(f, area, true, pressed, &app.theme);
     }
 }
 
@@ -915,14 +939,20 @@ fn render_send_button(f: &mut Frame, app: &App, area: Rect) {
         Color::DarkGray,
         Color::Green,
     );
-    let (btn_text, btn_style) = send_btn.render();
-    let display_width = btn_text.chars().count() as u16; // 15
+    let display_width = send_btn.width; // == the rendered "[  send  ►  ]" width (15)
 
     // Flush against the bottom-right corner of the input box — the
     // border line resumes right after the "]" (no wiped gap after the
     // button; buttons have no shadow).
     let btn_x = area.x + area.width.saturating_sub(1 + display_width);
     let btn_y = area.y + area.height.saturating_sub(1);
+
+    // Pressed look: held down AND the pointer is still on the button.
+    let pressed = app.pressed_button == Some(app::PressedButton::Send)
+        && app.mouse_pos.0 >= btn_x
+        && app.mouse_pos.0 < btn_x + display_width
+        && app.mouse_pos.1 == btn_y;
+    let (btn_text, btn_style) = send_btn.with_pressed(pressed).render();
 
     let btn_area = Rect {
         x: btn_x,
@@ -1331,6 +1361,11 @@ fn render_model_dialog(f: &mut Frame, app: &App, area: Rect) {
         app.model_dialog_focus == ModelDialogFocus::Confirm,
         app.theme.dialog_fg,
         app.theme.dialog_focus_bg,
+    )
+    .with_pressed_at(
+        app.pressed_button == Some(app::PressedButton::ModelDialogConfirm),
+        app.mouse_pos.0,
+        app.mouse_pos.1,
     );
     let cancel_btn = Button::new(
         "Cancel",
@@ -1339,6 +1374,11 @@ fn render_model_dialog(f: &mut Frame, app: &App, area: Rect) {
         app.model_dialog_focus == ModelDialogFocus::Cancel,
         app.theme.dialog_fg,
         app.theme.dialog_focus_bg,
+    )
+    .with_pressed_at(
+        app.pressed_button == Some(app::PressedButton::ModelDialogCancel),
+        app.mouse_pos.0,
+        app.mouse_pos.1,
     );
 
     let (confirm_text, confirm_style) = confirm_btn.render();
@@ -1418,6 +1458,11 @@ fn render_workflow_dialog(f: &mut Frame, app: &App, area: Rect) {
         app.workflow_dialog_focus == WorkflowDialogFocus::Confirm,
         app.theme.dialog_fg,
         app.theme.dialog_focus_bg,
+    )
+    .with_pressed_at(
+        app.pressed_button == Some(app::PressedButton::WorkflowDialogConfirm),
+        app.mouse_pos.0,
+        app.mouse_pos.1,
     );
     let cancel_btn = Button::new(
         "Cancel",
@@ -1426,6 +1471,11 @@ fn render_workflow_dialog(f: &mut Frame, app: &App, area: Rect) {
         app.workflow_dialog_focus == WorkflowDialogFocus::Cancel,
         app.theme.dialog_fg,
         app.theme.dialog_focus_bg,
+    )
+    .with_pressed_at(
+        app.pressed_button == Some(app::PressedButton::WorkflowDialogCancel),
+        app.mouse_pos.0,
+        app.mouse_pos.1,
     );
 
     let (confirm_text, confirm_style) = confirm_btn.render();
@@ -1469,6 +1519,15 @@ fn render_save_dialog(f: &mut Frame, app: &App, area: Rect) {
             );
             d.add_button("Cancel", app.save_dialog_focus == SaveDialogFocus::Cancel);
             d.add_button("Save", app.save_dialog_focus == SaveDialogFocus::Save);
+            // Pressed look: held down AND still under the pointer.
+            d.set_button_pressed(
+                0,
+                app.dialog_button_pressed(&d, area, 0, app::PressedButton::SaveDialogButton(0)),
+            );
+            d.set_button_pressed(
+                1,
+                app.dialog_button_pressed(&d, area, 1, app::PressedButton::SaveDialogButton(1)),
+            );
             d
         }
         app::SaveDialogMode::ExportChat => {
@@ -1495,6 +1554,15 @@ fn render_save_dialog(f: &mut Frame, app: &App, area: Rect) {
             );
             d.add_button("Cancel", app.save_dialog_focus == SaveDialogFocus::Cancel);
             d.add_button("Export", app.save_dialog_focus == SaveDialogFocus::Save);
+            // Pressed look: held down AND still under the pointer.
+            d.set_button_pressed(
+                0,
+                app.dialog_button_pressed(&d, area, 0, app::PressedButton::SaveDialogButton(0)),
+            );
+            d.set_button_pressed(
+                1,
+                app.dialog_button_pressed(&d, area, 1, app::PressedButton::SaveDialogButton(1)),
+            );
             d
         }
     };
@@ -1736,6 +1804,11 @@ fn render_settings_dialog(f: &mut Frame, app: &App, area: Rect) {
         app.settings_focus == SettingsFocus::Save,
         app.theme.dialog_fg,
         app.theme.dialog_focus_bg,
+    )
+    .with_pressed_at(
+        app.pressed_button == Some(app::PressedButton::SettingsDialogSave),
+        app.mouse_pos.0,
+        app.mouse_pos.1,
     );
     let cancel_btn = Button::new(
         cancel_label,
@@ -1744,6 +1817,11 @@ fn render_settings_dialog(f: &mut Frame, app: &App, area: Rect) {
         app.settings_focus == SettingsFocus::Cancel,
         app.theme.dialog_fg,
         app.theme.dialog_focus_bg,
+    )
+    .with_pressed_at(
+        app.pressed_button == Some(app::PressedButton::SettingsDialogCancel),
+        app.mouse_pos.0,
+        app.mouse_pos.1,
     );
 
     let (save_text, save_style) = save_btn.render();
@@ -2498,13 +2576,20 @@ mod keybar_tests {
     #[test]
     fn keybar_click_opens_the_clicked_keys_action() {
         let mut app = test_app();
-        // 80 cols, 10 equal fields: F9 covers x=64..71.
-        app.handle_keybar_click(67, 80);
+        // 80 cols, 10 equal fields: F9 covers x=64..71. Click + release
+        // on the same field runs the action (press/release semantics).
+        app.handle_keybar_click(67, 80, crate::app::ClickPhase::Press);
+        assert!(
+            !app.main_menu.is_open(),
+            "press alone must not open the menu"
+        );
+        app.handle_keybar_click(67, 80, crate::app::ClickPhase::Release);
         assert!(app.main_menu.is_open(), "clicking the F9 field opens the menu");
 
         // Clicks in field 1..=5 have no action attached (yet).
         let mut app = test_app();
-        app.handle_keybar_click(5, 80);
+        app.handle_keybar_click(5, 80, crate::app::ClickPhase::Press);
+        app.handle_keybar_click(5, 80, crate::app::ClickPhase::Release);
         assert!(!app.main_menu.is_open());
     }
 
@@ -2653,7 +2738,8 @@ mod about_dialog_tests {
         terminal
             .draw(|f| {
                 let area = f.area();
-                app.about_box().render(f, area, true, &app.theme);
+                app.about_box()
+                    .render(f, area, true, false, &app.theme);
             })
             .unwrap();
         let buf = terminal.backend().buffer().clone();
@@ -2696,7 +2782,7 @@ mod about_dialog_tests {
             .draw(|f| {
                 let area = f.area();
                 let mb = MessageBox::new("About", &app.about_message);
-                mb.render(f, area, true, &app.theme);
+                mb.render(f, area, true, false, &app.theme);
             })
             .unwrap();
         let buf = terminal.backend().buffer().clone();
@@ -2748,7 +2834,7 @@ mod about_logo_tests {
                 let area = f.area();
                 let mb = ui::MessageBox::new("About", "msg")
                     .with_header(ui::rustama_logo_lines());
-                mb.render(f, area, true, &ui::Theme::default());
+                mb.render(f, area, true, false, &ui::Theme::default());
             })
             .unwrap();
         let buf = terminal.backend().buffer().clone();
