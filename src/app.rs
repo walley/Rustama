@@ -2616,6 +2616,12 @@ impl App {
     /// Unified tool dispatch: terminal tools → LSP tools → stateless tools,
     /// then the auto-diagnostics hook for file edits.
     fn execute_tool(&mut self, name: &str, args: &str) -> String {
+        // Single choke point for path arguments: expand shell-style `~`
+        // so `~/git/Rustama` reaches the LSP layer (and the tracking
+        // hooks below) as a filesystem-valid path. Stateless tools
+        // expand again themselves — a no-op on absolute paths. The
+        // shell expands `~` on its own for bash/terminal commands.
+        let args = &expand_path_args(args);
         if matches!(name, "edit_file" | "write_file") {
             let parsed: serde_json::Value =
                 serde_json::from_str(args).unwrap_or(serde_json::json!({}));
@@ -7496,6 +7502,25 @@ fn dirs_home() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("."))
 }
 
+/// Rewrites the `path` argument of a tool-call JSON with a leading `~`
+/// expanded to the home directory (`crate::tools::expand_tilde`). Used
+/// by [`App::execute_tool`] as the dispatch-time safety net for tools
+/// that hand paths to rust-analyzer rather than `std::fs`. Idempotent:
+/// absolute paths pass through untouched, and malformed JSON is
+/// returned as-is so the tool produces its own "bad arguments" error.
+fn expand_path_args(args: &str) -> String {
+    let Ok(mut parsed) = serde_json::from_str::<serde_json::Value>(args) else {
+        return args.to_string();
+    };
+    if let Some(path) = parsed["path"].as_str() {
+        let expanded = crate::tools::expand_tilde(path);
+        if expanded != path {
+            parsed["path"] = serde_json::Value::String(expanded);
+        }
+    }
+    parsed.to_string()
+}
+
 /// Resolves the LSP workspace root: the configured `lsp_workspace` if set,
 /// else the directory of `save_path`, else the current directory.
 /// Missing `Cargo.toml` is not fatal — rust-analyzer still parses
@@ -7642,7 +7667,7 @@ fn get_tool_definitions() -> Vec<serde_json::Value> {
                     "properties": {
                         "path": {
                             "type": "string",
-                            "description": "The file path to read"
+                            "description": "The file path to read (a leading ~ is expanded to the home directory)"
                         },
                         "offset": {
                             "type": "integer",
@@ -7667,7 +7692,7 @@ fn get_tool_definitions() -> Vec<serde_json::Value> {
                     "properties": {
                         "path": {
                             "type": "string",
-                            "description": "The file path to write"
+                            "description": "The file path to write (a leading ~ is expanded to the home directory)"
                         },
                         "content": {
                             "type": "string",
@@ -7688,7 +7713,7 @@ fn get_tool_definitions() -> Vec<serde_json::Value> {
                     "properties": {
                         "path": {
                             "type": "string",
-                            "description": "The file path to edit"
+                            "description": "The file path to edit (a leading ~ is expanded to the home directory)"
                         },
                         "old_string": {
                             "type": "string",
@@ -7730,7 +7755,7 @@ fn get_tool_definitions() -> Vec<serde_json::Value> {
                     "properties": {
                         "path": {
                             "type": "string",
-                            "description": "The directory path to list"
+                            "description": "The directory path to list (a leading ~ is expanded to the home directory)"
                         }
                     },
                     "required": ["path"]
@@ -7751,7 +7776,7 @@ fn get_tool_definitions() -> Vec<serde_json::Value> {
                         },
                         "path": {
                             "type": "string",
-                            "description": "The directory to search in (defaults to current directory)"
+                            "description": "The directory to search in (defaults to current directory; a leading ~ is expanded)"
                         }
                     },
                     "required": ["pattern"]
@@ -7772,7 +7797,7 @@ fn get_tool_definitions() -> Vec<serde_json::Value> {
                         },
                         "path": {
                             "type": "string",
-                            "description": "The directory to search in"
+                            "description": "The directory to search in (a leading ~ is expanded)"
                         },
                         "include": {
                             "type": "string",
@@ -7888,7 +7913,7 @@ fn get_tool_definitions() -> Vec<serde_json::Value> {
                     "properties": {
                         "path": {
                             "type": "string",
-                            "description": "The .rs file to check. Default: the most recently edited file, else a workspace-wide summary."
+                            "description": "The .rs file to check. Default: the most recently edited file, else a workspace-wide summary. A leading ~ is expanded."
                         },
                         "severity": {
                             "type": "string",
@@ -7908,7 +7933,7 @@ fn get_tool_definitions() -> Vec<serde_json::Value> {
                     "properties": {
                         "path": {
                             "type": "string",
-                            "description": "The .rs file containing the symbol reference (absolute path)."
+                            "description": "The .rs file containing the symbol reference (absolute path; a leading ~ is expanded)."
                         },
                         "line": {
                             "type": "integer",
@@ -7933,7 +7958,7 @@ fn get_tool_definitions() -> Vec<serde_json::Value> {
                     "properties": {
                         "path": {
                             "type": "string",
-                            "description": "The .rs file containing the symbol (absolute path)."
+                            "description": "The .rs file containing the symbol (absolute path; a leading ~ is expanded)."
                         },
                         "line": {
                             "type": "integer",
@@ -7958,7 +7983,7 @@ fn get_tool_definitions() -> Vec<serde_json::Value> {
                     "properties": {
                         "path": {
                             "type": "string",
-                            "description": "The .rs file containing the symbol (absolute path)."
+                            "description": "The .rs file containing the symbol (absolute path; a leading ~ is expanded)."
                         },
                         "line": {
                             "type": "integer",
@@ -7987,7 +8012,7 @@ fn get_tool_definitions() -> Vec<serde_json::Value> {
                     "properties": {
                         "path": {
                             "type": "string",
-                            "description": "The .rs file to complete in (absolute path)."
+                            "description": "The .rs file to complete in (absolute path; a leading ~ is expanded)."
                         },
                         "line": {
                             "type": "integer",
@@ -9925,6 +9950,56 @@ mod lsp_tool_tests {
         // Server not running → auto-diagnostics hook stays silent.
         assert!(!out.contains("Diagnostics:"), "got: {}", out);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn expand_path_args_expands_tilde_only_in_path() {
+        let home = std::env::var("HOME").unwrap_or_default();
+        if home.is_empty() {
+            return;
+        }
+        // `path` is expanded, sibling args are left alone.
+        let out = expand_path_args(r#"{"path": "~/git/Rustama", "limit": 3}"#);
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(parsed["path"], format!("{home}/git/Rustama"));
+        assert_eq!(parsed["limit"], 3);
+
+        // Absolute paths and a missing `path` key pass through verbatim.
+        assert_eq!(
+            expand_path_args(r#"{"path": "/tmp/x.rs"}"#),
+            r#"{"path":"/tmp/x.rs"}"#
+        );
+        assert_eq!(
+            expand_path_args(r#"{"command": "ls ~"}"#),
+            r#"{"command":"ls ~"}"#
+        );
+        // Malformed JSON: returned unchanged so the tool reports it.
+        assert_eq!(expand_path_args("not json"), "not json");
+    }
+
+    #[test]
+    fn execute_tool_expands_tilde_path_for_tracking() {
+        let mut app = test_app();
+        let Some(home) = std::env::var("HOME").ok().filter(|h| !h.is_empty()) else {
+            return;
+        };
+        let dir = std::path::Path::new(&home)
+            .join(format!("rustama-tilde-track-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let rel = dir.file_name().unwrap().to_string_lossy().to_string();
+        let out = app.execute_tool(
+            "write_file",
+            &serde_json::json!({"path": format!("~/{rel}/x.rs"), "content": "fn main() {}\n"})
+                .to_string(),
+        );
+        // `last_edited_file` (drives the auto-diagnostics hook) sees the
+        // expanded absolute path, not the raw `~/...` string.
+        assert_eq!(
+            app.last_edited_file,
+            Some(std::path::PathBuf::from(format!("{home}/{rel}/x.rs")))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(out.contains("Successfully wrote"), "got: {}", out);
     }
 
     #[test]

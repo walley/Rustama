@@ -11,6 +11,11 @@
 //! Stateful tools (terminal PTY, LSP) do not live here — they need
 //! `App` state and are dispatched by `App::execute_tool` *before* this
 //! stateless dispatcher is consulted.
+//!
+//! Every tool that takes a `path` argument accepts shell-style tilde
+//! notation: [`expand_tilde`] resolves a leading `~`/`~user` to a home
+//! directory before the path reaches the filesystem (or, for the LSP
+//! tools, via the same rewrite in `App::execute_tool`).
 
 use crate::app::safe_prefix;
 
@@ -65,14 +70,80 @@ pub(crate) fn execute_tool_call(name: &str, args_json: &str, proxy: &Option<Stri
     }
 }
 
+/// Expands a leading `~` in a tool path argument to an absolute path.
+/// Neither `std::fs` nor the `glob` crate understand shell-style tilde
+/// notation, so a model-supplied `~/git/Rustama` would otherwise fail
+/// with "No such file or directory".
+///
+///   * `~`          → the user's home directory (`$HOME`)
+///   * `~/rest`     → `$HOME/rest`
+///   * `~user/rest` → that user's home directory (from `/etc/passwd`)
+///
+/// Anything else — a `~` that is not the leading component, or a
+/// `~user` that cannot be resolved — is returned unchanged, so the tool
+/// reports the underlying filesystem error as before.
+pub(crate) fn expand_tilde(path: &str) -> String {
+    if !path.starts_with('~') {
+        return path.to_string();
+    }
+    if path == "~" {
+        return home_dir().unwrap_or_else(|| path.to_string());
+    }
+    if let Some(rest) = path.strip_prefix("~/") {
+        return match home_dir() {
+            Some(home) => format!("{}/{}", home, rest),
+            None => path.to_string(),
+        };
+    }
+    // `~user[/rest]`: resolve via the passwd database (unix only).
+    #[cfg(unix)]
+    {
+        let (user, rest) = match path[1..].split_once('/') {
+            Some((user, rest)) => (user, rest),
+            None => (&path[1..], ""),
+        };
+        if !user.is_empty()
+            && let Some(user_home) = passwd_home(user)
+        {
+            return if rest.is_empty() {
+                user_home
+            } else {
+                format!("{}/{}", user_home, rest)
+            };
+        }
+    }
+    path.to_string()
+}
+
+/// The user's home directory, or `None` when `$HOME` is unset/empty.
+fn home_dir() -> Option<String> {
+    std::env::var("HOME").ok().filter(|h| !h.is_empty())
+}
+
+/// Looks up `user`'s home directory in `/etc/passwd`. Lines are
+/// `name:passwd:uid:gid:gecos:home:shell`, so the home directory is
+/// field 6 (0-based index 5) of the first line naming `user`.
+#[cfg(unix)]
+fn passwd_home(user: &str) -> Option<String> {
+    let passwd = std::fs::read_to_string("/etc/passwd").ok()?;
+    passwd.lines().find_map(|line| {
+        let fields: Vec<&str> = line.split(':').collect();
+        if fields.first() == Some(&user) && fields.len() > 5 {
+            Some(fields[5].to_string())
+        } else {
+            None
+        }
+    })
+}
+
 /// `read_file`: whole file, or a 1-based `offset`/`limit` window with a
 /// "showing lines X-Y of Z" footer.
 fn read_file(args: &serde_json::Value) -> String {
-    let path = args["path"].as_str().unwrap_or("");
+    let path = expand_tilde(args["path"].as_str().unwrap_or(""));
     // 1-based first line; default: start of file.
     let offset = args["offset"].as_u64().unwrap_or(1).max(1) as usize;
     let limit = args["limit"].as_u64().map(|n| n as usize);
-    match std::fs::read_to_string(path) {
+    match std::fs::read_to_string(&path) {
         Ok(content) => {
             let total_lines = content.lines().count();
             if offset == 1 && limit.is_none() {
@@ -110,9 +181,9 @@ fn read_file(args: &serde_json::Value) -> String {
 
 /// `write_file`: create or overwrite a file.
 fn write_file(args: &serde_json::Value) -> String {
-    let path = args["path"].as_str().unwrap_or("");
+    let path = expand_tilde(args["path"].as_str().unwrap_or(""));
     let content = args["content"].as_str().unwrap_or("");
-    match std::fs::write(path, content) {
+    match std::fs::write(&path, content) {
         Ok(()) => format!("Successfully wrote {} bytes to {}", content.len(), path),
         Err(e) => format!("Error writing file: {}", e),
     }
@@ -121,17 +192,17 @@ fn write_file(args: &serde_json::Value) -> String {
 /// `edit_file`: replace the first occurrence of `old_string` and return
 /// a unified diff of the change.
 fn edit_file(args: &serde_json::Value) -> String {
-    let path = args["path"].as_str().unwrap_or("");
+    let path = expand_tilde(args["path"].as_str().unwrap_or(""));
     let old = args["old_string"].as_str().unwrap_or("");
     let new = args["new_string"].as_str().unwrap_or("");
-    match std::fs::read_to_string(path) {
+    match std::fs::read_to_string(&path) {
         Ok(content) => {
             if let Some(pos) = content.find(old) {
                 let mut new_content = content.clone();
                 new_content.replace_range(pos..pos + old.len(), new);
-                match std::fs::write(path, &new_content) {
+                match std::fs::write(&path, &new_content) {
                     Ok(()) => {
-                        let diff = unified_diff(&content, &new_content, path, 3);
+                        let diff = unified_diff(&content, &new_content, &path, 3);
                         format!("Successfully edited {}\n{}", path, diff)
                     }
                     Err(e) => format!("Error writing file: {}", e),
@@ -209,7 +280,7 @@ fn bash(args: &serde_json::Value) -> String {
 
 /// `list_files`: directory entries, `dir/` suffixed, sorted.
 fn list_files(args: &serde_json::Value) -> String {
-    let path = args["path"].as_str().unwrap_or(".");
+    let path = expand_tilde(args["path"].as_str().unwrap_or("."));
     match std::fs::read_dir(path) {
         Ok(entries) => {
             let mut files: Vec<String> = entries
@@ -230,7 +301,7 @@ fn list_files(args: &serde_json::Value) -> String {
 /// `search_files`: glob pattern → matching paths.
 fn search_files(args: &serde_json::Value) -> String {
     let pattern = args["pattern"].as_str().unwrap_or("*");
-    let path = args["path"].as_str().unwrap_or(".");
+    let path = expand_tilde(args["path"].as_str().unwrap_or("."));
     let full_pattern = format!("{}/{}", path, pattern);
     match glob::glob(&full_pattern) {
         Ok(paths) => {
@@ -257,10 +328,10 @@ fn search_files(args: &serde_json::Value) -> String {
 /// final joined result including its newline separators.
 fn search_content(args: &serde_json::Value) -> String {
     let pattern = args["pattern"].as_str().unwrap_or("");
-    let path = args["path"].as_str().unwrap_or(".");
+    let path = expand_tilde(args["path"].as_str().unwrap_or("."));
     let include = args["include"].as_str().unwrap_or("*");
 
-    match grep_regex(pattern, path, include) {
+    match grep_regex(pattern, &path, include) {
         Ok(results) => {
             if results.is_empty() {
                 "No matches found".to_string()
@@ -833,5 +904,93 @@ mod tests {
         let b = parse_text_tool_calls("list_files:\n{\"path\": \".\"}");
         assert_eq!(b.len(), 1, "name-colon fallback: {:?}", b);
         assert_eq!(b[0]["name"], "list_files");
+    }
+
+    #[test]
+    fn expand_tilde_resolves_home_and_subpath() {
+        let Some(home) = home_dir() else { return }; // no $HOME: nothing to assert
+        assert_eq!(expand_tilde("~"), home);
+        assert_eq!(expand_tilde("~/git/Rustama"), format!("{home}/git/Rustama"));
+        // Trailing slash and nested tilde-free components pass through.
+        assert_eq!(expand_tilde("~/x/"), format!("{home}/x/"));
+    }
+
+    #[test]
+    fn expand_tilde_leaves_other_paths_untouched() {
+        // Absolute, relative, tilde-free, and mid-path tildes must not
+        // be rewritten (an unresolvable path must still produce the
+        // tool's usual filesystem error, not a mangled path).
+        assert_eq!(expand_tilde(""), "");
+        assert_eq!(expand_tilde("/tmp/x.rs"), "/tmp/x.rs");
+        assert_eq!(expand_tilde("src/app.rs"), "src/app.rs");
+        assert_eq!(expand_tilde("."), ".");
+        assert_eq!(expand_tilde("a~b/c"), "a~b/c");
+        assert_eq!(expand_tilde("src/~/x"), "src/~/x");
+        // Unknown user: returned unchanged.
+        assert_eq!(
+            expand_tilde("~no-such-user-8f3a/x"),
+            "~no-such-user-8f3a/x"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn expand_tilde_resolves_named_user() {
+        let user = std::env::var("USER").or_else(|_| std::env::var("LOGNAME"));
+        let Some(user) = user.ok().filter(|u| !u.is_empty()) else { return };
+        let Some(home) = home_dir() else { return };
+        assert_eq!(expand_tilde(&format!("~{user}")), home);
+        assert_eq!(
+            expand_tilde(&format!("~{user}/git/Rustama")),
+            format!("{home}/git/Rustama")
+        );
+    }
+
+    #[test]
+    fn list_files_accepts_tilde_path() {
+        // The reported failure mode: `~/...` must list the home
+        // directory, not fail with "No such file or directory".
+        let out = execute_tool_call("list_files", r#"{"path": "~"}"#, &None);
+        assert!(
+            !out.starts_with("Error listing directory"),
+            "tilde path must resolve, got: {out}"
+        );
+
+        // End-to-end: a tilde subpath reaches a real directory under $HOME.
+        let Some(home) = home_dir() else { return };
+        let dir = std::path::Path::new(&home)
+            .join(format!("rustama-tilde-list-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("f.txt"), "x").unwrap();
+        let rel = dir.file_name().unwrap().to_string_lossy().to_string();
+        let out = execute_tool_call(
+            "list_files",
+            &serde_json::json!({"path": format!("~/{rel}")}).to_string(),
+            &None,
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(out, "f.txt\nsub/", "got: {out}");
+    }
+
+    #[test]
+    fn write_file_accepts_tilde_path() {
+        let Some(home) = home_dir() else { return };
+        let dir = std::path::Path::new(&home)
+            .join(format!("rustama-tilde-write-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let rel = dir.file_name().unwrap().to_string_lossy().to_string();
+        let out = execute_tool_call(
+            "write_file",
+            &serde_json::json!({"path": format!("~/{rel}/tilde.md"), "content": "hi"}).to_string(),
+            &None,
+        );
+        assert!(out.starts_with("Successfully wrote"), "got: {out}");
+        let read_back = execute_tool_call(
+            "read_file",
+            &serde_json::json!({"path": format!("~/{rel}/tilde.md")}).to_string(),
+            &None,
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(read_back, "hi", "round-trip through ~/ path failed");
     }
 }
