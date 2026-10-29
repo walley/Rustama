@@ -89,8 +89,8 @@ system_prompt = You are a coding assistant with access to tools.
 # HTTP proxy URL (optional — set to "off" or leave commented to disable)
 # proxy = http://proxy:8080
 
-# Max agentic tool rounds per request (1–100, default: 10)
-max_tool_rounds = 10
+# Max agentic tool rounds per request (default: 100)
+max_tool_rounds = 100
 
 # Max API retries on 429/rate-limit errors (1–50, default: 10)
 max_retries = 10
@@ -131,7 +131,7 @@ lsp_auto_diagnostics = true
 | `logfile` | string | `rustama.log` | Path to the log file |
 | `system_prompt` | string | (coding assistant prompt) | System prompt sent with every conversation |
 | `proxy` | string | _(none)_ | HTTP proxy URL; set to `off`, `none`, or `false` to disable |
-| `max_tool_rounds` | integer | `10` | Maximum agentic tool call rounds per request (1–100) |
+| `max_tool_rounds` | integer | `100` | Maximum agentic tool call rounds per request |
 | `max_retries` | integer | `10` | Maximum API retries on rate-limit errors (1–50) |
 | `terminal_width_pct` | integer | `40` | Percentage of terminal width for the output panel (20–80) |
 | `justify` | bool | `false` | Justify text paragraphs in the output pane |
@@ -238,7 +238,7 @@ Many settings can be viewed or changed at runtime using slash commands:
 | `/effort <level>` | Set reasoning effort (`low`/`medium`/`high`/`on`/`off`/`none`) |
 | `/maxtokens <n>` | Set max output tokens (or `/maxtokens off`) |
 | `/seed <n>` | Set sampling seed (or `/seed off`) |
-| `/maxrounds <n>` | Set max agentic tool rounds (1–1000) |
+| `/maxrounds <n>` | Set max agentic tool rounds (default: 100) |
 | `/ctx <n>` | Set context window / `num_ctx` for Ollama models (`auto` to auto-detect, `off` to disable) |
 | `/proxy <url>` | Set HTTP proxy (`/proxy off` disables) |
 | `/log` | Toggle logging on/off |

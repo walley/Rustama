@@ -296,7 +296,7 @@ impl Default for Config {
             system_prompt_coder_file: None,
             system_prompt_assistant_file: None,
             proxy: None,
-            max_tool_rounds: 10,
+            max_tool_rounds: 100,
             max_retries: 10,
             terminal_width_pct: 40,
             justify: false,
@@ -459,7 +459,7 @@ impl Config {
              system_prompt_assistant = {}\n\n\
              # HTTP proxy URL (optional, e.g. http://proxy:8080)\n\
              # proxy = http://proxy:8080\n\n\
-             # Max agentic tool rounds per request (1-1000, default: 10)\n\
+             # Max agentic tool rounds per request (default: 100)\n\
              max_tool_rounds = {}\n\n\
              # Max API retries on 429/rate-limit errors (1-50, default: 10)\n\
              max_retries = {}\n\n\
@@ -571,7 +571,7 @@ impl Config {
         }
         if let Some(v) = values.get("max_tool_rounds")
             && let Ok(n) = v.parse::<usize>()
-            && (1..=1000).contains(&n)
+            && n > 0
         {
             cfg.max_tool_rounds = n;
         }

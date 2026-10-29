@@ -5293,7 +5293,7 @@ impl App {
         self.params
             .apply_key("num_ctx", self.settings_num_ctx.trim());
         if let Ok(v) = self.settings_max_tool_rounds.trim().parse::<usize>()
-            && (1..=1000).contains(&v)
+            && v > 0
         {
             self.max_tool_rounds = v;
         }
@@ -6170,11 +6170,11 @@ impl App {
             "log" => Some(self.slash_log()),
             "maxrounds" => Some(match arg {
                 Some(n) => match n.parse::<usize>() {
-                    Ok(v) if (1..=1000).contains(&v) => {
+                    Ok(v) if v > 0 => {
                         self.max_tool_rounds = v;
                         format!("Max tool rounds set to {}", v)
                     }
-                    Ok(_) => "Value must be between 1 and 1000".to_string(),
+                    Ok(_) => "Value must be at least 1".to_string(),
                     Err(_) => "Usage: /maxrounds <number>".to_string(),
                 },
                 None => format!(
@@ -6403,7 +6403,7 @@ impl App {
             ("/system", "Show current system prompt"),
             ("/setsystem <text>", "Set system prompt (no arg clears)"),
             ("/log", "Toggle logging on/off"),
-            ("/maxrounds <n>", "Max agentic tool rounds (default: 10)"),
+            ("/maxrounds <n>", "Max agentic tool rounds (default: 100)"),
             ("/temp <n>", "Temperature 0.0-2.0 (default: 1.0)"),
             ("/topp <n>", "Top_p 0.0-1.0 (default: 0.9)"),
             ("/topk <n>", "Top_k 1-100 (default: 40)"),
