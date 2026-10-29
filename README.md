@@ -238,7 +238,7 @@ Many settings can be viewed or changed at runtime using slash commands:
 | `/effort <level>` | Set reasoning effort (`low`/`medium`/`high`/`on`/`off`/`none`) |
 | `/maxtokens <n>` | Set max output tokens (or `/maxtokens off`) |
 | `/seed <n>` | Set sampling seed (or `/seed off`) |
-| `/maxrounds <n>` | Set max agentic tool rounds (1–100) |
+| `/maxrounds <n>` | Set max agentic tool rounds (1–1000) |
 | `/ctx <n>` | Set context window / `num_ctx` for Ollama models (`auto` to auto-detect, `off` to disable) |
 | `/proxy <url>` | Set HTTP proxy (`/proxy off` disables) |
 | `/log` | Toggle logging on/off |

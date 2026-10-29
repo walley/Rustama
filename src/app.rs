@@ -5293,7 +5293,7 @@ impl App {
         self.params
             .apply_key("num_ctx", self.settings_num_ctx.trim());
         if let Ok(v) = self.settings_max_tool_rounds.trim().parse::<usize>()
-            && (1..=100).contains(&v)
+            && (1..=1000).contains(&v)
         {
             self.max_tool_rounds = v;
         }
@@ -6170,11 +6170,11 @@ impl App {
             "log" => Some(self.slash_log()),
             "maxrounds" => Some(match arg {
                 Some(n) => match n.parse::<usize>() {
-                    Ok(v) if (1..=100).contains(&v) => {
+                    Ok(v) if (1..=1000).contains(&v) => {
                         self.max_tool_rounds = v;
                         format!("Max tool rounds set to {}", v)
                     }
-                    Ok(_) => "Value must be between 1 and 100".to_string(),
+                    Ok(_) => "Value must be between 1 and 1000".to_string(),
                     Err(_) => "Usage: /maxrounds <number>".to_string(),
                 },
                 None => format!(
