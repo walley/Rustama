@@ -1379,6 +1379,8 @@ pub struct App {
     /// with `finish_reason="stop"` right after an unfinished-looking text
     /// (see `needs_continuation`). Reset on fresh user input.
     pub auto_continue_count: u32,
+    /// Configured per-turn budget for automatic "continue" nudges.
+    pub max_auto_continues: u32,
     /// Token usage received mid-stream (via `StreamChunk::Stats`) that has not
     /// been committed to `token_stats` yet.
     last_stats: TokenStats,
@@ -1588,6 +1590,7 @@ impl App {
             pending_continuation: false,
             continuation_count: 0,
             auto_continue_count: 0,
+            max_auto_continues: cfg.max_auto_continues,
             last_stats: TokenStats::default(),
             lsp: crate::lsp::LspClient::new(),
             lsp_server: cfg.lsp_server.clone(),
@@ -2778,14 +2781,14 @@ impl App {
     /// consumed (i.e. the UI needs a redraw).
     /// Handle a stalled turn (empty response / dead stream) by auto-sending
     /// "continue", reusing the same budget as the mid-thought auto-continue
-    /// mechanism (MAX_AUTO_CONTINUES). Returns true when a retry was kicked
+    /// mechanism (`max_auto_continues`). Returns true when a retry was kicked
     /// off (the caller should `break` out of the stream loop without
     /// clearing `response_rx`/`is_loading`).
     fn maybe_auto_continue(&mut self, reason: &str) -> bool {
-        if self.auto_continue_count >= MAX_AUTO_CONTINUES {
+        if self.auto_continue_count >= self.max_auto_continues {
             self.messages.push(ChatMessage::app(format!(
                 "Auto-continue limit ({}) reached — type \"continue\" to keep going.",
-                MAX_AUTO_CONTINUES
+                self.max_auto_continues
             )));
             return false;
         }
@@ -2794,12 +2797,12 @@ impl App {
             "AUTO_CONTINUE",
             &format!(
                 "attempt {}/{} ({})",
-                self.auto_continue_count, MAX_AUTO_CONTINUES, reason
+                self.auto_continue_count, self.max_auto_continues, reason
             ),
         );
         self.messages.push(ChatMessage::app(format!(
             "{} — auto-sending \"continue\" ({}/{}).",
-            reason, self.auto_continue_count, MAX_AUTO_CONTINUES
+            reason, self.auto_continue_count, self.max_auto_continues
         )));
         self.set_auto_scroll();
         self.send_to_ollama_async_with(Some("continue".to_string()));
@@ -3053,8 +3056,8 @@ impl App {
                             // "continue" — detect the unfinished-looking text and send it
                             // automatically.
                             let unfinished = self.chat_mode.uses_tools() && needs_continuation(&text);
-                            let wants_more =
-                                unfinished && self.auto_continue_count < MAX_AUTO_CONTINUES;
+                            let wants_more = unfinished
+                                && self.auto_continue_count < self.max_auto_continues;
                             self.messages.push(ChatMessage::assistant(text));
                             self.streaming_thinking.clear();
                             self.streaming_text.clear();
@@ -3064,12 +3067,12 @@ impl App {
                                     "AUTO_CONTINUE",
                                     &format!(
                                         "attempt {}/{}",
-                                        self.auto_continue_count, MAX_AUTO_CONTINUES
+                                        self.auto_continue_count, self.max_auto_continues
                                     ),
                                 );
                                 self.messages.push(ChatMessage::app(format!(
                                     "Model stopped mid-thought — auto-sending \"continue\" ({}/{})...",
-                                    self.auto_continue_count, MAX_AUTO_CONTINUES
+                                    self.auto_continue_count, self.max_auto_continues
                                 )));
                                 self.set_auto_scroll();
                                 self.send_to_ollama_async_with(Some("continue".to_string()));
@@ -3078,7 +3081,7 @@ impl App {
                             if unfinished {
                                 self.messages.push(ChatMessage::app(format!(
                                     "Auto-continue limit ({}) reached — type \"continue\" to keep going.",
-                                    MAX_AUTO_CONTINUES
+                                    self.max_auto_continues
                                 )));
                             }
                         } else if self.maybe_auto_continue("Empty response from model") {
@@ -3717,6 +3720,7 @@ impl App {
             system_prompt_assistant_file: self.system_prompt_assistant_file.clone(),
             proxy: self.proxy.clone(),
             max_tool_rounds: self.max_tool_rounds,
+            max_auto_continues: self.max_auto_continues,
             max_retries: self.max_retries,
             terminal_width_pct: self.terminal_state.width_pct,
             justify: self.justify,
@@ -7201,25 +7205,28 @@ mod usage_tests {
     #[test]
     fn maybe_auto_continue_works_without_tools() {
         // After removing the `uses_tools()` guard, auto-continue should
-        // proceed even in plain Chat mode (no tools). Use MAX-1 to avoid
-        // tripping the limit guard (the function still spawns a background
+        // proceed even in plain Chat mode (no tools). Start one below the
+        // configured limit to avoid tripping the guard (the function still
+        // spawns a background
         // request thread, which is fine in a test — it will just fail to
         // connect and log an error).
         let mut app = test_app();
         app.chat_mode = ChatMode::Chat;
-        app.auto_continue_count = MAX_AUTO_CONTINUES - 1;
+        app.max_auto_continues = 2;
+        app.auto_continue_count = app.max_auto_continues - 1;
         assert!(app.maybe_auto_continue("Empty response from model"));
-        assert_eq!(app.auto_continue_count, MAX_AUTO_CONTINUES);
+        assert_eq!(app.auto_continue_count, app.max_auto_continues);
     }
 
     #[test]
-    fn maybe_auto_continue_respects_limit() {
+    fn maybe_auto_continue_respects_configured_limit() {
         let mut app = test_app();
-        app.auto_continue_count = MAX_AUTO_CONTINUES;
+        app.max_auto_continues = 3;
+        app.auto_continue_count = app.max_auto_continues;
         assert!(!app.maybe_auto_continue("Stream ended unexpectedly"));
         assert!(app.messages.iter().any(|m| matches!(
             m,
-            ChatMessage::App { text, .. } if text.contains("Auto-continue limit")
+            ChatMessage::App { text, .. } if text.contains("Auto-continue limit (3)")
         )));
     }
 
@@ -8211,12 +8218,6 @@ async fn send_with_retry(
     }
     SendOutcome::Error(last_err.unwrap())
 }
-
-/// Upper bound on automatic "continue" nudges per user turn (see
-/// [`needs_continuation`]). Bounds token waste when the model keeps
-/// stopping without making progress; the user can always type "continue"
-/// by hand to reset the budget.
-const MAX_AUTO_CONTINUES: u32 = 10;
 
 /// Heuristic: does this assistant text look like the model stopped right
 /// before the tool call it announced?
@@ -9317,6 +9318,7 @@ fn build_chat_body(
         }
         if let Some(tools) = tools_for_mode(mode) {
             body["tools"] = serde_json::json!(tools);
+            body["tool_choice"] = serde_json::json!("auto");
         }
         body["temperature"] = serde_json::json!(params.temperature);
         body["top_p"] = serde_json::json!(params.top_p);
@@ -9744,6 +9746,16 @@ mod chat_body_tests {
         assert!(body.get("options").is_none());
         assert!(body.get("think").is_none());
         assert!(body["tools"].is_array());
+        assert_eq!(body["tool_choice"], "auto");
+    }
+
+    #[test]
+    fn cloud_body_omits_tool_choice_without_tools() {
+        let cloud = cloud();
+        let params = ModelParams::default();
+        let body = build_chat_body("test-cloud", Some(&cloud), ChatMode::Chat, &msgs(), &params);
+        assert!(body.get("tools").is_none());
+        assert!(body.get("tool_choice").is_none());
     }
 
     #[test]

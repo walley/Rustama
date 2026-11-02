@@ -28,6 +28,8 @@ pub struct Config {
     pub system_prompt_assistant_file: Option<String>,
     pub proxy: Option<String>,
     pub max_tool_rounds: usize,
+    /// Automatic "continue" nudges allowed per user turn; 0 disables them.
+    pub max_auto_continues: u32,
     pub max_retries: u32,
     pub terminal_width_pct: u16,
     pub justify: bool,
@@ -297,6 +299,7 @@ impl Default for Config {
             system_prompt_assistant_file: None,
             proxy: None,
             max_tool_rounds: 100,
+            max_auto_continues: 10,
             max_retries: 10,
             terminal_width_pct: 40,
             justify: false,
@@ -346,6 +349,10 @@ impl Config {
                         },
                     ),
                     ("logfile".to_string(), dflt.logfile.clone()),
+                    (
+                        "max_auto_continues".to_string(),
+                        dflt.max_auto_continues.to_string(),
+                    ),
                     ("mode".to_string(), dflt.mode.clone()),
                     (
                         "system_prompt_coder".to_string(),
@@ -461,6 +468,8 @@ impl Config {
              # proxy = http://proxy:8080\n\n\
              # Max agentic tool rounds per request (default: 100)\n\
              max_tool_rounds = {}\n\n\
+             # Max automatic continue nudges per user turn (0 disables, default: 10)\n\
+             max_auto_continues = {}\n\n\
              # Max API retries on 429/rate-limit errors (1-50, default: 10)\n\
              max_retries = {}\n\n\
              # Justify paragraphs in output (true/false, default: false)\n\
@@ -496,6 +505,7 @@ impl Config {
             coder_prompt,
             assistant_prompt,
             self.max_tool_rounds,
+            self.max_auto_continues,
             self.max_retries,
             self.justify,
             if self.hintbar { "on" } else { "off" },
@@ -574,6 +584,11 @@ impl Config {
             && n > 0
         {
             cfg.max_tool_rounds = n;
+        }
+        if let Some(v) = values.get("max_auto_continues")
+            && let Ok(n) = v.parse::<u32>()
+        {
+            cfg.max_auto_continues = n;
         }
         if let Some(v) = values.get("max_retries")
             && let Ok(n) = v.parse::<u32>()
@@ -749,6 +764,7 @@ impl Config {
             lines.push("# proxy = off".to_string());
         }
         lines.push(format!("max_tool_rounds = {}", self.max_tool_rounds));
+        lines.push(format!("max_auto_continues = {}", self.max_auto_continues));
         lines.push(format!("max_retries = {}", self.max_retries));
         lines.push(format!("terminal_width_pct = {}", self.terminal_width_pct));
         lines.push(format!("justify = {}", self.justify));
@@ -1347,6 +1363,18 @@ mod tests {
         assert_eq!(back.lsp_server, cfg.lsp_server);
         assert_eq!(back.lsp_workspace, cfg.lsp_workspace);
         assert_eq!(back.lsp_auto_diagnostics, cfg.lsp_auto_diagnostics);
+    }
+
+    #[test]
+    fn auto_continue_limit_parses_and_roundtrips() {
+        assert_eq!(Config::parse("model = x\n").max_auto_continues, 10);
+        assert_eq!(Config::parse("max_auto_continues = 37\n").max_auto_continues, 37);
+        assert_eq!(Config::parse("max_auto_continues = 0\n").max_auto_continues, 0);
+
+        let mut cfg = Config::default();
+        cfg.max_auto_continues = 23;
+        let back = Config::parse(&cfg.default_conf());
+        assert_eq!(back.max_auto_continues, 23);
     }
 
     #[test]

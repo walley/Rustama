@@ -92,6 +92,9 @@ system_prompt = You are a coding assistant with access to tools.
 # Max agentic tool rounds per request (default: 100)
 max_tool_rounds = 100
 
+# Max automatic "continue" nudges per user turn (0 disables, default: 10)
+max_auto_continues = 10
+
 # Max API retries on 429/rate-limit errors (1–50, default: 10)
 max_retries = 10
 
@@ -132,6 +135,7 @@ lsp_auto_diagnostics = true
 | `system_prompt` | string | (coding assistant prompt) | System prompt sent with every conversation |
 | `proxy` | string | _(none)_ | HTTP proxy URL; set to `off`, `none`, or `false` to disable |
 | `max_tool_rounds` | integer | `100` | Maximum agentic tool call rounds per request |
+| `max_auto_continues` | integer | `10` | Maximum automatic `continue` nudges per user turn (`0` disables) |
 | `max_retries` | integer | `10` | Maximum API retries on rate-limit errors (1–50) |
 | `terminal_width_pct` | integer | `40` | Percentage of terminal width for the output panel (20–80) |
 | `justify` | bool | `false` | Justify text paragraphs in the output pane |
