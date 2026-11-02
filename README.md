@@ -49,11 +49,13 @@ cargo run --release
 
 Rustama uses INI-style configuration files stored in `~/.config/rustama/`. On first run, default configuration files are created automatically.
 
+Ready-to-copy examples of every file live in [`config.example/`](config.example/) — they contain placeholder data only (no real keys). Copy them into the config directory and fill in your own values, or let Rustama generate the defaults and edit them in place.
+
 | File | Purpose |
 |------|---------|
 | `rustama.conf` | Main application settings |
-| `model_params.conf` | Per-model sampling parameters for Ollama models |
-| `cloud_models.conf` | Cloud model definitions + their parameters |
+| `models_ollama.conf` | Per-model sampling parameters for Ollama models (renamed from `model_params.conf`) |
+| `models_cloud.conf` | Cloud model definitions + their parameters (renamed from `cloud_models.conf`) |
 
 Session files live separately in `$DOCUMENTS/rustama/` (see [Session Files](#session-files)).
 
@@ -119,7 +121,7 @@ lsp_workspace =
 lsp_auto_diagnostics = true
 ```
 
-> **Note:** Sampling parameters (`temperature`, `top_p`, `top_k`, etc.) are **per-model** now — see `model_params.conf` and `cloud_models.conf` below. Legacy global values left in `rustama.conf` are migrated into the `[default]` section of `model_params.conf` automatically.
+> **Note:** Sampling parameters (`temperature`, `top_p`, `top_k`, etc.) are **per-model** now — see `models_ollama.conf` and `models_cloud.conf` below. Legacy global values left in `rustama.conf` are migrated into the `[default]` section of `models_ollama.conf` automatically.
 
 #### Configuration Options Reference
 
@@ -146,7 +148,7 @@ lsp_auto_diagnostics = true
 
 Boolean values accept: `true`, `yes`, `on`, `1` (and `false`, `no`, `off` for false).
 
-### Per-Model Parameters: `~/.config/rustama/model_params.conf`
+### Per-Model Parameters: `~/.config/rustama/models_ollama.conf`
 
 Sampling/generation parameters for Ollama models. The `[default]` section applies to every model; a named section starts from those defaults and overrides what it sets.
 
@@ -181,18 +183,28 @@ max_output_tokens = 8192
 | `presence_penalty` | float | `0.0` | Presence penalty (−2.0–2.0) |
 | `max_output_tokens` | integer | _(provider default)_ | Max output tokens; `off`/`none` to unset |
 | `reasoning_effort` | string | _(unset)_ | `low`, `medium`, `high`, or `on`/`off` to toggle thinking |
+| `tool_choice` | string | `auto` | Cloud only: `auto`, `none`, or `required` |
 | `seed` | integer | _(unset)_ | Sampling seed; `off`/`none` to unset |
 
 Keys not recognized by a given backend are simply not sent.
 
-### Cloud Models Configuration: `~/.config/rustama/cloud_models.conf`
+### Cloud Models Configuration: `~/.config/rustama/models_cloud.conf`
 
-Define cloud-hosted models (OpenAI-compatible APIs) in a separate configuration file. Each model gets its own `[section]`, and supports the same model parameter keys listed above. Parameters not set in a section fall back to the `[default]` section of `model_params.conf` (except `max_output_tokens`, which defaults to `16384` for cloud models).
+Define cloud-hosted models (OpenAI-compatible APIs) in a separate configuration file. Each model gets its own `[section]`. The optional `[default]` section applies to every cloud model; parameters not set in a model section fall back to it, then to the `[default]` section of `models_ollama.conf` (except `max_output_tokens`, which defaults to `16384` for cloud models).
 
 ```ini
 # Cloud models configuration
 # Required fields per section: api_url, api_key
 # Optional: api_model, plus any model parameter key
+
+[default]
+tool_choice = auto
+reasoning_effort = high
+temperature = 1
+top_p = 0.9
+top_k = 40
+frequency_penalty = 0
+presence_penalty = 0
 
 [mistral-small]
 api_url = https://api.mistral.ai/v1/chat/completions
@@ -215,7 +227,9 @@ reasoning_effort = high
 | `api_key` | yes | — | API authentication key (sections with `YOUR_...` placeholders are ignored) |
 | `api_model` | no | section name | Actual model name sent to the API |
 | `max_output_tokens` | no | `16384` | Maximum output tokens per response |
-| _(any model parameter key)_ | no | `[default]` section | Per-model overrides (temperature, penalties, seed, effort, …) |
+| `tool_choice` | no | `auto` | How tools are selected: `auto`, `none`, or `required` (cloud only) |
+| `reasoning_effort` | no | `high` | Reasoning level: `low`, `medium`, or `high` (cloud only) |
+| _(any other model parameter key)_ | no | `[default]` section | Per-model overrides (temperature, penalties, seed, …) |
 
 Cloud models appear in the model picker alongside local Ollama models. Use `/model` or `/list` to browse and switch between them.
 
@@ -256,7 +270,7 @@ Many settings can be viewed or changed at runtime using slash commands:
 | `/usage` | Session token usage and cost estimate |
 | `/quit` | Exit Rustama (aliases: `/q`, `/exit`) |
 
-Parameter changes made at runtime apply to the currently selected model and are persisted to its section in `model_params.conf` / `cloud_models.conf`.
+Parameter changes made at runtime apply to the currently selected model and are persisted to its section in `models_ollama.conf` / `models_cloud.conf`.
 
 ### Menu Bar & Settings Dialog
 

@@ -1,6 +1,13 @@
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+/// Ollama per-model parameter file (renamed from `model_params.conf`).
+pub const OLLAMA_MODELS_FILE: &str = "models_ollama.conf";
+/// Cloud model definitions file (renamed from `cloud_models.conf`).
+pub const CLOUD_MODELS_FILE: &str = "models_cloud.conf";
+const LEGACY_OLLAMA_MODELS_FILE: &str = "model_params.conf";
+const LEGACY_CLOUD_MODELS_FILE: &str = "cloud_models.conf";
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -55,8 +62,8 @@ pub struct Config {
 /// Per-model sampling / generation parameters.
 ///
 /// Used both for cloud models (parsed from the model's section in
-/// `cloud_models.conf`) and for Ollama models (parsed from the model's
-/// section in `model_params.conf`, falling back to that file's `[default]`
+/// `models_cloud.conf`) and for Ollama models (parsed from the model's
+/// section in `models_ollama.conf`, falling back to that file's `[default]`
 /// section). Values not recognized by a given backend are simply not sent.
 #[derive(Debug, Clone)]
 pub struct ModelParams {
@@ -71,6 +78,9 @@ pub struct ModelParams {
     /// Cloud: sent as `reasoning_effort` (levels only). Ollama: maps to the
     /// top-level `think` field (bool or level string).
     pub reasoning_effort: Option<String>,
+    /// Cloud only: `auto`, `none`, or `required`, sent as `tool_choice`.
+    /// `None` falls back to `auto` when tools are attached.
+    pub tool_choice: Option<String>,
     pub seed: Option<u32>,
     /// Ollama only: context window in tokens, sent as `options.num_ctx`.
     /// Overrides Ollama's default context window (2048) which silently
@@ -89,6 +99,7 @@ impl Default for ModelParams {
             presence_penalty: 0.0,
             max_output_tokens: None,
             reasoning_effort: None,
+            tool_choice: None,
             seed: None,
             num_ctx: None,
         }
@@ -156,6 +167,14 @@ impl ModelParams {
                     self.reasoning_effort = Some(v);
                 }
             }
+            "tool_choice" => {
+                let v = value.trim().to_lowercase();
+                if v.is_empty() {
+                    self.tool_choice = None;
+                } else if matches!(v.as_str(), "auto" | "none" | "required") {
+                    self.tool_choice = Some(v);
+                }
+            }
             "seed" => {
                 let v = value.trim();
                 if v.is_empty() || v.eq_ignore_ascii_case("off") || v.eq_ignore_ascii_case("none") {
@@ -199,6 +218,9 @@ impl ModelParams {
         }
         if let Some(ref e) = self.reasoning_effort {
             out.push(("reasoning_effort".to_string(), e.clone()));
+        }
+        if let Some(ref choice) = self.tool_choice {
+            out.push(("tool_choice".to_string(), choice.clone()));
         }
         if let Some(n) = self.seed {
             out.push(("seed".to_string(), n.to_string()));
@@ -493,7 +515,7 @@ impl Config {
              # NOTE: model parameters (temperature, top_p, top_k,\n\
              # frequency_penalty, presence_penalty, max_output_tokens,\n\
              # reasoning_effort, seed) are per-model now — see\n\
-             # model_params.conf (Ollama models) and cloud_models.conf.\n",
+             # models_ollama.conf (Ollama models) and models_cloud.conf.\n",
             self.ollama_url,
             self.model,
             self.save_path,
@@ -787,7 +809,7 @@ impl Config {
 }
 
 /// Loads cloud models, using `base` (typically the `[default]` section of
-/// `model_params.conf`) as the fallback for parameters a cloud section does
+/// `models_ollama.conf`) as the fallback for parameters a cloud section does
 /// not set itself — so a global default like `top_p` applies to cloud
 /// models too.
 pub fn load_cloud_models_with_base(base: &ModelParams) -> Vec<CloudModel> {
@@ -795,7 +817,8 @@ pub fn load_cloud_models_with_base(base: &ModelParams) -> Vec<CloudModel> {
         Some(d) => d,
         None => return Vec::new(),
     };
-    let conf_path = dir.join("cloud_models.conf");
+    migrate_legacy_conf(&dir, LEGACY_CLOUD_MODELS_FILE, CLOUD_MODELS_FILE);
+    let conf_path = dir.join(CLOUD_MODELS_FILE);
 
     if !conf_path.exists() {
         let _ = fs::create_dir_all(&dir);
@@ -807,32 +830,182 @@ pub fn load_cloud_models_with_base(base: &ModelParams) -> Vec<CloudModel> {
         Ok(c) => c,
         Err(_) => return Vec::new(),
     };
+    // Existing configs predate the [default] section; add it once so new
+    // cloud-level defaults actually take effect.
+    let original = content.clone();
+    let content = ensure_cloud_default_section(content);
+    if content != original {
+        let _ = fs::write(&conf_path, &content);
+    }
 
     parse_cloud_models(&content, base)
 }
 
+const CLOUD_DEFAULT_TOOL_CHOICE: &str = "auto";
+const CLOUD_DEFAULT_REASONING_EFFORT: &str = "high";
+
+/// Entries shipped in the models_cloud.conf `[default]` section. Sampling
+/// defaults mirror [`ModelParams::default`] so the generated file documents
+/// the effective values instead of inheriting them invisibly.
+fn cloud_default_entries() -> Vec<(&'static str, String)> {
+    let params = ModelParams::default();
+    vec![
+        ("tool_choice", CLOUD_DEFAULT_TOOL_CHOICE.to_string()),
+        (
+            "reasoning_effort",
+            CLOUD_DEFAULT_REASONING_EFFORT.to_string(),
+        ),
+        ("temperature", params.temperature.to_string()),
+        ("top_p", params.top_p.to_string()),
+        ("top_k", params.top_k.to_string()),
+        ("frequency_penalty", params.frequency_penalty.to_string()),
+        ("presence_penalty", params.presence_penalty.to_string()),
+    ]
+}
+
 fn default_cloud_conf() -> String {
-    "# Cloud models configuration\n\
-     # Each model has its own section [model_name]\n\
-     # Required fields: api_url, api_key\n\
-     # Optional: api_model (actual model name sent to API, defaults to section name)\n\
-     # Optional: max_output_tokens (default: 16384)\n\
-     # Optional model parameters: temperature (1.0), top_p (0.9), top_k (40),\n\
-     #   frequency_penalty (0.0), presence_penalty (0.0),\n\
-     #   reasoning_effort (low/medium/high/on/off), seed\n\
-     # Optional pricing in USD per 1M tokens (enables cost estimate):\n\
-     #   price_input, price_output, price_cached_read, price_cache_write\n\
-     \n\
-     [mistral-small]\n\
-     api_url = https://api.mistral.ai/v1/chat/completions\n\
-     api_key = YOUR_MISTRAL_API_KEY\n\
-     \n\
-     [kimi-k3]\n\
-     api_url = https://api.moonshot.ai/v1/chat/completions\n\
-     api_key = YOUR_MOONSHOT_API_KEY\n\
-     \n\
-     "
-    .to_string()
+    let mut out = String::from(
+        "# Cloud models configuration\n\
+         # Each model has its own section [model_name]\n\
+         # Required fields: api_url, api_key\n\
+         # Optional: api_model (actual model name sent to API, defaults to section name)\n\
+         # Optional: max_output_tokens (default: 16384), seed\n\
+         # Optional pricing in USD per 1M tokens (enables cost estimate):\n\
+         #   price_input, price_output, price_cached_read, price_cache_write\n\
+         \n\
+         # [default] applies to every cloud model; named sections override it.\n\
+         # tool_choice: auto, none, or required\n\
+         # reasoning_effort: low, medium, high, or on/off\n\
+         [default]\n",
+    );
+    for (key, value) in cloud_default_entries() {
+        out.push_str(&format!("{} = {}\n", key, value));
+    }
+    out.push_str(
+        "\n\
+         [mistral-small]\n\
+         api_url = https://api.mistral.ai/v1/chat/completions\n\
+         api_key = YOUR_MISTRAL_API_KEY\n\
+         \n\
+         [kimi-k3]\n\
+         api_url = https://api.moonshot.ai/v1/chat/completions\n\
+         api_key = YOUR_MOONSHOT_API_KEY\n\
+         \n\
+         ",
+    );
+    out
+}
+
+/// `[section]`'s defined keys, lowercased (header matched case-insensitively).
+fn section_keys(content: &str, section: &str) -> Vec<String> {
+    let mut keys = Vec::new();
+    let mut inside = false;
+    for line in content.lines() {
+        let line = line.trim();
+        if let Some(inner) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+            if inside {
+                break;
+            }
+            inside = inner.trim().eq_ignore_ascii_case(section);
+            continue;
+        }
+        if inside
+            && !line.is_empty()
+            && !line.starts_with('#')
+            && !line.starts_with(';')
+            && let Some((key, _)) = line.split_once('=')
+        {
+            keys.push(key.trim().to_lowercase());
+        }
+    }
+    keys
+}
+
+/// Adds the cloud-wide `[default]` section when an older config lacks it, and
+/// backfills any missing default keys into an existing one. Values the user
+/// already set are never overwritten.
+fn ensure_cloud_default_section(content: String) -> String {
+    let entries = cloud_default_entries();
+    if let Some(section) = find_section_name(&content, "default") {
+        let defined = section_keys(&content, &section);
+        let missing: Vec<(String, String)> = entries
+            .into_iter()
+            .filter(|(key, _)| !defined.iter().any(|k| k == key))
+            .map(|(key, value)| (key.to_string(), value))
+            .collect();
+        if missing.is_empty() {
+            return content;
+        }
+        return append_section_entries(&content, &section, &missing);
+    }
+    let mut out = String::from(
+        "# [default] applies to every cloud model; named sections override it.\n\
+         [default]\n",
+    );
+    for (key, value) in entries {
+        out.push_str(&format!("{} = {}\n", key, value));
+    }
+    out.push('\n');
+    out.push_str(&content);
+    out
+}
+
+/// First section header matching `name` (case-insensitive), original spelling.
+fn find_section_name(content: &str, name: &str) -> Option<String> {
+    for line in content.lines() {
+        let line = line.trim();
+        if let Some(inner) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+            let inner = inner.trim();
+            if inner.eq_ignore_ascii_case(name) {
+                return Some(inner.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Inserts `entries` after the last `key = value` line of `section`, keeping
+/// the block grouped instead of landing after any trailing comments. Falls
+/// back to directly after the header for an empty section.
+fn append_section_entries(content: &str, section: &str, entries: &[(String, String)]) -> String {
+    let mut lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
+    let mut inside = false;
+    let mut anchor: Option<usize> = None;
+
+    for (i, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        if let Some(inner) = trimmed.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+            if inside {
+                break;
+            }
+            inside = inner.trim().eq_ignore_ascii_case(section);
+            if inside {
+                anchor = Some(i);
+            }
+            continue;
+        }
+        if inside
+            && !trimmed.is_empty()
+            && !trimmed.starts_with('#')
+            && !trimmed.starts_with(';')
+            && trimmed.contains('=')
+        {
+            anchor = Some(i);
+        }
+    }
+
+    let Some(at) = anchor else {
+        return content.to_string();
+    };
+    let tail = lines.split_off(at + 1);
+    lines.extend(entries.iter().map(|(k, v)| format!("{} = {}", k, v)));
+    lines.extend(tail);
+
+    let mut out = lines.join("\n");
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out
 }
 
 /// A key left at its shipped placeholder (`YOUR_...`) counts as "not configured".
@@ -946,14 +1119,72 @@ fn cloud_params_default(base: &ModelParams) -> ModelParams {
     }
 }
 
+fn apply_cloud_setting(
+    key: &str,
+    value: &str,
+    params: &mut ModelParams,
+    pricing: &mut ModelPricing,
+) {
+    match key {
+        "price_input" | "input_price" => {
+            pricing.input_per_mtok = value.parse().ok();
+        }
+        "price_output" | "output_price" => {
+            pricing.output_per_mtok = value.parse().ok();
+        }
+        "price_cached_read" | "cached_read_price" | "price_cached" => {
+            pricing.cached_read_per_mtok = value.parse().ok();
+        }
+        "price_cache_write" | "cache_write_price" => {
+            pricing.cache_write_per_mtok = value.parse().ok();
+        }
+        _ => {
+            params.apply_key(key, value);
+        }
+    }
+}
+
+/// Parses the models_cloud.conf `[default]` section (model params + pricing)
+/// that every named cloud model inherits.
+fn parse_cloud_defaults(content: &str, base: &ModelParams) -> (ModelParams, ModelPricing) {
+    let mut params = cloud_params_default(base);
+    let mut pricing = ModelPricing::default();
+    let mut in_default = false;
+
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with(';') || line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with('[') && line.ends_with(']') {
+            in_default = line[1..line.len() - 1]
+                .trim()
+                .eq_ignore_ascii_case("default");
+            continue;
+        }
+        if in_default
+            && let Some((key, value)) = line.split_once('=')
+        {
+            apply_cloud_setting(
+                &key.trim().to_lowercase(),
+                value.trim(),
+                &mut params,
+                &mut pricing,
+            );
+        }
+    }
+    (params, pricing)
+}
+
 fn parse_cloud_models(content: &str, base: &ModelParams) -> Vec<CloudModel> {
     let mut models = Vec::new();
+    let (default_params, default_pricing) = parse_cloud_defaults(content, base);
     let mut current_name: Option<String> = None;
     let mut current_url = String::new();
     let mut current_key = String::new();
     let mut current_api_model = String::new();
-    let mut current_params = cloud_params_default(base);
-    let mut current_pricing = ModelPricing::default();
+    let mut current_params = default_params.clone();
+    let mut current_pricing = default_pricing.clone();
 
     for line in content.lines() {
         let line = line.trim();
@@ -963,6 +1194,7 @@ fn parse_cloud_models(content: &str, base: &ModelParams) -> Vec<CloudModel> {
 
         if line.starts_with('[') && line.ends_with(']') {
             if let Some(name) = current_name.take()
+                && !name.eq_ignore_ascii_case("default")
                 && !current_url.is_empty()
                 && !current_key.is_empty()
                 && !is_placeholder_key(&current_key)
@@ -985,8 +1217,8 @@ fn parse_cloud_models(content: &str, base: &ModelParams) -> Vec<CloudModel> {
             current_url.clear();
             current_key.clear();
             current_api_model.clear();
-            current_params = cloud_params_default(base);
-            current_pricing = ModelPricing::default();
+            current_params = default_params.clone();
+            current_pricing = default_pricing.clone();
         } else if let Some((key, value)) = line.split_once('=') {
             let key = key.trim().to_lowercase();
             let value = value.trim().to_string();
@@ -994,26 +1226,13 @@ fn parse_cloud_models(content: &str, base: &ModelParams) -> Vec<CloudModel> {
                 "api_url" => current_url = value,
                 "api_key" => current_key = value,
                 "api_model" => current_api_model = value,
-                "price_input" | "input_price" => {
-                    current_pricing.input_per_mtok = value.parse().ok();
-                }
-                "price_output" | "output_price" => {
-                    current_pricing.output_per_mtok = value.parse().ok();
-                }
-                "price_cached_read" | "cached_read_price" | "price_cached" => {
-                    current_pricing.cached_read_per_mtok = value.parse().ok();
-                }
-                "price_cache_write" | "cache_write_price" => {
-                    current_pricing.cache_write_per_mtok = value.parse().ok();
-                }
-                _ => {
-                    current_params.apply_key(&key, &value);
-                }
+                _ => apply_cloud_setting(&key, &value, &mut current_params, &mut current_pricing),
             }
         }
     }
 
     if let Some(name) = current_name
+        && !name.eq_ignore_ascii_case("default")
         && !current_url.is_empty()
         && !current_key.is_empty()
         && !is_placeholder_key(&current_key)
@@ -1036,7 +1255,7 @@ fn parse_cloud_models(content: &str, base: &ModelParams) -> Vec<CloudModel> {
     models
 }
 
-/// Per-model parameters for Ollama models, loaded from `model_params.conf`.
+/// Per-model parameters for Ollama models, loaded from `models_ollama.conf`.
 ///
 /// The optional `[default]` section provides the base for every model; a
 /// named section starts from those defaults and overrides what it sets.
@@ -1062,7 +1281,8 @@ pub fn load_model_params() -> ModelParamsStore {
             per_model: HashMap::new(),
         };
     };
-    let conf_path = dir.join("model_params.conf");
+    migrate_legacy_conf(&dir, LEGACY_OLLAMA_MODELS_FILE, OLLAMA_MODELS_FILE);
+    let conf_path = dir.join(OLLAMA_MODELS_FILE);
 
     if !conf_path.exists() {
         let _ = fs::create_dir_all(&dir);
@@ -1080,7 +1300,7 @@ pub fn load_model_params() -> ModelParamsStore {
     }
 }
 
-/// Builds the initial `model_params.conf`. Legacy global sampling keys
+/// Builds the initial `models_ollama.conf`. Legacy global sampling keys
 /// (temperature/top_p/top_k) left over in `rustama.conf` are migrated into
 /// the `[default]` section so existing users keep their settings.
 fn default_model_params_conf() -> String {
@@ -1150,16 +1370,18 @@ fn parse_model_params(content: &str) -> ModelParamsStore {
     ModelParamsStore { default, per_model }
 }
 
-/// Persists `params` into the section for `model` — in `cloud_models.conf`
-/// for cloud models, otherwise in `model_params.conf`.
+/// Persists `params` into the section for `model` — in `models_cloud.conf`
+/// for cloud models, otherwise in `models_ollama.conf`.
 pub fn save_model_params(model: &str, params: &ModelParams, is_cloud: bool) -> Result<(), String> {
     let dir = conf_dir().ok_or("Cannot determine config directory")?;
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let path = dir.join(if is_cloud {
-        "cloud_models.conf"
+    let (file, legacy) = if is_cloud {
+        (CLOUD_MODELS_FILE, LEGACY_CLOUD_MODELS_FILE)
     } else {
-        "model_params.conf"
-    });
+        (OLLAMA_MODELS_FILE, LEGACY_OLLAMA_MODELS_FILE)
+    };
+    migrate_legacy_conf(&dir, legacy, file);
+    let path = dir.join(file);
     let content = fs::read_to_string(&path).unwrap_or_else(|_| {
         if is_cloud {
             default_cloud_conf()
@@ -1245,6 +1467,19 @@ fn update_ini_section(content: &str, section: &str, entries: &[(String, String)]
         out.push('\n');
     }
     out
+}
+
+/// Renames a config file from its pre-rename name on first load. The new
+/// file always wins when both exist, so a stale legacy file is ignored.
+fn migrate_legacy_conf(dir: &Path, legacy: &str, current: &str) {
+    let old_path = dir.join(legacy);
+    let new_path = dir.join(current);
+    if new_path.exists() || !old_path.exists() {
+        return;
+    }
+    if fs::rename(&old_path, &new_path).is_err() {
+        let _ = fs::copy(&old_path, &new_path);
+    }
 }
 
 pub fn conf_dir() -> Option<PathBuf> {
@@ -1459,8 +1694,128 @@ mod tests {
     }
 
     #[test]
+    fn cloud_default_section_applies_to_every_model() {
+        let conf = "[default]\n\
+                    tool_choice = auto\n\
+                    reasoning_effort = high\n\
+                    temperature = 0.7\n\
+                    price_input = 2.5\n\
+                    \n\
+                    [a]\napi_url = https://x\napi_key = sk-real\n\
+                    \n\
+                    [b]\napi_url = https://y\napi_key = sk-real\n\
+                    reasoning_effort = low\n\
+                    tool_choice = required\n";
+        let models = parse_cloud_models(conf, &ModelParams::default());
+        assert_eq!(models.len(), 2); // [default] is not a model
+        assert_eq!(models[0].params.tool_choice.as_deref(), Some("auto"));
+        assert_eq!(models[0].params.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(models[0].params.temperature, 0.7);
+        assert_eq!(models[0].pricing.input_per_mtok, Some(2.5));
+        assert_eq!(models[1].params.tool_choice.as_deref(), Some("required"));
+        assert_eq!(models[1].params.reasoning_effort.as_deref(), Some("low"));
+    }
+
+    #[test]
+    fn shipped_cloud_defaults_include_tool_choice_and_reasoning() {
+        let (params, _) = parse_cloud_defaults(&default_cloud_conf(), &ModelParams::default());
+        assert_eq!(params.tool_choice.as_deref(), Some("auto"));
+        assert_eq!(params.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(params.temperature, 1.0);
+        assert_eq!(params.top_p, 0.9);
+        assert_eq!(params.top_k, 40);
+        assert_eq!(params.frequency_penalty, 0.0);
+        assert_eq!(params.presence_penalty, 0.0);
+    }
+
+    #[test]
+    fn missing_cloud_default_section_is_backfilled_once() {
+        let old = "[m]\napi_url = https://x\napi_key = sk-real\n";
+        let updated = ensure_cloud_default_section(old.to_string());
+        assert!(updated.contains("[default]\n"));
+        let models = parse_cloud_models(&updated, &ModelParams::default());
+        assert_eq!(models[0].params.tool_choice.as_deref(), Some("auto"));
+        assert_eq!(models[0].params.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(models[0].params.temperature, 1.0);
+        assert_eq!(models[0].params.top_p, 0.9);
+        // Idempotent.
+        assert_eq!(ensure_cloud_default_section(updated.clone()), updated);
+
+        // Backfills missing keys but never overwrites existing ones.
+        let partial =
+            "[default]\ntool_choice = none\n[m]\napi_url = https://x\napi_key = sk-real\n";
+        let filled = ensure_cloud_default_section(partial.to_string());
+        // Keys join the existing block, right below the last key line.
+        assert!(filled.starts_with(
+            "[default]\ntool_choice = none\nreasoning_effort = high\ntemperature = 1\n"
+        ));
+        let models = parse_cloud_models(&filled, &ModelParams::default());
+        assert_eq!(models[0].params.tool_choice.as_deref(), Some("none"));
+        assert_eq!(models[0].params.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(models[0].params.temperature, 1.0);
+        assert_eq!(models[0].params.top_p, 0.9);
+    }
+
+    #[test]
+    fn legacy_conf_files_are_renamed_on_load() {
+        let dir = std::env::temp_dir().join(format!("rustama-conf-migrate-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(LEGACY_OLLAMA_MODELS_FILE), "x = 1\n").unwrap();
+        fs::write(dir.join(LEGACY_CLOUD_MODELS_FILE), "y = 2\n").unwrap();
+
+        migrate_legacy_conf(&dir, LEGACY_OLLAMA_MODELS_FILE, OLLAMA_MODELS_FILE);
+        migrate_legacy_conf(&dir, LEGACY_CLOUD_MODELS_FILE, CLOUD_MODELS_FILE);
+
+        assert!(!dir.join(LEGACY_OLLAMA_MODELS_FILE).exists());
+        assert!(!dir.join(LEGACY_CLOUD_MODELS_FILE).exists());
+        assert_eq!(
+            fs::read_to_string(dir.join(OLLAMA_MODELS_FILE)).unwrap(),
+            "x = 1\n"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.join(CLOUD_MODELS_FILE)).unwrap(),
+            "y = 2\n"
+        );
+
+        // The renamed file wins: a stale legacy file is left untouched.
+        fs::write(dir.join(LEGACY_OLLAMA_MODELS_FILE), "stale = 1\n").unwrap();
+        migrate_legacy_conf(&dir, LEGACY_OLLAMA_MODELS_FILE, OLLAMA_MODELS_FILE);
+        assert_eq!(
+            fs::read_to_string(dir.join(OLLAMA_MODELS_FILE)).unwrap(),
+            "x = 1\n"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn example_config_files_parse() {
+        let main = Config::parse(include_str!("../config.example/rustama.conf"));
+        assert_eq!(main.mode, "coder");
+        assert_eq!(main.max_auto_continues, 10);
+        assert_eq!(main.max_tool_rounds, 100);
+        assert_eq!(main.terminal_width_pct, 40);
+        assert!(!main.lsp);
+        assert!(!main.hintbar);
+
+        let cloud = include_str!("../config.example/models_cloud.conf");
+        // Placeholder keys (YOUR_...) mean no model is registered yet.
+        assert!(parse_cloud_models(cloud, &ModelParams::default()).is_empty());
+        let (defaults, _) = parse_cloud_defaults(cloud, &ModelParams::default());
+        assert_eq!(defaults.tool_choice.as_deref(), Some("auto"));
+        assert_eq!(defaults.top_p, 0.9);
+
+        let ollama = include_str!("../config.example/models_ollama.conf");
+        let store = parse_model_params(ollama);
+        assert_eq!(store.default.top_k, 40);
+        assert_eq!(store.params_for("llama3.2:3b").temperature, 0.7);
+        assert_eq!(store.params_for("qwen3:8b").num_ctx, Some(32768));
+    }
+
+    #[test]
     fn cloud_sections_inherit_default_base() {
-        // The [default] section of model_params.conf is the fallback for
+        // The [default] section of models_ollama.conf is the fallback for
         // cloud models too; section keys still win; max_output_tokens keeps
         // its own cloud default.
         let mut base = ModelParams::default();
@@ -1509,6 +1864,10 @@ mod tests {
         assert_eq!(p.reasoning_effort.as_deref(), Some("high"));
         assert!(p.apply_key("reasoning_effort", "bogus")); // ignored
         assert_eq!(p.reasoning_effort.as_deref(), Some("high"));
+        assert!(p.apply_key("tool_choice", "REQUIRED"));
+        assert_eq!(p.tool_choice.as_deref(), Some("required"));
+        assert!(p.apply_key("tool_choice", "bogus")); // ignored
+        assert_eq!(p.tool_choice.as_deref(), Some("required"));
         assert!(p.apply_key("max_output_tokens", "off"));
         assert_eq!(p.max_output_tokens, None);
         assert!(!p.apply_key("not_a_param", "1"));

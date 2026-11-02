@@ -1287,7 +1287,7 @@ pub struct App {
     pub tool_call_log: Vec<(String, String, String)>,
     /// Effective generation parameters for the currently selected model.
     pub params: ModelParams,
-    /// Per-model parameters for Ollama models (from `model_params.conf`).
+    /// Per-model parameters for Ollama models (from `models_ollama.conf`).
     pub model_params_store: ModelParamsStore,
     pub show_save_dialog: bool,
     pub save_dialog_path: String,
@@ -2867,7 +2867,7 @@ impl App {
                         self.pending_tool_calls.clear();
                         // Push visible warning — Done handler will set_auto_scroll
                         self.messages.push(ChatMessage::app(format!(
-                            "⚠ {} Increase max_output_tokens in cloud_models.conf or model_params.conf.",
+                            "⚠ {} Increase max_output_tokens in models_cloud.conf or models_ollama.conf.",
                             msg
                         )));
                     }
@@ -3704,7 +3704,7 @@ impl App {
 
     /// Saves the global config (proxy, urls, retries, ...) and the current
     /// model's generation parameters to their per-model config section
-    /// (`cloud_models.conf` for cloud models, `model_params.conf` otherwise).
+    /// (`models_cloud.conf` for cloud models, `models_ollama.conf` otherwise).
     pub fn save_config(&self) -> Result<(), String> {
         let cfg = Config {
             ollama_url: self.ollama_url.clone(),
@@ -4524,7 +4524,7 @@ impl App {
 
     /// Combined model list shown in the model dialog: local Ollama
     /// models (fetched from `/api/tags`) first, then the cloud models
-    /// from `cloud_models.conf`. Each entry carries a cloud flag so the
+    /// from `models_cloud.conf`. Each entry carries a cloud flag so the
     /// UI can mark them. A name present in both places is listed once,
     /// flagged as cloud — that is what selecting it actually uses.
     pub fn model_dialog_entries(&self) -> Vec<(String, bool)> {
@@ -7627,8 +7627,8 @@ mod sessions_dir_tests {
 }
 
 /// Resolves the effective generation parameters for a model: cloud models
-/// carry their own (from `cloud_models.conf`); Ollama models look up
-/// `model_params.conf` (named section, then `[default]`, then built-ins).
+/// carry their own (from `models_cloud.conf`); Ollama models look up
+/// `models_ollama.conf` (named section, then `[default]`, then built-ins).
 fn params_for_model(
     model: &str,
     cloud_models: &[CloudModel],
@@ -9318,7 +9318,8 @@ fn build_chat_body(
         }
         if let Some(tools) = tools_for_mode(mode) {
             body["tools"] = serde_json::json!(tools);
-            body["tool_choice"] = serde_json::json!("auto");
+            body["tool_choice"] =
+                serde_json::json!(params.tool_choice.as_deref().unwrap_or("auto"));
         }
         body["temperature"] = serde_json::json!(params.temperature);
         body["top_p"] = serde_json::json!(params.top_p);
@@ -9663,6 +9664,7 @@ mod chat_body_tests {
             presence_penalty: -0.5,
             max_output_tokens: Some(4096),
             reasoning_effort: Some("high".to_string()),
+            tool_choice: None,
             seed: Some(42),
             num_ctx: Some(202752),
         };
@@ -9729,6 +9731,7 @@ mod chat_body_tests {
             presence_penalty: 0.1,
             max_output_tokens: Some(8192),
             reasoning_effort: Some("medium".to_string()),
+            tool_choice: Some("required".to_string()),
             seed: Some(7),
             num_ctx: Some(9999), // not an OpenAI concept — must not be sent
         };
@@ -9745,6 +9748,15 @@ mod chat_body_tests {
         assert!(body.get("num_ctx").is_none());
         assert!(body.get("options").is_none());
         assert!(body.get("think").is_none());
+        assert!(body["tools"].is_array());
+        assert_eq!(body["tool_choice"], "required");
+    }
+
+    #[test]
+    fn cloud_body_tool_choice_falls_back_to_auto() {
+        let cloud = cloud();
+        let params = ModelParams::default();
+        let body = build_chat_body("test-cloud", Some(&cloud), ChatMode::Coder, &msgs(), &params);
         assert!(body["tools"].is_array());
         assert_eq!(body["tool_choice"], "auto");
     }

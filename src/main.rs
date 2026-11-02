@@ -1329,7 +1329,7 @@ fn render_model_dialog(f: &mut Frame, app: &App, area: Rect) {
         _ => "Context: detecting...".to_string(),
     };
     let info_text = if is_cloud_sel {
-        // Pricing, when the model has it in cloud_models.conf.
+        // Pricing, when the model has it in models_cloud.conf.
         let pricing = selected
             .and_then(|(name, _)| app.cloud_models.iter().find(|m| &m.name == name))
             .and_then(|m| m.pricing.short_summary());

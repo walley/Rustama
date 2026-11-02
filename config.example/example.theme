@@ -1,0 +1,36 @@
+# Example Rustama theme — a "midnight" palette.
+#
+# Select it with `theme = example` in rustama.conf (the file is read from the
+# config directory as `example.theme`). Values may be named colours
+# (black, red, light_red, …), rgb(r,g,b), or #rrggbb. Any key you leave out
+# keeps the built-in default theme's value, so a partial file is valid.
+
+# Dialogs
+dialog_border   = #4C6FFF
+dialog_bg       = #0B1020
+dialog_fg       = #E6E9F5
+dialog_title_fg = #FFB86B
+dialog_focus_bg = #24408E
+dialog_input_fg = #9FB0D0
+
+# Lists (selection)
+list_selected_bg = #24408E
+list_selected_fg = #FFFFFF
+
+# File browser
+dir_fg  = #7CE38B
+file_fg = #E6E9F5
+path_fg = #9FB0D0
+
+# Chat output
+thinking_fg = #FFD479
+
+# Menu bar / submenus
+menu_selected_bg   = #FFFFFF
+menu_selected_fg   = #0B1020
+menu_unselected_bg = #24408E
+menu_unselected_fg = #FFFFFF
+menu_border_fg     = #4C6FFF
+
+# Cloud-model entries in the model picker
+cloud_fg = #6FD3FF
