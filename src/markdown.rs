@@ -20,7 +20,7 @@ use pulldown_cmark::{
 };
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// Render a markdown string (an assistant message body) as styled lines.
 ///
@@ -140,7 +140,7 @@ pub fn render_markdown(text: &str, theme: &Theme) -> Vec<Line<'static>> {
                 TagEnd::CodeBlock => {
                     in_code_block = false;
                     let (code_lines, max_width) =
-                        highlight_code(&code_block_text, code_block_lang.as_deref());
+                        highlight_code(&code_block_text, code_block_lang.as_deref(), 120);
 
                     // Squared border around the code block.
                     let border_width = 2 + max_width; // 1 left indent + content + 1 right padding
@@ -218,21 +218,34 @@ pub fn render_markdown(text: &str, theme: &Theme) -> Vec<Line<'static>> {
                         top.push('┐');
                         lines.push(Line::from(Span::styled(top, border_style)));
 
-                        // Header row: │ a │ b │ c │
-                        let mut header_spans: Vec<Span> = Vec::new();
-                        for (i, h) in table_headers.iter().enumerate() {
-                            let w = col_widths[i];
-                            let padded = pad_to_width(h, w);
-                            header_spans.push(Span::styled(
-                                format!("│ {} ", padded),
-                                Style::default()
-                                    .fg(theme.md_table_header_fg)
-                                    .bg(theme.md_table_header_bg)
-                                    .add_modifier(Modifier::BOLD),
-                            ));
+                        // Header row: wrap each cell to column width, render line by line
+                        let header_lines: Vec<Vec<String>> = table_headers
+                            .iter()
+                            .enumerate()
+                            .map(|(i, h)| wrap_text(h, col_widths[i]))
+                            .collect();
+                        let header_max_lines = header_lines
+                            .iter()
+                            .map(|l| l.len())
+                            .max()
+                            .unwrap_or(1);
+                        for line_idx in 0..header_max_lines {
+                            let mut row_spans: Vec<Span> = Vec::new();
+                            for (i, cell_lines) in header_lines.iter().enumerate() {
+                                let w = col_widths[i];
+                                let cell_text = cell_lines.get(line_idx).cloned().unwrap_or_default();
+                                let padded = pad_to_width(&cell_text, w);
+                                row_spans.push(Span::styled(
+                                    format!("│ {} ", padded),
+                                    Style::default()
+                                        .fg(theme.md_table_header_fg)
+                                        .bg(theme.md_table_header_bg)
+                                        .add_modifier(Modifier::BOLD),
+                                ));
+                            }
+                            row_spans.push(Span::styled("│", border_style));
+                            lines.push(Line::from(row_spans));
                         }
-                        header_spans.push(Span::styled("│", border_style));
-                        lines.push(Line::from(header_spans));
 
                         // Separator: ├───┼───┼───┤
                         let mut sep = String::from("├");
@@ -245,19 +258,35 @@ pub fn render_markdown(text: &str, theme: &Theme) -> Vec<Line<'static>> {
                         sep.push('┤');
                         lines.push(Line::from(Span::styled(sep, border_style)));
 
-                        // Data rows: │ x │ y │ z │
+                        // Data rows: wrap each cell to column width, render line by line
                         for row in &table_rows {
-                            let mut row_spans: Vec<Span> = Vec::new();
-                            for (i, cell) in row.iter().enumerate() {
-                                let w = col_widths.get(i).copied().unwrap_or(10);
-                                let padded = pad_to_width(cell, w);
-                                row_spans.push(Span::styled(
-                                    format!("│ {} ", padded),
-                                    Style::default().bg(theme.md_bg),
-                                ));
+                            let row_lines: Vec<Vec<String>> = row
+                                .iter()
+                                .enumerate()
+                                .map(|(i, cell)| {
+                                    let w = col_widths.get(i).copied().unwrap_or(10);
+                                    wrap_text(cell, w)
+                                })
+                                .collect();
+                            let row_max_lines = row_lines
+                                .iter()
+                                .map(|l| l.len())
+                                .max()
+                                .unwrap_or(1);
+                            for line_idx in 0..row_max_lines {
+                                let mut row_spans: Vec<Span> = Vec::new();
+                                for (i, cell_lines) in row_lines.iter().enumerate() {
+                                    let w = col_widths.get(i).copied().unwrap_or(10);
+                                    let cell_text = cell_lines.get(line_idx).cloned().unwrap_or_default();
+                                    let padded = pad_to_width(&cell_text, w);
+                                    row_spans.push(Span::styled(
+                                        format!("│ {} ", padded),
+                                        Style::default().bg(theme.md_bg),
+                                    ));
+                                }
+                                row_spans.push(Span::styled("│", border_style));
+                                lines.push(Line::from(row_spans));
                             }
-                            row_spans.push(Span::styled("│", border_style));
-                            lines.push(Line::from(row_spans));
                         }
 
                         // Bottom border: └───┴───┴───┘
@@ -379,14 +408,120 @@ fn pad_to_width(s: &str, width: usize) -> String {
     format!("{}{}", s, " ".repeat(padding))
 }
 
+/// Wrap text to fit within `width` display columns, breaking long words if
+/// necessary. Returns one line per wrapped segment.
+fn wrap_text(s: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![String::new()];
+    }
+
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    let mut current_width = 0;
+
+    for ch in s.chars() {
+        let ch_width = ch.width().unwrap_or(1);
+        if current_width + ch_width > width && !current.is_empty() {
+            lines.push(current);
+            current = String::new();
+            current_width = 0;
+        }
+        current.push(ch);
+        current_width += ch_width;
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+
+    lines
+}
+
+/// Wrap a vector of spans to fit within `width` display columns, splitting
+/// spans at character boundaries when necessary. Each span keeps its own
+/// style. Returns one line per wrapped segment.
+fn wrap_spans(spans: Vec<Span<'static>>, max_width: usize, _bg: Color) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut current_spans: Vec<Span<'static>> = Vec::new();
+    let mut current_width = 0usize;
+
+    for span in spans {
+        let span_text = span.content.to_string();
+        let span_width = span_text.width();
+
+        if current_width + span_width > max_width && !current_spans.is_empty() {
+            lines.push(Line::from(current_spans));
+            current_spans = Vec::new();
+            current_width = 0;
+        }
+
+        if span_width > max_width {
+            // Single span is wider than max_width - split it character by character
+            let mut remaining = span_text.as_str();
+            while !remaining.is_empty() {
+                let mut chars_fitted = 0;
+                let mut width_so_far = 0;
+                for ch in remaining.chars() {
+                    let w = ch.width().unwrap_or(1);
+                    if width_so_far + w > max_width {
+                        break;
+                    }
+                    width_so_far += w;
+                    chars_fitted += 1;
+                }
+
+                if chars_fitted == 0 {
+                    // Even one character doesn't fit - force one character
+                    let ch = remaining.chars().next().unwrap();
+                    let len = ch.len_utf8();
+                    let (first, rest) = remaining.split_at(len);
+                    current_spans.push(Span::styled(
+                        first.to_string(),
+                        span.style,
+                    ));
+                    lines.push(Line::from(current_spans));
+                    current_spans = Vec::new();
+                    current_width = 0;
+                    remaining = rest;
+                } else {
+                    let (first, rest) = remaining.split_at(chars_fitted);
+                    current_spans.push(Span::styled(
+                        first.to_string(),
+                        span.style,
+                    ));
+                    current_width += first.width();
+                    remaining = rest;
+                }
+            }
+        } else {
+            current_spans.push(span);
+            current_width += span_width;
+        }
+    }
+
+    if !current_spans.is_empty() {
+        lines.push(Line::from(current_spans));
+    }
+
+    if lines.is_empty() {
+        lines.push(Line::from(Vec::new()));
+    }
+
+    lines
+}
+
 /// Syntax-highlight a code block with syntect's "base16-ocean.dark" theme
 /// on the shared code-block background. Returns the rendered lines and the
 /// maximum content width (used by the caller to draw a squared border).
 ///
 /// Each line gets a one-space left indent and its background is extended
-/// to the width of the longest line, so every line sits on an equal-size
-/// colored block.
-fn highlight_code(code: &str, lang: Option<&str>) -> (Vec<Line<'static>>, usize) {
+/// to the width of the longest line (capped at `max_width`), so every line
+/// sits on an equal-size colored block. Lines wider than `max_width` are
+/// wrapped to fit.
+fn highlight_code(code: &str, lang: Option<&str>, max_width: usize) -> (Vec<Line<'static>>, usize) {
     use syntect::easy::HighlightLines;
     use syntect::highlighting::ThemeSet;
     use syntect::parsing::SyntaxSet;
@@ -406,7 +541,7 @@ fn highlight_code(code: &str, lang: Option<&str>) -> (Vec<Line<'static>>, usize)
 
     let bg = CODE_BLOCK_BG;
     let mut all_spans: Vec<Vec<Span<'static>>> = Vec::new();
-    let mut max_width = 0usize;
+    let mut max_width_computed = 0usize;
 
     for line in code.lines() {
         let ranges = h.highlight_line(line, ss).unwrap_or_default();
@@ -419,29 +554,37 @@ fn highlight_code(code: &str, lang: Option<&str>) -> (Vec<Line<'static>>, usize)
             ));
         }
         let line_width: usize = spans.iter().map(|s| s.content.len()).sum();
-        max_width = max_width.max(line_width);
+        max_width_computed = max_width_computed.max(line_width);
         all_spans.push(spans);
     }
+
+    // Cap max_width at the provided limit
+    let max_width = max_width_computed.min(max_width);
 
     let mut result: Vec<Line<'static>> = Vec::new();
 
     for spans in all_spans {
-        let content_width: usize = spans.iter().map(|s| s.content.len()).sum();
-        let mut line_spans: Vec<Span<'static>> = Vec::new();
-        // One-space left indent on the background.
-        line_spans.push(Span::styled(" ", Style::default().bg(bg)));
-        line_spans.extend(spans);
-        // Fill remaining width with background so every line is equal width.
-        let remaining = max_width.saturating_sub(content_width);
-        if remaining > 0 {
-            line_spans.push(Span::styled(
-                " ".repeat(remaining),
-                Style::default().bg(bg),
-            ));
+        // Wrap spans at max_width
+        let wrapped = wrap_spans(spans, max_width, bg);
+        for line in wrapped {
+            // Each wrapped line already has content spans; add left indent,
+            // fill to width, and right padding
+            let mut line_spans: Vec<Span<'static>> = Vec::new();
+            line_spans.push(Span::styled(" ", Style::default().bg(bg)));
+            // Remove the last span if it's just right padding from wrap_spans
+            // and rebuild properly
+            let content_width: usize = line.spans.iter().map(|s| s.content.width()).sum();
+            line_spans.extend(line.spans.into_iter());
+            let remaining = max_width.saturating_sub(content_width);
+            if remaining > 0 {
+                line_spans.push(Span::styled(
+                    " ".repeat(remaining),
+                    Style::default().bg(bg),
+                ));
+            }
+            line_spans.push(Span::styled(" ", Style::default().bg(bg)));
+            result.push(Line::from(line_spans));
         }
-        // One-space right padding so text doesn't touch the frame.
-        line_spans.push(Span::styled(" ", Style::default().bg(bg)));
-        result.push(Line::from(line_spans));
     }
 
     // Handle empty code block / trailing newline.
@@ -455,7 +598,6 @@ fn highlight_code(code: &str, lang: Option<&str>) -> (Vec<Line<'static>>, usize)
                 Style::default().bg(bg),
             ));
         }
-        // One-space right padding so text doesn't touch the frame.
         line_spans.push(Span::styled(" ", Style::default().bg(bg)));
         result.push(Line::from(line_spans));
     }
