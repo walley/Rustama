@@ -24,7 +24,7 @@ mod ui;
 use app::{App, ChatMessage, Focus, InputMode, ModelDialogFocus, SaveDialogFocus, SettingsFocus};
 use config::Config;
 use markdown::render_markdown;
-use ui::{Button, CODE_BLOCK_BG, ConfirmationBox, FileActionDialog, MC_GREEN, dialog_block};
+use ui::{Button, CODE_BLOCK_BG, ConfirmationBox, FileActionDialog, MC_GREEN, Theme, dialog_block};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let original_hook = std::panic::take_hook();
@@ -352,28 +352,32 @@ fn ui(f: &mut Frame, app: &mut App) {
 /// `App::maybe_append_lsp_diagnostics`) renders **magenta** in any
 /// tool's result — `lsp_section` tells whether the line is inside it
 /// (the caller tracks the marker while walking the lines).
-fn tool_result_line_style(tool: &str, line: &str, lsp_section: bool) -> Style {
+fn tool_result_line_style(tool: &str, line: &str, lsp_section: bool, theme: &Theme) -> Style {
     if lsp_section {
         return Style::default().fg(Color::Magenta);
     }
     match tool {
-        "edit_file" => edit_file_result_line_style(line),
-        _ => Style::default().fg(Color::DarkGray),
+        "edit_file" => edit_file_result_line_style(line, theme),
+        _ => Style::default().fg(theme.diff_fg),
     }
 }
 
 /// Diff coloring for `edit_file` results: `+` added lines green,
-/// `-` removed lines red, `@@` hunk headers cyan; `---`/`+++` file
-/// headers and context lines stay dim.
-fn edit_file_result_line_style(line: &str) -> Style {
-    if line.starts_with('+') && !line.starts_with("+++") {
-        Style::default().fg(Color::Green)
-    } else if line.starts_with('-') && !line.starts_with("---") {
-        Style::default().fg(Color::Red)
+/// `-` removed lines red, `@@` hunk headers cyan; `--- ` old-file and
+/// `+++ ` new-file headers colored like their diff counterparts.
+fn edit_file_result_line_style(line: &str, theme: &Theme) -> Style {
+    if line.starts_with("--- ") {
+        Style::default().fg(theme.diff_minus).bg(theme.diff_bg)
+    } else if line.starts_with("+++ ") {
+        Style::default().fg(theme.diff_plus).bg(theme.diff_bg)
+    } else if line.starts_with('+') {
+        Style::default().fg(theme.diff_plus).bg(theme.diff_bg)
+    } else if line.starts_with('-') {
+        Style::default().fg(theme.diff_minus).bg(theme.diff_bg)
     } else if line.starts_with('@') {
-        Style::default().fg(Color::Cyan)
+        Style::default().fg(Color::Cyan).bg(theme.diff_bg)
     } else {
-        Style::default().fg(Color::DarkGray)
+        Style::default().fg(theme.diff_fg).bg(theme.diff_bg)
     }
 }
 
@@ -435,7 +439,7 @@ fn render_output(f: &mut Frame, app: &mut App, area: Rect) {
                         if i == 0 && !ts.is_empty() {
                             spans.push(Span::styled(
                                 format!("[{}] ", ts),
-                                Style::default().fg(Color::DarkGray),
+                                Style::default().fg(app.theme.timestamp_fg),
                             ));
                         }
                         spans.push(Span::styled(
@@ -453,41 +457,61 @@ fn render_output(f: &mut Frame, app: &mut App, area: Rect) {
                     if !ts.is_empty() {
                         hist.push(Line::from(Span::styled(
                             format!("  [{}]", ts),
-                            Style::default().fg(Color::DarkGray),
+                            Style::default().fg(app.theme.timestamp_fg),
                         )));
                     }
-                    let mut md_lines = render_markdown(text);
+                    let mut md_lines = render_markdown(text, &app.theme);
                     hist.append(&mut md_lines);
                 }
                 ChatMessage::System { text, ts } => {
                     for (i, text_line) in text.lines().enumerate() {
-                        let ts_prefix = if i == 0 && !ts.is_empty() {
-                            format!("[{}] ", ts)
+                        if i == 0 && !ts.is_empty() {
+                            hist.push(Line::from(vec![
+                                Span::styled(
+                                    format!("  [{}] ", ts),
+                                    Style::default().fg(app.theme.timestamp_fg),
+                                ),
+                                Span::styled(
+                                    text_line.to_string(),
+                                    Style::default()
+                                        .fg(app.theme.system_fg)
+                                        .add_modifier(Modifier::ITALIC),
+                                ),
+                            ]));
                         } else {
-                            String::new()
-                        };
-                        hist.push(Line::from(Span::styled(
-                            format!("  {}{}", ts_prefix, text_line),
-                            Style::default()
-                                .fg(Color::DarkGray)
-                                .add_modifier(Modifier::ITALIC),
-                        )));
+                            hist.push(Line::from(Span::styled(
+                                format!("  {}", text_line),
+                                Style::default()
+                                    .fg(app.theme.system_fg)
+                                    .add_modifier(Modifier::ITALIC),
+                            )));
+                        }
                     }
                     hist.push(Line::from(""));
                 }
                 ChatMessage::App { text, ts } => {
                     for (i, text_line) in text.lines().enumerate() {
-                        let ts_prefix = if i == 0 && !ts.is_empty() {
-                            format!("[{}] ", ts)
+                        if i == 0 && !ts.is_empty() {
+                            hist.push(Line::from(vec![
+                                Span::styled(
+                                    format!("  [{}] ", ts),
+                                    Style::default().fg(app.theme.timestamp_fg),
+                                ),
+                                Span::styled(
+                                    text_line.to_string(),
+                                    Style::default()
+                                        .fg(app.theme.system_fg)
+                                        .add_modifier(Modifier::ITALIC),
+                                ),
+                            ]));
                         } else {
-                            String::new()
-                        };
-                        hist.push(Line::from(Span::styled(
-                            format!("  {}{}", ts_prefix, text_line),
-                            Style::default()
-                                .fg(Color::DarkGray)
-                                .add_modifier(Modifier::ITALIC),
-                        )));
+                            hist.push(Line::from(Span::styled(
+                                format!("  {}", text_line),
+                                Style::default()
+                                    .fg(app.theme.system_fg)
+                                    .add_modifier(Modifier::ITALIC),
+                            )));
+                        }
                     }
                     hist.push(Line::from(""));
                 }
@@ -495,7 +519,7 @@ fn render_output(f: &mut Frame, app: &mut App, area: Rect) {
                     if !ts.is_empty() {
                         hist.push(Line::from(Span::styled(
                             format!("  [{}]", ts),
-                            Style::default().fg(Color::DarkGray),
+                            Style::default().fg(app.theme.timestamp_fg),
                         )));
                     }
                     let mut in_code = false;
@@ -529,7 +553,7 @@ fn render_output(f: &mut Frame, app: &mut App, area: Rect) {
                             .fg(Color::Cyan)
                             .add_modifier(Modifier::BOLD),
                     )));
-                    let mut md_lines = render_markdown(content);
+                    let mut md_lines = render_markdown(content, &app.theme);
                     hist.append(&mut md_lines);
                     hist.push(Line::from(""));
                 }
@@ -561,7 +585,7 @@ fn render_output(f: &mut Frame, app: &mut App, area: Rect) {
                     if !ts.is_empty() {
                         call_spans.push(Span::styled(
                             format!("  [{}]", ts),
-                            Style::default().fg(Color::DarkGray),
+                            Style::default().fg(app.theme.timestamp_fg),
                         ));
                     }
                     hist.push(Line::from(call_spans));
@@ -572,7 +596,7 @@ fn render_output(f: &mut Frame, app: &mut App, area: Rect) {
                     for arg_line in pretty_args.lines() {
                         hist.push(Line::from(Span::styled(
                             format!("    {}", arg_line),
-                            Style::default().fg(Color::DarkGray),
+                            Style::default().fg(app.theme.tool_json_fg),
                         )));
                     }
                     hist.push(Line::from(""));
@@ -615,7 +639,7 @@ fn render_output(f: &mut Frame, app: &mut App, area: Rect) {
                     if !ts.is_empty() {
                         result_spans.push(Span::styled(
                             format!("  [{}]", ts),
-                            Style::default().fg(Color::DarkGray),
+                            Style::default().fg(app.theme.timestamp_fg),
                         ));
                     }
                     hist.push(Line::from(result_spans));
@@ -648,7 +672,7 @@ fn render_output(f: &mut Frame, app: &mut App, area: Rect) {
                         // edit_file's embedded unified diff; the LSP
                         // diagnostics section is magenta; other tools
                         // render plain dim lines.
-                        let style = tool_result_line_style(name, result_line, in_lsp_section);
+                        let style = tool_result_line_style(name, result_line, in_lsp_section, &app.theme);
                         hist.push(Line::from(Span::styled(
                             format!("    {}", result_line),
                             style,
@@ -693,7 +717,7 @@ fn render_output(f: &mut Frame, app: &mut App, area: Rect) {
             lines.push(Line::from(""));
         }
         if app.is_loading && !app.streaming_text.is_empty() {
-            let mut md_lines = render_markdown(&app.streaming_text);
+            let mut md_lines = render_markdown(&app.streaming_text, &app.theme);
             lines.append(&mut md_lines);
         }
         // No "waiting" placeholder: the status bar's throbber covers it.
@@ -778,10 +802,12 @@ fn render_output(f: &mut Frame, app: &mut App, area: Rect) {
         .borders(Borders::ALL)
         .title(" Output ")
         .title_bottom(bottom_title)
-        .border_style(focus_style);
+        .border_style(focus_style)
+        .style(Style::default().bg(app.theme.output_bg));
 
     let paragraph = Paragraph::new(render_lines)
         .block(block)
+        .style(Style::default().bg(app.theme.output_bg))
         .scroll((scroll, 0));
 
     let content_area = Rect {
@@ -2079,46 +2105,46 @@ mod throbber_tests {
 
 #[cfg(test)]
 mod tool_result_tests {
-    use super::tool_result_line_style;
+    use super::{tool_result_line_style, Theme};
     use ratatui::style::Color;
 
     #[test]
     fn edit_file_diff_lines_colored() {
         assert_eq!(
-            tool_result_line_style("edit_file", "+ added line", false).fg,
+            tool_result_line_style("edit_file", "+ added line", false, &Theme::default()).fg,
             Some(Color::Green)
         );
         assert_eq!(
-            tool_result_line_style("edit_file", "- removed line", false).fg,
+            tool_result_line_style("edit_file", "- removed line", false, &Theme::default()).fg,
             Some(Color::Red)
         );
         assert_eq!(
-            tool_result_line_style("edit_file", "@@ -1,3 +1,4 @@", false).fg,
+            tool_result_line_style("edit_file", "@@ -1,3 +1,4 @@", false, &Theme::default()).fg,
             Some(Color::Cyan)
         );
         // Context lines stay dim.
         assert_eq!(
-            tool_result_line_style("edit_file", "  context line", false).fg,
-            Some(Color::DarkGray)
+            tool_result_line_style("edit_file", "  context line", false, &Theme::default()).fg,
+            Some(Color::White)
         );
-        // --- / +++ file headers are not content changes — stay dim.
+        // --- old-file header → red, +++ new-file header → green
         assert_eq!(
-            tool_result_line_style("edit_file", "--- a/src/app.rs", false).fg,
-            Some(Color::DarkGray)
+            tool_result_line_style("edit_file", "--- a/src/app.rs", false, &Theme::default()).fg,
+            Some(Color::Red)
         );
         assert_eq!(
-            tool_result_line_style("edit_file", "+++ b/src/app.rs", false).fg,
-            Some(Color::DarkGray)
+            tool_result_line_style("edit_file", "+++ b/src/app.rs", false, &Theme::default()).fg,
+            Some(Color::Green)
         );
         // The "Successfully edited" banner and auto-appended
         // diagnostics lines render dim like context.
         assert_eq!(
-            tool_result_line_style("edit_file", "Successfully edited src/x.rs", false).fg,
-            Some(Color::DarkGray)
+            tool_result_line_style("edit_file", "Successfully edited src/x.rs", false, &Theme::default()).fg,
+            Some(Color::White)
         );
         assert_eq!(
-            tool_result_line_style("edit_file", "src/x.rs:3:9: [error] boom", false).fg,
-            Some(Color::DarkGray)
+            tool_result_line_style("edit_file", "src/x.rs:3:9: [error] boom", false, &Theme::default()).fg,
+            Some(Color::White)
         );
     }
 
@@ -2128,32 +2154,32 @@ mod tool_result_tests {
         // in any tool's result (edit_file AND write_file both get the
         // section auto-appended).
         assert_eq!(
-            tool_result_line_style("edit_file", "Diagnostics: LSP diagnostics for /tmp/x.rs:", true)
+            tool_result_line_style("edit_file", "Diagnostics: LSP diagnostics for /tmp/x.rs:", true, &Theme::default())
                 .fg,
             Some(Color::Magenta)
         );
         assert_eq!(
-            tool_result_line_style("edit_file", "/tmp/x.rs:2:5: [error] boom", true).fg,
+            tool_result_line_style("edit_file", "/tmp/x.rs:2:5: [error] boom", true, &Theme::default()).fg,
             Some(Color::Magenta)
         );
         assert_eq!(
-            tool_result_line_style("write_file", "LSP: no diagnostics for /tmp/x.rs \u{2713}", true)
+            tool_result_line_style("write_file", "LSP: no diagnostics for /tmp/x.rs \u{2713}", true, &Theme::default())
                 .fg,
             Some(Color::Magenta)
         );
         assert_eq!(
-            tool_result_line_style("write_file", "LSP workspace (/ws): 2 errors, 1 warnings", true)
+            tool_result_line_style("write_file", "LSP workspace (/ws): 2 errors, 1 warnings", true, &Theme::default())
                 .fg,
             Some(Color::Magenta)
         );
         // Before the marker the same lines keep their normal styling
         // (dim outside a diff, diff colors inside one).
         assert_eq!(
-            tool_result_line_style("edit_file", "/tmp/x.rs:2:5: [error] boom", false).fg,
-            Some(Color::DarkGray)
+            tool_result_line_style("edit_file", "/tmp/x.rs:2:5: [error] boom", false, &Theme::default()).fg,
+            Some(Color::White)
         );
         assert_eq!(
-            tool_result_line_style("edit_file", "+ new line", false).fg,
+            tool_result_line_style("edit_file", "+ new line", false, &Theme::default()).fg,
             Some(Color::Green)
         );
     }
@@ -2172,20 +2198,20 @@ mod tool_result_tests {
             "unknown_tool",
         ] {
             assert_eq!(
-                tool_result_line_style(tool, "+ Add trait impl", false).fg,
-                Some(Color::DarkGray),
+                tool_result_line_style(tool, "+ Add trait impl", false, &Theme::default()).fg,
+                Some(Color::White),
                 "{}: + line mis-colored",
                 tool
             );
             assert_eq!(
-                tool_result_line_style(tool, "- operand", false).fg,
-                Some(Color::DarkGray),
+                tool_result_line_style(tool, "- operand", false, &Theme::default()).fg,
+                Some(Color::White),
                 "{}: - line mis-colored",
                 tool
             );
             assert_eq!(
-                tool_result_line_style(tool, "@decorator", false).fg,
-                Some(Color::DarkGray),
+                tool_result_line_style(tool, "@decorator", false, &Theme::default()).fg,
+                Some(Color::White),
                 "{}: @ line mis-colored",
                 tool
             );

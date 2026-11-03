@@ -54,6 +54,42 @@ pub struct Theme {
     /// Cloud-model rows in the model picker (magenta) — distinguishes
     /// cloud providers from local Ollama models at a glance.
     pub cloud_fg: Color,
+    /// Background of the main chat/output area where conversation shows.
+    pub output_bg: Color,
+    /// Foreground color for system/app-level message text in the chat output.
+    pub system_fg: Color,
+    /// Foreground color for timestamps in the chat output.
+    pub timestamp_fg: Color,
+    /// Background color for edit_file diff results in the chat output.
+    pub diff_bg: Color,
+    /// Default foreground color for edit_file diff results.
+    pub diff_fg: Color,
+    /// Foreground color for added lines (+) in edit_file diff results.
+    pub diff_plus: Color,
+    /// Foreground color for removed lines (-) in edit_file diff results.
+    pub diff_minus: Color,
+    /// Foreground color for JSON argument text in tool call results.
+    pub tool_json_fg: Color,
+    /// Background color for markdown elements in the chat output.
+    pub md_bg: Color,
+    /// Foreground color for markdown headings.
+    pub md_header_fg: Color,
+    /// Foreground color for markdown list bullets.
+    pub md_bullet_fg: Color,
+    /// Foreground color for markdown inline code.
+    pub md_code_fg: Color,
+    /// Background color for markdown inline code.
+    pub md_code_bg: Color,
+    /// Foreground color for markdown table borders/frames.
+    pub md_table_fg: Color,
+    /// Foreground color for markdown table header cells.
+    pub md_table_header_fg: Color,
+    /// Background color for markdown table header cells.
+    pub md_table_header_bg: Color,
+    /// Foreground color for markdown horizontal rules.
+    pub md_rule_fg: Color,
+    /// Foreground color for markdown code block headers ([LANG]/[CODE]).
+    pub md_code_block_fg: Color,
 }
 
 impl Theme {
@@ -80,6 +116,24 @@ impl Theme {
             menu_unselected_fg: Color::White,
             menu_border_fg: Color::White,
             cloud_fg: Color::Magenta,
+            output_bg: Color::Blue,
+            system_fg: Color::Green,
+            timestamp_fg: Color::Green,
+            diff_bg: Color::Black,
+            diff_fg: Color::White,
+            diff_plus: Color::Green,
+            diff_minus: Color::Red,
+            tool_json_fg: Color::Magenta,
+            md_bg: Color::Blue,
+            md_header_fg: Color::Yellow,
+            md_bullet_fg: Color::Green,
+            md_code_fg: Color::Cyan,
+            md_code_bg: Color::Rgb(40, 40, 60),
+            md_table_fg: Color::White,
+            md_table_header_fg: Color::White,
+            md_table_header_bg: Color::Rgb(60, 60, 80),
+            md_rule_fg: Color::DarkGray,
+            md_code_block_fg: Color::Yellow,
         }
     }
 
@@ -199,6 +253,24 @@ fn apply_color(theme: &mut Theme, key: &str, color: Color) {
         "menu_unselected_fg" => theme.menu_unselected_fg = color,
         "menu_border_fg" => theme.menu_border_fg = color,
         "cloud_fg" => theme.cloud_fg = color,
+        "output_bg" => theme.output_bg = color,
+        "system_fg" => theme.system_fg = color,
+        "timestamp_fg" => theme.timestamp_fg = color,
+        "diff_bg" => theme.diff_bg = color,
+        "diff_fg" => theme.diff_fg = color,
+        "diff_plus" => theme.diff_plus = color,
+        "diff_minus" => theme.diff_minus = color,
+        "tool_json_fg" => theme.tool_json_fg = color,
+        "md_bg" => theme.md_bg = color,
+        "md_header_fg" => theme.md_header_fg = color,
+        "md_bullet_fg" => theme.md_bullet_fg = color,
+        "md_code_fg" => theme.md_code_fg = color,
+        "md_code_bg" => theme.md_code_bg = color,
+        "md_table_fg" => theme.md_table_fg = color,
+        "md_table_header_fg" => theme.md_table_header_fg = color,
+        "md_table_header_bg" => theme.md_table_header_bg = color,
+        "md_rule_fg" => theme.md_rule_fg = color,
+        "md_code_block_fg" => theme.md_code_block_fg = color,
         _ => {}
     }
 }
@@ -2229,7 +2301,11 @@ mod tests {
             "dialog_focus_bg", "dialog_input_fg", "list_selected_bg",
             "list_selected_fg", "dir_fg", "file_fg", "path_fg", "thinking_fg",
             "menu_selected_bg", "menu_selected_fg", "menu_unselected_bg",
-            "menu_unselected_fg", "menu_border_fg",
+            "menu_unselected_fg", "menu_border_fg", "cloud_fg", "output_bg",
+            "system_fg", "timestamp_fg", "diff_bg", "diff_fg", "diff_plus",
+            "diff_minus", "tool_json_fg", "md_bg", "md_header_fg", "md_bullet_fg", "md_code_fg",
+            "md_code_bg", "md_table_fg", "md_table_header_fg", "md_table_header_bg",
+            "md_rule_fg", "md_code_block_fg",
         ];
         let mut checked = 0;
         for entry in entries.flatten() {

@@ -14,12 +14,13 @@
 //! `wrap_and_justify_lines()` (main.rs) keys on to leave code lines
 //! unwrapped/unjustified.
 
-use crate::ui::CODE_BLOCK_BG;
+use crate::ui::{CODE_BLOCK_BG, Theme};
 use pulldown_cmark::{
     CodeBlockKind, Event as MdEvent, Options as MdOptions, Parser as MdParser, Tag, TagEnd,
 };
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
+use unicode_width::UnicodeWidthStr;
 
 /// Render a markdown string (an assistant message body) as styled lines.
 ///
@@ -30,7 +31,7 @@ use ratatui::text::{Line, Span};
 /// list bullets and `─` rules. `+---+`-style ASCII-art frame lines some
 /// models draw around their answers are filtered out before parsing, and
 /// indented code fences are normalized by `normalize_code_fences`.
-pub fn render_markdown(text: &str) -> Vec<Line<'static>> {
+pub fn render_markdown(text: &str, theme: &Theme) -> Vec<Line<'static>> {
     let mut md_options = MdOptions::empty();
     md_options.insert(MdOptions::ENABLE_STRIKETHROUGH);
     md_options.insert(MdOptions::ENABLE_TABLES);
@@ -84,7 +85,8 @@ pub fn render_markdown(text: &str) -> Vec<Line<'static>> {
                     current_spans.push(Span::styled(
                         prefix.to_string(),
                         Style::default()
-                            .fg(Color::Yellow)
+                            .fg(theme.md_header_fg)
+                            .bg(theme.md_bg)
                             .add_modifier(Modifier::BOLD),
                     ));
                     bold = true;
@@ -97,14 +99,6 @@ pub fn render_markdown(text: &str) -> Vec<Line<'static>> {
                         CodeBlockKind::Fenced(lang) if !lang.is_empty() => Some(lang.to_string()),
                         _ => None,
                     };
-                    let header = match &code_block_lang {
-                        Some(lang) => format!("[{}]", lang.to_uppercase()),
-                        None => "[CODE]".to_string(),
-                    };
-                    lines.push(Line::from(Span::styled(
-                        header,
-                        Style::default().fg(Color::Yellow).bg(CODE_BLOCK_BG),
-                    )));
                 }
                 Tag::Table(_alignment) => {
                     flush_line(&mut lines, &mut current_spans);
@@ -126,7 +120,10 @@ pub fn render_markdown(text: &str) -> Vec<Line<'static>> {
                 Tag::Strong => bold = true,
                 Tag::Item => {
                     flush_line(&mut lines, &mut current_spans);
-                    current_spans.push(Span::styled("  • ", Style::default().fg(Color::Green)));
+                    current_spans.push(Span::styled(
+                        "  • ",
+                        Style::default().fg(theme.md_bullet_fg),
+                    ));
                 }
                 _ => {}
             },
@@ -142,10 +139,53 @@ pub fn render_markdown(text: &str) -> Vec<Line<'static>> {
                 }
                 TagEnd::CodeBlock => {
                     in_code_block = false;
-                    let code_lines = highlight_code(&code_block_text, code_block_lang.as_deref());
-                    for line in code_lines {
-                        lines.push(line);
+                    let (code_lines, max_width) =
+                        highlight_code(&code_block_text, code_block_lang.as_deref());
+
+                    // Squared border around the code block.
+                    let border_width = 2 + max_width; // 1 left indent + content + 1 right padding
+                    let border_style =
+                        Style::default().fg(theme.md_table_fg).bg(CODE_BLOCK_BG);
+
+                    // Top border with embedded header: ┌[BASH]─────┐
+                    let header_text = match &code_block_lang {
+                        Some(lang) => format!("[{}]", lang.to_uppercase()),
+                        None => "[CODE]".to_string(),
+                    };
+                    let header_len = header_text.len();
+                    let dash_count = border_width.saturating_sub(header_len);
+                    let mut top_spans: Vec<Span<'static>> = Vec::new();
+                    top_spans.push(Span::styled("┌", border_style));
+                    top_spans.push(Span::styled(
+                        header_text,
+                        Style::default()
+                            .fg(theme.md_code_block_fg)
+                            .bg(CODE_BLOCK_BG),
+                    ));
+                    if dash_count > 0 {
+                        top_spans.push(Span::styled(
+                            "─".repeat(dash_count),
+                            border_style,
+                        ));
                     }
+                    top_spans.push(Span::styled("┐", border_style));
+                    lines.push(Line::from(top_spans));
+
+                    // Code lines with left/right borders: │ content │
+                    for line in code_lines {
+                        let mut spans: Vec<Span<'static>> = Vec::new();
+                        spans.push(Span::styled("│", border_style));
+                        spans.extend(line.spans);
+                        spans.push(Span::styled("│", border_style));
+                        lines.push(Line::from(spans));
+                    }
+
+                    // Bottom border: └───┘
+                    let mut bottom = String::from("└");
+                    bottom.push_str(&"─".repeat(border_width));
+                    bottom.push('┘');
+                    lines.push(Line::from(Span::styled(bottom, border_style)));
+
                     lines.push(Line::from(""));
                 }
                 TagEnd::Table => {
@@ -157,14 +197,15 @@ pub fn render_markdown(text: &str) -> Vec<Line<'static>> {
                                 let data_max = table_rows
                                     .iter()
                                     .filter_map(|r| r.get(i))
-                                    .map(|c| c.len())
+                                    .map(|c| c.width())
                                     .max()
                                     .unwrap_or(0);
-                                h.len().max(data_max).max(3)
+                                h.width().max(data_max).max(3)
                             })
                             .collect();
 
-                        let border_style = Style::default().fg(Color::DarkGray);
+                        let border_style =
+                            Style::default().fg(theme.md_table_fg).bg(theme.md_bg);
 
                         // Top border: ┌───┬───┬───┐
                         let mut top = String::from("┌");
@@ -181,12 +222,12 @@ pub fn render_markdown(text: &str) -> Vec<Line<'static>> {
                         let mut header_spans: Vec<Span> = Vec::new();
                         for (i, h) in table_headers.iter().enumerate() {
                             let w = col_widths[i];
-                            let padded = format!("{:<width$}", h, width = w);
+                            let padded = pad_to_width(h, w);
                             header_spans.push(Span::styled(
                                 format!("│ {} ", padded),
                                 Style::default()
-                                    .fg(Color::White)
-                                    .bg(Color::Rgb(60, 60, 80))
+                                    .fg(theme.md_table_header_fg)
+                                    .bg(theme.md_table_header_bg)
                                     .add_modifier(Modifier::BOLD),
                             ));
                         }
@@ -209,9 +250,11 @@ pub fn render_markdown(text: &str) -> Vec<Line<'static>> {
                             let mut row_spans: Vec<Span> = Vec::new();
                             for (i, cell) in row.iter().enumerate() {
                                 let w = col_widths.get(i).copied().unwrap_or(10);
-                                let padded = format!("{:<width$}", cell, width = w);
-                                row_spans
-                                    .push(Span::styled(format!("│ {} ", padded), Style::default()));
+                                let padded = pad_to_width(cell, w);
+                                row_spans.push(Span::styled(
+                                    format!("│ {} ", padded),
+                                    Style::default().bg(theme.md_bg),
+                                ));
                             }
                             row_spans.push(Span::styled("│", border_style));
                             lines.push(Line::from(row_spans));
@@ -280,7 +323,9 @@ pub fn render_markdown(text: &str) -> Vec<Line<'static>> {
             MdEvent::Code(code) => {
                 current_spans.push(Span::styled(
                     format!("`{}`", code),
-                    Style::default().fg(Color::Cyan).bg(Color::Rgb(40, 40, 60)),
+                    Style::default()
+                        .fg(theme.md_code_fg)
+                        .bg(theme.md_code_bg),
                 ));
             }
             MdEvent::SoftBreak | MdEvent::HardBreak => {
@@ -296,7 +341,9 @@ pub fn render_markdown(text: &str) -> Vec<Line<'static>> {
                 flush_line(&mut lines, &mut current_spans);
                 lines.push(Line::from(Span::styled(
                     "─────────────────────────────────────",
-                    Style::default().fg(Color::DarkGray),
+                    Style::default()
+                        .fg(theme.md_rule_fg)
+                        .bg(theme.md_bg),
                 )));
                 lines.push(Line::from(""));
             }
@@ -321,11 +368,25 @@ fn flush_line(lines: &mut Vec<Line<'static>>, spans: &mut Vec<Span<'static>>) {
     }
 }
 
+/// Pad a string on the right with spaces so its display width equals `width`.
+/// Uses unicode-width to account for double-wide characters (emoji, etc.).
+fn pad_to_width(s: &str, width: usize) -> String {
+    let display_width = s.width();
+    if display_width >= width {
+        return s.to_string();
+    }
+    let padding = width - display_width;
+    format!("{}{}", s, " ".repeat(padding))
+}
+
 /// Syntax-highlight a code block with syntect's "base16-ocean.dark" theme
-/// on the shared code-block background. The `SyntaxSet`/`ThemeSet` load
-/// lazily into `OnceLock`s — the first highlighted block pays the load,
-/// every later one reuses it.
-fn highlight_code(code: &str, lang: Option<&str>) -> Vec<Line<'static>> {
+/// on the shared code-block background. Returns the rendered lines and the
+/// maximum content width (used by the caller to draw a squared border).
+///
+/// Each line gets a one-space left indent and its background is extended
+/// to the width of the longest line, so every line sits on an equal-size
+/// colored block.
+fn highlight_code(code: &str, lang: Option<&str>) -> (Vec<Line<'static>>, usize) {
     use syntect::easy::HighlightLines;
     use syntect::highlighting::ThemeSet;
     use syntect::parsing::SyntaxSet;
@@ -344,7 +405,8 @@ fn highlight_code(code: &str, lang: Option<&str>) -> Vec<Line<'static>> {
     let mut h = HighlightLines::new(syntax, &ts.themes["base16-ocean.dark"]);
 
     let bg = CODE_BLOCK_BG;
-    let mut result: Vec<Line<'static>> = Vec::new();
+    let mut all_spans: Vec<Vec<Span<'static>>> = Vec::new();
+    let mut max_width = 0usize;
 
     for line in code.lines() {
         let ranges = h.highlight_line(line, ss).unwrap_or_default();
@@ -356,14 +418,49 @@ fn highlight_code(code: &str, lang: Option<&str>) -> Vec<Line<'static>> {
                 Style::default().fg(fg).bg(bg),
             ));
         }
-        result.push(Line::from(spans));
+        let line_width: usize = spans.iter().map(|s| s.content.len()).sum();
+        max_width = max_width.max(line_width);
+        all_spans.push(spans);
     }
 
+    let mut result: Vec<Line<'static>> = Vec::new();
+
+    for spans in all_spans {
+        let content_width: usize = spans.iter().map(|s| s.content.len()).sum();
+        let mut line_spans: Vec<Span<'static>> = Vec::new();
+        // One-space left indent on the background.
+        line_spans.push(Span::styled(" ", Style::default().bg(bg)));
+        line_spans.extend(spans);
+        // Fill remaining width with background so every line is equal width.
+        let remaining = max_width.saturating_sub(content_width);
+        if remaining > 0 {
+            line_spans.push(Span::styled(
+                " ".repeat(remaining),
+                Style::default().bg(bg),
+            ));
+        }
+        // One-space right padding so text doesn't touch the frame.
+        line_spans.push(Span::styled(" ", Style::default().bg(bg)));
+        result.push(Line::from(line_spans));
+    }
+
+    // Handle empty code block / trailing newline.
     if code.ends_with('\n') || code.is_empty() {
-        result.push(Line::from(Span::styled(" ", Style::default().bg(bg))));
+        let mut line_spans: Vec<Span<'static>> = Vec::new();
+        line_spans.push(Span::styled(" ", Style::default().bg(bg)));
+        let remaining = max_width.saturating_sub(0);
+        if remaining > 0 {
+            line_spans.push(Span::styled(
+                " ".repeat(remaining),
+                Style::default().bg(bg),
+            ));
+        }
+        // One-space right padding so text doesn't touch the frame.
+        line_spans.push(Span::styled(" ", Style::default().bg(bg)));
+        result.push(Line::from(line_spans));
     }
 
-    result
+    (result, max_width)
 }
 
 /// Normalize indented ``` fences before parsing.
@@ -417,13 +514,13 @@ fn normalize_code_fences(lines: &[&str]) -> Vec<String> {
 #[cfg(test)]
 mod markdown_tests {
     use super::render_markdown;
-    use crate::ui::CODE_BLOCK_BG;
+    use crate::ui::{CODE_BLOCK_BG, Theme};
     use ratatui::style::{Color, Modifier};
     use ratatui::text::Line;
 
     /// Concatenate every span of every rendered line into one string.
     fn render_text(md: &str) -> String {
-        render_markdown(md)
+        render_markdown(md, &Theme::default())
             .iter()
             .flat_map(|l| l.spans.iter())
             .map(|s| s.content.to_string())
@@ -432,7 +529,7 @@ mod markdown_tests {
 
     #[test]
     fn heading_prefix_is_yellow_bold() {
-        let lines = render_markdown("# Title");
+        let lines = render_markdown("# Title", &Theme::default());
         let all = render_text("# Title");
         assert!(all.contains("# Title"), "heading text missing: {all:?}");
         let span = lines
@@ -456,7 +553,7 @@ mod markdown_tests {
         // Both the [RUST] header span and every highlighted body span must
         // sit on ui::CODE_BLOCK_BG — the same value wrap_and_justify_lines
         // (main.rs) keys on to leave code lines unwrapped.
-        let lines = render_markdown("```rust\nfn main() {}\n```");
+        let lines = render_markdown("```rust\nfn main() {}\n```", &Theme::default());
         let code_lines: Vec<&Line> = lines
             .iter()
             .filter(|l| l.spans.iter().any(|s| s.style.bg == Some(CODE_BLOCK_BG)))
@@ -504,7 +601,7 @@ mod markdown_tests {
 
     #[test]
     fn empty_input_renders_one_blank_line() {
-        let lines = render_markdown("");
+        let lines = render_markdown("", &Theme::default());
         assert_eq!(lines.len(), 1);
     }
 

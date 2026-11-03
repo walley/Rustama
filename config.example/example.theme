@@ -34,3 +34,6 @@ menu_border_fg     = #4C6FFF
 
 # Cloud-model entries in the model picker
 cloud_fg = #6FD3FF
+
+# Chat/output area background (default: blue)
+output_bg = #1E3C78
