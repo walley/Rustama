@@ -341,3 +341,45 @@ So your `terminal_read` screen already gives the grid; add a `mouse_state` field
 I sent `ESC[<0;44;42M` (left click at col 44, row 42) expecting the welcome window's scrollbar to scroll. It didn't — most likely because the encoding I chose didn't match the app's enabled mode, or the tracking mode wasn't confirmed active, or the event needed to be a release-delimited click and the framework routed it before the window had focus. All three are exactly what a proper host-side mouse API solves: it reads the app's actual mode, encodes correctly, and you can sequence `press`→`release` deliberately.
 
 If you implement the semantic commands above plus the mode-tracking state, mouse will work reliably for any TUI app (certik, mc, vim with mouse on, htop) — and you'll never have to hand-encode escape bytes again.
+
+---
+
+# Implementation (done)
+
+Mouse support is now implemented in the terminal tools. Summary of what was added:
+
+## New tools (5)
+
+All take 1-based `x` (column) / `y` (row) matching the `screen` grid from `terminal_read`:
+
+- `terminal_mouse_click {x, y, button?, modifiers?}` — full press+release
+- `terminal_mouse_press {x, y, button?, modifiers?}` — button down (for drags)
+- `terminal_mouse_release {x, y, button?, modifiers?}` — button up
+- `terminal_mouse_move {x, y, button?, modifiers?}` — pointer move / drag (needs ?1002/?1003)
+- `terminal_mouse_wheel {x, y, delta_y}` — scroll (delta_y>0 up, <0 down)
+
+`button` ∈ left|middle|right (wheel sets its own); `modifiers` is an optional array of shift|ctrl|alt.
+
+Each returns JSON `{delivered, bytes?, reason?, mouse, release?}`. `delivered=false` when the app hasn't enabled mouse reporting.
+
+## Mode tracking (the key piece)
+
+The vt100 parser already tracks DECSET/DECRST `?9/?1000/?1002/?1003` (tracking mode) and `?1005/?1006` (encoding). `terminal_read` now includes a `mouse` field:
+
+```json
+"mouse": {"tracking": "button-motion (?1002)", "encoding": "sgr (?1006)", "enabled": true, "cols": 80, "rows": 24}
+```
+
+`TerminalState::encode_mouse_event` reads this state and encodes the event into the correct byte sequence for the active mode/encoding:
+
+- **SGR (?1006)**: `ESC[<b;x;yM` (press/motion/wheel), `ESC[<b;x;ym` (release)
+- **X10/default**: `ESC[M` + 3 raw bytes `b+32, x+32, y+32` (release = code 3) — returned as `Vec<u8>` so bytes ≥128 stay single-byte (a `String` would UTF-8-encode them and corrupt the sequence)
+- Button code `b`: left=0, middle=1, right=2, motion+=32, wheel up=64, wheel down=65; modifiers shift+=4, alt+=8, ctrl+=16
+
+Coordinates are clamped to the grid. Motion events degrade to plain presses under ?1000 (press-release only). Events are not sent at all when tracking mode is `None` (would be misread as garbage input).
+
+## Files changed
+
+- `src/app.rs`: `MouseEventSpec`/`MouseEventKind`/`MouseButton`/`MouseModifiers`, `encode_mouse_event`, `parse_mouse_args`, `TerminalState::{mouse_state, encode_mouse_event, send_mouse_event, send_bytes}`, `mouse` field in `read_buffer_incremental`, dispatch arms + `terminal_mouse_tool` helper in `execute_terminal_tool`
+- `src/tools.rs`: 5 new entries in `TOOL_NAMES` + JSON schemas; `terminal_read` description documents the `mouse` field
+- Tests in `app::mouse_encoding_tests` (10 tests): SGR/X10 encodings, modifiers, wheel, drag, release codes, high-coordinate single-byte safety, mode degradation, arg parsing, schema presence, and live PTY tests (not delivered when off / delivered as SGR after `printf '\033[?1000h\033[?1006h'`)

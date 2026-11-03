@@ -302,9 +302,28 @@ pub struct CloudModel {
     pub api_model: String,
     pub params: ModelParams,
     pub pricing: ModelPricing,
-    /// Whether this model accepts the `reasoning_effort` parameter.
-    /// Set to `false` for models like Mistral that reject unknown parameters.
-    pub supports_reasoning_effort: bool,
+    /// How this model's API expects the reasoning toggle to be sent.
+    /// Configured per model via `reasoning_param` in `models_cloud.conf`:
+    ///   - `reasoning_effort` (default) — OpenAI-style levels
+    ///     (low/medium/high) in a top-level `reasoning_effort` field.
+    ///   - `think` — Mistral-style boolean in a top-level `think` field
+    ///     (api.mistral.ai magistral-* / reasoning-capable models).
+    ///   - `none` — never send any reasoning parameter.
+    pub reasoning_param: ReasoningParam,
+}
+
+/// Which request field carries the reasoning toggle for a cloud model.
+/// Purely config-driven (`reasoning_param` key in `models_cloud.conf`),
+/// so no provider is special-cased in code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ReasoningParam {
+    /// OpenAI-style top-level `reasoning_effort` with levels only.
+    #[default]
+    ReasoningEffort,
+    /// Mistral-style top-level `think` boolean.
+    Think,
+    /// Never send a reasoning parameter.
+    None,
 }
 
 impl Default for Config {
@@ -873,6 +892,9 @@ fn default_cloud_conf() -> String {
          # Required fields: api_url, api_key\n\
          # Optional: api_model (actual model name sent to API, defaults to section name)\n\
          # Optional: max_output_tokens (default: 16384), seed\n\
+         # Optional: reasoning_param — which request field carries the reasoning\n\
+         #   toggle: reasoning_effort (default, levels low/medium/high),\n\
+         #   think (boolean, e.g. Mistral api.mistral.ai models), or none.\n\
          # Optional pricing in USD per 1M tokens (enables cost estimate):\n\
          #   price_input, price_output, price_cached_read, price_cache_write\n\
          \n\
@@ -1188,7 +1210,7 @@ fn parse_cloud_models(content: &str, base: &ModelParams) -> Vec<CloudModel> {
     let mut current_api_model = String::new();
     let mut current_params = default_params.clone();
     let mut current_pricing = default_pricing.clone();
-    let mut current_supports_reasoning_effort = true;
+    let mut current_reasoning_param = ReasoningParam::default();
 
     for line in content.lines() {
         let line = line.trim();
@@ -1215,7 +1237,7 @@ fn parse_cloud_models(content: &str, base: &ModelParams) -> Vec<CloudModel> {
                     api_model,
                     params: current_params.clone(),
                     pricing: current_pricing.clone(),
-                    supports_reasoning_effort: current_supports_reasoning_effort,
+                    reasoning_param: current_reasoning_param,
                 });
             }
             current_name = Some(line[1..line.len() - 1].trim().to_string());
@@ -1224,7 +1246,7 @@ fn parse_cloud_models(content: &str, base: &ModelParams) -> Vec<CloudModel> {
             current_api_model.clear();
             current_params = default_params.clone();
             current_pricing = default_pricing.clone();
-            current_supports_reasoning_effort = true;
+            current_reasoning_param = ReasoningParam::default();
         } else if let Some((key, value)) = line.split_once('=') {
             let key = key.trim().to_lowercase();
             let value = value.trim().to_string();
@@ -1232,9 +1254,21 @@ fn parse_cloud_models(content: &str, base: &ModelParams) -> Vec<CloudModel> {
                 "api_url" => current_url = value,
                 "api_key" => current_key = value,
                 "api_model" => current_api_model = value,
+                // Which request field carries the reasoning toggle:
+                // reasoning_effort (default) | think | none.
+                "reasoning_param" => {
+                    current_reasoning_param = match value.to_lowercase().as_str() {
+                        "think" => ReasoningParam::Think,
+                        "none" | "off" => ReasoningParam::None,
+                        _ => ReasoningParam::ReasoningEffort,
+                    };
+                }
+                // Legacy key: reasoning_effort_supported=false is equivalent
+                // to reasoning_param=none; true keeps the default.
                 "reasoning_effort_supported" => {
-                    current_supports_reasoning_effort =
-                        value.parse::<bool>().unwrap_or(true);
+                    if !value.parse::<bool>().unwrap_or(true) {
+                        current_reasoning_param = ReasoningParam::None;
+                    }
                 }
                 _ => apply_cloud_setting(&key, &value, &mut current_params, &mut current_pricing),
             }
@@ -1259,7 +1293,7 @@ fn parse_cloud_models(content: &str, base: &ModelParams) -> Vec<CloudModel> {
             api_model,
             params: current_params,
             pricing: current_pricing,
-            supports_reasoning_effort: current_supports_reasoning_effort,
+            reasoning_param: current_reasoning_param,
         });
     }
 
@@ -1678,6 +1712,20 @@ mod tests {
     }
 
     #[test]
+    fn reasoning_param_key_selects_request_field() {
+        let conf = "[a]\napi_url = https://x\napi_key = k\nreasoning_param = think\n\
+                    \n[b]\napi_url = https://y\napi_key = k\nreasoning_param = none\n\
+                    \n[c]\napi_url = https://z\napi_key = k\n\
+                    \n[d]\napi_url = https://w\napi_key = k\nreasoning_effort_supported = false\n";
+        let models = parse_cloud_models(conf, &ModelParams::default());
+        assert_eq!(models[0].reasoning_param, ReasoningParam::Think);
+        assert_eq!(models[1].reasoning_param, ReasoningParam::None);
+        assert_eq!(models[2].reasoning_param, ReasoningParam::ReasoningEffort);
+        // Legacy key maps to None.
+        assert_eq!(models[3].reasoning_param, ReasoningParam::None);
+    }
+
+    #[test]
     fn placeholder_keys_are_skipped() {
         let conf = "[mistral-small]\n\
                     api_url = https://api.mistral.ai/v1/chat/completions\n\
@@ -2079,3 +2127,30 @@ mod tests {
         assert!(out.contains("[b]\ny = 2\nseed = 3\n"));
     }
 }
+
+#[cfg(test)]
+mod user_conf_smoke {
+    use super::*;
+
+    /// Sanity check against the developer's real models_cloud.conf when it
+    /// exists: every section must parse and mistral-hosted ones must use
+    /// `think`. Skipped silently on other machines.
+    #[test]
+    fn dev_models_cloud_conf_parses_with_reasoning_params() {
+        let Some(dir) = conf_dir() else { return };
+        let path = dir.join(CLOUD_MODELS_FILE);
+        let Ok(content) = std::fs::read_to_string(&path) else { return };
+        if !content.contains("api.mistral.ai") {
+            return; // not the dev machine's conf
+        }
+        let models = parse_cloud_models(&content, &ModelParams::default());
+        assert!(!models.is_empty());
+        for m in &models {
+            if m.api_url.contains("api.mistral.ai") && m.name.starts_with("magistral") {
+                assert_eq!(m.reasoning_param, ReasoningParam::Think, "{}", m.name);
+            }
+        }
+    }
+}
+
+

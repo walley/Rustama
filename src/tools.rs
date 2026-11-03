@@ -498,6 +498,11 @@ pub(crate) const TOOL_NAMES: &[&str] = &[
     "terminal_send",
     "terminal_read",
     "terminal_close",
+    "terminal_mouse_click",
+    "terminal_mouse_press",
+    "terminal_mouse_release",
+    "terminal_mouse_move",
+    "terminal_mouse_wheel",
     "lsp_diagnostics",
     "lsp_definition",
     "lsp_symbol_info",
@@ -732,7 +737,7 @@ pub(crate) fn get_tool_definitions() -> Vec<serde_json::Value> {
             "type": "function",
             "function": {
                 "name": "terminal_read",
-                "description": "Read output from the terminal session. Returns JSON with 'output' (new raw output since 'cursor'), 'cursor' (pass on the next read for incremental output), 'gap' (true if output was lost to buffer overflow), 'screen' (the current rendered terminal screen as text — like a screenshot; this is what shows what full-screen/interactive programs are doing), and 'screen_cursor' (cursor row/col on screen). On the first read, omit 'cursor'. Use 'screen' to understand the current state of interactive/TUI programs.",
+                "description": "Read output from the terminal session. Returns JSON with 'output' (new raw output since 'cursor'), 'cursor' (pass on the next read for incremental output), 'gap' (true if output was lost to buffer overflow), 'screen' (the current rendered terminal screen as text — like a screenshot; this is what shows what full-screen/interactive programs are doing), 'screen_cursor' (cursor row/col on screen), and 'mouse' (the mouse-reporting mode the app enabled: tracking, encoding, enabled flag, and grid cols/rows — use this to know whether terminal_mouse_* events will be delivered, and to map 1-based x/y coordinates onto the screen grid). On the first read, omit 'cursor'. Use 'screen' to understand the current state of interactive/TUI programs.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -752,6 +757,90 @@ pub(crate) fn get_tool_definitions() -> Vec<serde_json::Value> {
                 "parameters": {
                     "type": "object",
                     "properties": {}
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "terminal_mouse_click",
+                "description": "Click the mouse at a position in the terminal session's screen grid (a full press+release). Coordinates are 1-based (x = column, y = row), matching the 'screen' grid returned by terminal_read (row 1 is the top line, column 1 is the leftmost). Use terminal_read first to see the screen and pick a target. The event is encoded according to the mouse mode the running app enabled (shown in terminal_read's 'mouse' field); if the app has not enabled mouse reporting, delivered=false is returned. Use this to click buttons, scrollbars, menu items, etc. in TUI apps (mc, htop, vim with mouse, TUIs).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "x": { "type": "integer", "description": "Column (1-based, leftmost = 1)" },
+                        "y": { "type": "integer", "description": "Row (1-based, top = 1)" },
+                        "button": { "type": "string", "enum": ["left", "middle", "right"], "description": "Mouse button. Default: left" },
+                        "modifiers": { "type": "array", "items": { "type": "string", "enum": ["shift", "ctrl", "alt"] }, "description": "Optional held modifiers" }
+                    },
+                    "required": ["x", "y"]
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "terminal_mouse_press",
+                "description": "Press (and hold) a mouse button at a position in the terminal screen grid, without releasing. Use together with terminal_mouse_release (or terminal_mouse_move while held) to perform drags. Coordinates are 1-based (x=column, y=row). Encoded per the app's enabled mouse mode; delivered=false if mouse reporting is off.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "x": { "type": "integer", "description": "Column (1-based)" },
+                        "y": { "type": "integer", "description": "Row (1-based)" },
+                        "button": { "type": "string", "enum": ["left", "middle", "right"], "description": "Mouse button. Default: left" },
+                        "modifiers": { "type": "array", "items": { "type": "string", "enum": ["shift", "ctrl", "alt"] }, "description": "Optional held modifiers" }
+                    },
+                    "required": ["x", "y"]
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "terminal_mouse_release",
+                "description": "Release a previously pressed mouse button at a position in the terminal screen grid. Coordinates are 1-based (x=column, y=row). Pair with terminal_mouse_press to complete a click or end a drag. Encoded per the app's enabled mouse mode.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "x": { "type": "integer", "description": "Column (1-based)" },
+                        "y": { "type": "integer", "description": "Row (1-based)" },
+                        "button": { "type": "string", "enum": ["left", "middle", "right"], "description": "Mouse button. Default: left" },
+                        "modifiers": { "type": "array", "items": { "type": "string", "enum": ["shift", "ctrl", "alt"] }, "description": "Optional held modifiers" }
+                    },
+                    "required": ["x", "y"]
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "terminal_mouse_move",
+                "description": "Move the mouse pointer to a position in the terminal screen grid, optionally with a button held (for drags — requires the app to have enabled button-motion/any-motion tracking, ?1002/?1003). Coordinates are 1-based (x=column, y=row). Set 'button' to the held button for a drag, or omit for a hover move.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "x": { "type": "integer", "description": "Column (1-based)" },
+                        "y": { "type": "integer", "description": "Row (1-based)" },
+                        "button": { "type": "string", "enum": ["left", "middle", "right", "none"], "description": "Button held during the move (for drags). Default: none" },
+                        "modifiers": { "type": "array", "items": { "type": "string", "enum": ["shift", "ctrl", "alt"] }, "description": "Optional held modifiers" }
+                    },
+                    "required": ["x", "y"]
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "terminal_mouse_wheel",
+                "description": "Scroll the mouse wheel at a position in the terminal screen grid (e.g. to scroll a TUI's content or list). Coordinates are 1-based (x=column, y=row). delta_y > 0 scrolls up, delta_y < 0 scrolls down (one notch per unit).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "x": { "type": "integer", "description": "Column (1-based)" },
+                        "y": { "type": "integer", "description": "Row (1-based)" },
+                        "delta_y": { "type": "integer", "description": "Scroll amount: positive = up, negative = down. Default: -1" }
+                    },
+                    "required": ["x", "y"]
                 }
             }
         }),

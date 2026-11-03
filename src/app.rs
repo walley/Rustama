@@ -16,9 +16,9 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
 
 use crate::config::{
-    CloudModel, Config, ModelParams, ModelParamsStore, ModelsConfFiles, find_conf_file,
-    load_agents_md, load_cloud_models_with_base, load_model_params, read_models_conf_files,
-    save_model_params,
+    CloudModel, Config, ModelParams, ModelParamsStore, ModelsConfFiles, ReasoningParam,
+    find_conf_file, load_agents_md, load_cloud_models_with_base, load_model_params,
+    read_models_conf_files, save_model_params,
 };
 use crate::tools::{cap_tool_result, execute_tool_call, get_tool_definitions, parse_text_tool_calls};
 pub use crate::spinners::SPINNERS;
@@ -758,6 +758,85 @@ impl TerminalState {
             .unwrap_or_else(|e| e)
     }
 
+    /// Snapshot of the child app's mouse-reporting state, read from the
+    /// vt100 screen model (which tracks DECSET/DECRST `?1000/?1002/?1003/
+    /// ?1005/?1006`). Surfaced in `terminal_read` so the model can tell
+    /// whether a `terminal_mouse_*` call will actually be delivered.
+    pub fn mouse_state(&self) -> serde_json::Value {
+        let core = self.core.lock().unwrap();
+        let screen = core.parser.screen();
+        let (rows, cols) = screen.size();
+        serde_json::json!({
+            "tracking": match screen.mouse_protocol_mode() {
+                vt100::MouseProtocolMode::None => "none",
+                vt100::MouseProtocolMode::Press => "press (?9 / X10)",
+                vt100::MouseProtocolMode::PressRelease => "press-release (?1000)",
+                vt100::MouseProtocolMode::ButtonMotion => "button-motion (?1002)",
+                vt100::MouseProtocolMode::AnyMotion => "any-motion (?1003)",
+            },
+            "encoding": match screen.mouse_protocol_encoding() {
+                vt100::MouseProtocolEncoding::Default => "x10",
+                vt100::MouseProtocolEncoding::Utf8 => "utf8 (?1005)",
+                vt100::MouseProtocolEncoding::Sgr => "sgr (?1006)",
+            },
+            "enabled": screen.mouse_protocol_mode() != vt100::MouseProtocolMode::None,
+            "cols": cols,
+            "rows": rows,
+        })
+    }
+
+    /// Encodes one mouse event into the byte sequence a real terminal
+    /// would write to the PTY master for it, honouring the encoding
+    /// (`x10`/`utf8`/`sgr`) the child app enabled via DECSET. Returns
+    /// `None` when the app has mouse reporting disabled (mode `None`),
+    /// because the bytes would be swallowed/misread by the app.
+    ///
+    /// Coordinates are 1-based (col, row), matching what `terminal_read`
+    /// reports in `screen`/`screen_cursor`.
+    pub fn encode_mouse_event(&self, ev: &MouseEventSpec) -> Option<Vec<u8>> {
+        let core = self.core.lock().unwrap();
+        let screen = core.parser.screen();
+        let mode = screen.mouse_protocol_mode();
+        if mode == vt100::MouseProtocolMode::None {
+            return None;
+        }
+        let enc = screen.mouse_protocol_encoding();
+        // Clamp to the grid so we never emit out-of-range coordinates.
+        let (rows, cols) = screen.size();
+        let x = ev.x.clamp(1, cols.max(1) as u32);
+        let y = ev.y.clamp(1, rows.max(1) as u32);
+        Some(encode_mouse_event(ev, mode, enc, x, y))
+    }
+
+    /// Sends a semantic mouse event (click / press / release / move /
+    /// wheel) to the running terminal, encoding it per the app's current
+    /// mouse mode. Returns a JSON status string for the tool result.
+    pub fn send_mouse_event(&mut self, ev: &MouseEventSpec) -> String {
+        let encoded = self.encode_mouse_event(ev);
+        match encoded {
+            None => serde_json::json!({
+                "delivered": false,
+                "reason": "the app has not enabled mouse reporting (no ?9/?1000/?1002/?1003 DECSET seen)",
+                "mouse": self.mouse_state(),
+            })
+            .to_string(),
+            Some(bytes) => match self.send_bytes(&bytes) {
+                Ok(()) => serde_json::json!({
+                    "delivered": true,
+                    "bytes": String::from_utf8_lossy(&bytes),
+                    "mouse": self.mouse_state(),
+                })
+                .to_string(),
+                Err(e) => serde_json::json!({
+                    "delivered": false,
+                    "reason": e,
+                    "mouse": self.mouse_state(),
+                })
+                .to_string(),
+            },
+        }
+    }
+
     /// Whether the child app enabled application cursor keys mode
     /// (DECCKM, `ESC[?1h`) — the vt100 parser tracks it. Full-screen
     /// apps (htop, vim, less) turn it on; see [`key_to_pty_bytes`].
@@ -768,11 +847,18 @@ impl TerminalState {
     /// Writes raw bytes to the PTY master with no trailing newline —
     /// keystrokes, escape sequences, control characters.
     pub fn send_raw(&mut self, data: &str) -> Result<(), String> {
+        self.send_bytes(data.as_bytes())
+    }
+
+    /// Byte-level variant of [`send_raw`](Self::send_raw): writes exact
+    /// bytes (which may be non-UTF-8, e.g. X10 mouse sequences with
+    /// values ≥ 128) to the PTY master.
+    pub fn send_bytes(&mut self, data: &[u8]) -> Result<(), String> {
         let mut writer = self.writer.lock().unwrap();
         match writer.as_mut() {
             Some(w) => {
                 use std::io::Write;
-                w.write_all(data.as_bytes())
+                w.write_all(data)
                     .and_then(|()| w.flush())
                     .map_err(|e| format!("Error writing to terminal: {}", e))
             }
@@ -851,6 +937,26 @@ impl TerminalState {
         result["screen"] = serde_json::json!(c.parser.screen().contents());
         let (row, col) = c.parser.screen().cursor_position();
         result["screen_cursor"] = serde_json::json!({"row": row, "col": col});
+        // Mouse-reporting state (which tracking mode / encoding the child
+        // app enabled), so terminal_mouse_* calls know if they'll land.
+        let (rows, cols) = c.parser.screen().size();
+        result["mouse"] = serde_json::json!({
+            "tracking": match c.parser.screen().mouse_protocol_mode() {
+                vt100::MouseProtocolMode::None => "none",
+                vt100::MouseProtocolMode::Press => "press (?9 / X10)",
+                vt100::MouseProtocolMode::PressRelease => "press-release (?1000)",
+                vt100::MouseProtocolMode::ButtonMotion => "button-motion (?1002)",
+                vt100::MouseProtocolMode::AnyMotion => "any-motion (?1003)",
+            },
+            "encoding": match c.parser.screen().mouse_protocol_encoding() {
+                vt100::MouseProtocolEncoding::Default => "x10",
+                vt100::MouseProtocolEncoding::Utf8 => "utf8 (?1005)",
+                vt100::MouseProtocolEncoding::Sgr => "sgr (?1006)",
+            },
+            "enabled": c.parser.screen().mouse_protocol_mode() != vt100::MouseProtocolMode::None,
+            "cols": cols,
+            "rows": rows,
+        });
         result
     }
 
@@ -868,6 +974,156 @@ impl TerminalState {
         self.command.clear();
         *self.core.lock().unwrap() = TerminalCore::new(self.size.0, self.size.1);
         "Terminal closed".to_string()
+    }
+}
+
+/// A semantic mouse event, as requested by the `terminal_mouse_*` tools.
+/// Coordinates are 1-based (col, row) on the terminal grid — the same
+/// coordinate space `terminal_read` reports via `screen`/`screen_cursor`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MouseEventSpec {
+    pub kind: MouseEventKind,
+    pub button: MouseButton,
+    pub x: u32,
+    pub y: u32,
+    pub modifiers: MouseModifiers,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MouseEventKind {
+    /// Button pressed down.
+    Press,
+    /// Button released.
+    Release,
+    /// Pointer moved (with `button` held, for drags; `None`-ish when no
+    /// button is held — encoded as motion-only).
+    Move,
+    /// Mouse wheel scrolled. `button` carries the direction
+    /// ([`MouseButton::WheelUp`] / [`MouseButton::WheelDown`]).
+    Wheel,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MouseButton {
+    Left,
+    Middle,
+    Right,
+    WheelUp,
+    WheelDown,
+    /// No button (pure motion). Encodes as the "no button" motion code.
+    None,
+}
+
+/// Modifier flags OR-ed together (shift=4, alt/meta=8, ctrl=16), matching
+/// the xterm modifier bits added to the mouse button code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MouseModifiers {
+    pub shift: bool,
+    pub alt: bool,
+    pub ctrl: bool,
+}
+
+impl MouseModifiers {
+    fn bits(self) -> u32 {
+        let mut b = 0;
+        if self.shift {
+            b |= 4;
+        }
+        if self.alt {
+            b |= 8;
+        }
+        if self.ctrl {
+            b |= 16;
+        }
+        b
+    }
+}
+
+/// Encodes a semantic mouse event into the exact bytes a real terminal
+/// writes to the PTY master for it, given the app's current mouse mode
+/// and encoding (both tracked by the vt100 parser from DECSET/DECRST).
+///
+/// Encodings:
+/// * **SGR** (`?1006`): `ESC[<b;x;yM` (press/motion/wheel) or `...m`
+///   (release). x,y are 1-based decimal.
+/// * **UTF-8** (`?1005`): like SGR but coordinates encoded as UTF-8
+///   codepoints offset by 32 (only matters >223; we emit SGR-style
+///   numbers which are valid for the common range).
+/// * **X10/default**: `ESC[M` + three bytes `b+32`, `x+32`, `y+32`
+///   (release uses button code 3). Coordinates must be ≤223.
+///
+/// Button code `b` (before modifiers): left=0, middle=1, right=2,
+/// motion flag=+32, wheel up=64, wheel down=65, no-button motion=35.
+fn encode_mouse_event(
+    ev: &MouseEventSpec,
+    mode: vt100::MouseProtocolMode,
+    enc: vt100::MouseProtocolEncoding,
+    x: u32,
+    y: u32,
+) -> Vec<u8> {
+    use vt100::{MouseProtocolEncoding as Enc, MouseProtocolMode as Mode};
+
+    // Base button code per xterm.
+    let base: u32 = match ev.kind {
+        MouseEventKind::Wheel => match ev.button {
+            MouseButton::WheelUp => 64,
+            MouseButton::WheelDown => 65,
+            _ => 64,
+        },
+        MouseEventKind::Release => match ev.button {
+            MouseButton::Left => 0,
+            MouseButton::Middle => 1,
+            MouseButton::Right => 2,
+            _ => 0,
+        },
+        MouseEventKind::Press => match ev.button {
+            MouseButton::Left => 0,
+            MouseButton::Middle => 1,
+            MouseButton::Right => 2,
+            _ => 0,
+        },
+        MouseEventKind::Move => {
+            // Motion flag (32) + the held button (0/1/2), or 35 for
+            // button-less motion.
+            32 + match ev.button {
+                MouseButton::Left => 0,
+                MouseButton::Middle => 1,
+                MouseButton::Right => 2,
+                _ => 3,
+            }
+        }
+    };
+    let b = base + ev.modifiers.bits();
+
+    // Motion events are only meaningful under ?1002/?1003; under ?1000
+    // (press-release only) a motion event degrades to a plain press so
+    // the app still sees *something* rather than nothing.
+    let b = match (ev.kind, mode) {
+        (MouseEventKind::Move, Mode::PressRelease) => b & !32, // strip motion flag
+        _ => b,
+    };
+
+    match enc {
+        Enc::Sgr | Enc::Utf8 => {
+            let final_char = if ev.kind == MouseEventKind::Release {
+                'm'
+            } else {
+                'M'
+            };
+            format!("\x1b[<{};{};{}{}", b, x, y, final_char).into_bytes()
+        }
+        Enc::Default => {
+            // X10: ESC[M Cb Cx Cy, each byte = value + 32 (raw byte, may
+            // be ≥128 — hence Vec<u8>, never a UTF-8 String). Release is
+            // encoded as button code 3 (plus modifiers), NOT via the SGR
+            // lowercase trick. Coordinates are capped at 223 (255-32).
+            let release = ev.kind == MouseEventKind::Release;
+            let cb = if release { 3 + ev.modifiers.bits() } else { b };
+            let cx = (x.min(223) + 32) as u8;
+            let cy = (y.min(223) + 32) as u8;
+            let cbc = (cb.min(223) + 32) as u8;
+            vec![b'\x1b', b'[', b'M', cbc, cx, cy]
+        }
     }
 }
 
@@ -1053,6 +1309,60 @@ fn decode_terminal_escapes(input: &str) -> String {
     }
 
     out
+}
+
+/// Returns the thinking text that immediately precedes an assistant
+/// message in the chat history (the `Thinking` message directly before
+/// it), if any. Used to replay prior reasoning to Ollama as the
+/// assistant message's `thinking` field on subsequent turns — Ollama's
+/// reasoning models expect it there, not as a separate message.
+fn assistant_thinking_of(messages: &[ChatMessage], assistant: &ChatMessage) -> Option<String> {
+    let pos = messages.iter().position(|m| std::ptr::eq(m, assistant))?;
+    if pos == 0 {
+        return None;
+    }
+    match &messages[pos - 1] {
+        ChatMessage::Thinking { text, .. } if !text.is_empty() => Some(text.clone()),
+        _ => None,
+    }
+}
+
+/// Parses the common arguments of a `terminal_mouse_*` tool call into a
+/// [`MouseEventSpec`]. `x`/`y` are 1-based (col, row); `button` defaults
+/// to `left` (or `none` for `move`); `modifiers` is an optional array of
+/// `"shift"`/`"ctrl"`/`"alt"`.
+fn parse_mouse_args(args: &serde_json::Value, kind: MouseEventKind) -> MouseEventSpec {
+    let x = args["x"].as_u64().unwrap_or(1) as u32;
+    let y = args["y"].as_u64().unwrap_or(1) as u32;
+    let button = match args["button"].as_str().unwrap_or(match kind {
+        MouseEventKind::Move => "none",
+        _ => "left",
+    }) {
+        "left" => MouseButton::Left,
+        "middle" => MouseButton::Middle,
+        "right" => MouseButton::Right,
+        "wheel_up" | "up" => MouseButton::WheelUp,
+        "wheel_down" | "down" => MouseButton::WheelDown,
+        _ => MouseButton::None,
+    };
+    let mut modifiers = MouseModifiers::default();
+    if let Some(mods) = args["modifiers"].as_array() {
+        for m in mods.iter().filter_map(|v| v.as_str()) {
+            match m {
+                "shift" => modifiers.shift = true,
+                "ctrl" | "control" => modifiers.ctrl = true,
+                "alt" | "meta" => modifiers.alt = true,
+                _ => {}
+            }
+        }
+    }
+    MouseEventSpec {
+        kind,
+        button,
+        x,
+        y,
+        modifiers,
+    }
 }
 
 /// Identifies the dialog button the left mouse button is currently held
@@ -1971,8 +2281,72 @@ impl App {
                 Some(result.to_string())
             }
             "terminal_close" => Some(self.terminal_state.close()),
+            "terminal_mouse_click" => {
+                let args: serde_json::Value =
+                    serde_json::from_str(args_json).unwrap_or(serde_json::json!({}));
+                Some(self.terminal_mouse_tool(&args, MouseEventKind::Press, true))
+            }
+            "terminal_mouse_press" => {
+                let args: serde_json::Value =
+                    serde_json::from_str(args_json).unwrap_or(serde_json::json!({}));
+                Some(self.terminal_mouse_tool(&args, MouseEventKind::Press, false))
+            }
+            "terminal_mouse_release" => {
+                let args: serde_json::Value =
+                    serde_json::from_str(args_json).unwrap_or(serde_json::json!({}));
+                Some(self.terminal_mouse_tool(&args, MouseEventKind::Release, false))
+            }
+            "terminal_mouse_move" => {
+                let args: serde_json::Value =
+                    serde_json::from_str(args_json).unwrap_or(serde_json::json!({}));
+                Some(self.terminal_mouse_tool(&args, MouseEventKind::Move, false))
+            }
+            "terminal_mouse_wheel" => {
+                let args: serde_json::Value =
+                    serde_json::from_str(args_json).unwrap_or(serde_json::json!({}));
+                let delta = args["delta_y"].as_i64().unwrap_or(-1);
+                let button = if delta >= 0 {
+                    MouseButton::WheelUp
+                } else {
+                    MouseButton::WheelDown
+                };
+                let mut ev = parse_mouse_args(&args, MouseEventKind::Wheel);
+                ev.button = button;
+                Some(self.terminal_state.send_mouse_event(&ev))
+            }
             _ => None,
         }
+    }
+
+    /// Shared handler for the `terminal_mouse_*` tools (except wheel,
+    /// which sets its own button). Parses the common args, optionally
+    /// appends a matching release so a "click" is a full press+release.
+    fn terminal_mouse_tool(
+        &mut self,
+        args: &serde_json::Value,
+        kind: MouseEventKind,
+        with_release: bool,
+    ) -> String {
+        let ev = parse_mouse_args(args, kind);
+        let mut out = self.terminal_state.send_mouse_event(&ev);
+        if with_release && kind == MouseEventKind::Press {
+            let rel = MouseEventSpec {
+                kind: MouseEventKind::Release,
+                button: ev.button,
+                x: ev.x,
+                y: ev.y,
+                modifiers: ev.modifiers,
+            };
+            let rel_out = self.terminal_state.send_mouse_event(&rel);
+            // Fold both results into one JSON object.
+            let mut a: serde_json::Value =
+                serde_json::from_str(&out).unwrap_or(serde_json::json!({}));
+            let b: serde_json::Value =
+                serde_json::from_str(&rel_out).unwrap_or(serde_json::json!({}));
+            a["release"] = b;
+            out = a.to_string();
+        }
+        out
     }
 
     // ─── LSP (rust-analyzer) ─────────────────────────────────────────
@@ -3120,15 +3494,30 @@ impl App {
                     api_messages.push(serde_json::json!({"role": "user", "content": t}));
                 }
                 ChatMessage::Assistant { text: t, .. } => {
-                    api_messages.push(serde_json::json!({"role": "assistant", "content": t}));
+                    // Ollama reasoning models want prior thinking replayed as
+                    // assistant `thinking` so multi-turn context stays coherent;
+                    // cloud APIs don't accept that field and get plain content.
+                    let mut msg = serde_json::json!({"role": "assistant", "content": t});
+                    if !is_cloud {
+                        if let Some(th) = assistant_thinking_of(&self.messages, m) {
+                            msg["thinking"] = serde_json::json!(th);
+                        }
+                    }
+                    api_messages.push(msg);
                 }
                 ChatMessage::System { .. } => {}
                 ChatMessage::App { .. } => {}
                 ChatMessage::Thinking { text: t, .. } => {
-                    api_messages.push(serde_json::json!({
-                        "role": "system",
-                        "content": format!("Your previous reasoning (interrupted): {}", t),
-                    }));
+                    if is_cloud {
+                        // Cloud APIs have no slot for orphaned thinking; keep it
+                        // as a system note so it isn't lost entirely.
+                        api_messages.push(serde_json::json!({
+                            "role": "system",
+                            "content": format!("Your previous reasoning (interrupted): {}", t),
+                        }));
+                    }
+                    // Ollama: thinking is attached to the assistant message
+                    // itself (see Assistant arm above), so nothing to push here.
                 }
                 ChatMessage::FileContent { name, content, .. } => {
                     api_messages.push(serde_json::json!({
@@ -3298,15 +3687,30 @@ impl App {
                     api_messages.push(serde_json::json!({"role": "user", "content": t}));
                 }
                 ChatMessage::Assistant { text: t, .. } => {
-                    api_messages.push(serde_json::json!({"role": "assistant", "content": t}));
+                    // Ollama reasoning models want prior thinking replayed as
+                    // assistant `thinking` so multi-turn context stays coherent;
+                    // cloud APIs don't accept that field and get plain content.
+                    let mut msg = serde_json::json!({"role": "assistant", "content": t});
+                    if !is_cloud {
+                        if let Some(th) = assistant_thinking_of(&self.messages, m) {
+                            msg["thinking"] = serde_json::json!(th);
+                        }
+                    }
+                    api_messages.push(msg);
                 }
                 ChatMessage::System { .. } => {}
                 ChatMessage::App { .. } => {}
                 ChatMessage::Thinking { text: t, .. } => {
-                    api_messages.push(serde_json::json!({
-                        "role": "system",
-                        "content": format!("Your previous reasoning (interrupted): {}", t),
-                    }));
+                    if is_cloud {
+                        // Cloud APIs have no slot for orphaned thinking; keep it
+                        // as a system note so it isn't lost entirely.
+                        api_messages.push(serde_json::json!({
+                            "role": "system",
+                            "content": format!("Your previous reasoning (interrupted): {}", t),
+                        }));
+                    }
+                    // Ollama: thinking is attached to the assistant message
+                    // itself (see Assistant arm above), so nothing to push here.
                 }
                 ChatMessage::FileContent { name, content, .. } => {
                     api_messages.push(serde_json::json!({
@@ -6995,6 +7399,10 @@ fn parse_token_stats(json: &serde_json::Value) -> TokenStats {
         prompt_tokens: json["prompt_eval_count"].as_u64().unwrap_or(0),
         response_tokens,
         cached_tokens: 0,
+        // Ollama reports reasoning tokens in `prompt_eval_count` when
+        // thinking is on but not as a separate counter; the closest
+        // available signal is the thinking length. We leave it 0 here and
+        // let the UI count reasoning tokens from streamed thinking text.
         reasoning_tokens: 0,
         total_duration_ms: json["total_duration"].as_u64().unwrap_or(0) / 1_000_000,
         tokens_per_sec,
@@ -7112,7 +7520,7 @@ mod usage_tests {
                 cached_read_per_mtok: Some(0.30),
                 cache_write_per_mtok: None,
             },
-            supports_reasoning_effort: true,
+            reasoning_param: ReasoningParam::ReasoningEffort,
         });
         // 1M fresh in * $3 + 1M cached * $0.30 + 100k out * $15
         // = 3.0 + 0.3 + 1.5 = 4.8
@@ -8924,6 +9332,377 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+mod reasoning_tests {
+    use super::*;
+
+    fn msgs_with_thinking() -> Vec<ChatMessage> {
+        vec![
+            ChatMessage::user("hi".to_string()),
+            ChatMessage::thinking("let me think".to_string()),
+            ChatMessage::assistant("answer".to_string()),
+            ChatMessage::user("again".to_string()),
+        ]
+    }
+
+    #[test]
+    fn assistant_thinking_of_finds_preceding_thinking() {
+        let msgs = msgs_with_thinking();
+        let assistant = msgs.iter().find(|m| matches!(m, ChatMessage::Assistant { .. })).unwrap();
+        assert_eq!(
+            assistant_thinking_of(&msgs, assistant).as_deref(),
+            Some("let me think")
+        );
+    }
+
+    #[test]
+    fn assistant_thinking_of_none_without_thinking() {
+        let msgs = vec![
+            ChatMessage::user("hi".to_string()),
+            ChatMessage::assistant("answer".to_string()),
+        ];
+        let assistant = msgs.iter().find(|m| matches!(m, ChatMessage::Assistant { .. })).unwrap();
+        assert_eq!(assistant_thinking_of(&msgs, assistant), None);
+    }
+
+    #[test]
+    fn ollama_body_has_think_field_for_levels_and_toggles() {
+        let msgs = || vec![serde_json::json!({"role": "user", "content": "hi"})];
+        let mut p = ModelParams::default();
+
+        p.reasoning_effort = Some("high".to_string());
+        let body = build_chat_body("m", None, ChatMode::Chat, &msgs(), &p);
+        assert_eq!(body["think"], "high");
+
+        p.reasoning_effort = Some("on".to_string());
+        let body = build_chat_body("m", None, ChatMode::Chat, &msgs(), &p);
+        assert_eq!(body["think"], true);
+
+        p.reasoning_effort = Some("off".to_string());
+        let body = build_chat_body("m", None, ChatMode::Chat, &msgs(), &p);
+        assert_eq!(body["think"], false);
+
+        p.reasoning_effort = None;
+        let body = build_chat_body("m", None, ChatMode::Chat, &msgs(), &p);
+        assert!(body.get("think").is_none(), "unset effort must not send think");
+    }
+
+    #[test]
+    fn cloud_body_sends_reasoning_effort_levels_only() {
+        let msgs = || vec![serde_json::json!({"role": "user", "content": "hi"})];
+        let cloud = CloudModel {
+            name: "c".to_string(),
+            api_url: "https://x/api/chat".to_string(),
+            api_model: "m".to_string(),
+            api_key: "k".to_string(),
+            params: ModelParams::default(),
+            pricing: crate::config::ModelPricing::default(),
+            reasoning_param: ReasoningParam::ReasoningEffort,
+        };
+        let mut p = ModelParams::default();
+        p.reasoning_effort = Some("medium".to_string());
+        let body = build_chat_body("c", Some(&cloud), ChatMode::Chat, &msgs(), &p);
+        assert_eq!(body["reasoning_effort"], "medium");
+
+        // "on" is an Ollama-style toggle, not a cloud level — must not be sent.
+        p.reasoning_effort = Some("on".to_string());
+        let body = build_chat_body("c", Some(&cloud), ChatMode::Chat, &msgs(), &p);
+        assert!(body.get("reasoning_effort").is_none());
+
+        // reasoning_param=none → never sent, regardless of effort.
+        let mut cloud2 = cloud.clone();
+        cloud2.reasoning_param = ReasoningParam::None;
+        p.reasoning_effort = Some("high".to_string());
+        let body = build_chat_body("c", Some(&cloud2), ChatMode::Chat, &msgs(), &p);
+        assert!(body.get("reasoning_effort").is_none());
+        assert!(body.get("think").is_none());
+    }
+
+    #[test]
+    fn reasoning_param_think_sends_boolean_think() {
+        // Config-driven: any model with `reasoning_param = think` gets a
+        // top-level `think` boolean instead of `reasoning_effort`.
+        let msgs = || vec![serde_json::json!({"role": "user", "content": "hi"})];
+        let cloud = CloudModel {
+            name: "m".to_string(),
+            api_url: "https://api.example.com/v1/chat/completions".to_string(),
+            api_model: "some-reasoning-model".to_string(),
+            api_key: "k".to_string(),
+            params: ModelParams::default(),
+            pricing: crate::config::ModelPricing::default(),
+            reasoning_param: ReasoningParam::Think,
+        };
+        let mut p = ModelParams::default();
+
+        p.reasoning_effort = Some("high".to_string());
+        let body = build_chat_body("m", Some(&cloud), ChatMode::Chat, &msgs(), &p);
+        assert_eq!(body["think"], true, "got: {}", body);
+        assert!(body.get("reasoning_effort").is_none());
+
+        p.reasoning_effort = Some("off".to_string());
+        let body = build_chat_body("m", Some(&cloud), ChatMode::Chat, &msgs(), &p);
+        assert_eq!(body["think"], false);
+
+        p.reasoning_effort = Some("on".to_string());
+        let body = build_chat_body("m", Some(&cloud), ChatMode::Chat, &msgs(), &p);
+        assert_eq!(body["think"], true);
+
+        p.reasoning_effort = None;
+        let body = build_chat_body("m", Some(&cloud), ChatMode::Chat, &msgs(), &p);
+        assert!(body.get("think").is_none(), "unset effort sends nothing");
+    }
+}
+
+#[cfg(test)]
+mod mouse_encoding_tests {
+    use super::{
+        MouseButton, MouseEventKind, MouseEventSpec, MouseModifiers, encode_mouse_event,
+        parse_mouse_args,
+    };
+    use vt100::{MouseProtocolEncoding as Enc, MouseProtocolMode as Mode};
+
+    fn ev(kind: MouseEventKind, button: MouseButton, x: u32, y: u32) -> MouseEventSpec {
+        MouseEventSpec {
+            kind,
+            button,
+            x,
+            y,
+            modifiers: MouseModifiers::default(),
+        }
+    }
+
+    #[test]
+    fn sgr_left_click_is_press_then_release() {
+        let press = encode_mouse_event(
+            &ev(MouseEventKind::Press, MouseButton::Left, 10, 5),
+            Mode::PressRelease,
+            Enc::Sgr,
+            10,
+            5,
+        );
+        let release = encode_mouse_event(
+            &ev(MouseEventKind::Release, MouseButton::Left, 10, 5),
+            Mode::PressRelease,
+            Enc::Sgr,
+            10,
+            5,
+        );
+        assert_eq!(press, b"\x1b[<0;10;5M".to_vec());
+        assert_eq!(release, b"\x1b[<0;10;5m".to_vec());
+    }
+
+    #[test]
+    fn sgr_right_click_and_modifiers() {
+        let mut e = ev(MouseEventKind::Press, MouseButton::Right, 3, 8);
+        e.modifiers.ctrl = true;
+        e.modifiers.shift = true;
+        let out = encode_mouse_event(&e, Mode::ButtonMotion, Enc::Sgr, 3, 8);
+        // right = 2, shift = +4, ctrl = +16 → b = 22
+        assert_eq!(out, b"\x1b[<22;3;8M".to_vec());
+    }
+
+    #[test]
+    fn sgr_wheel_up_down() {
+        let up = encode_mouse_event(
+            &ev(MouseEventKind::Wheel, MouseButton::WheelUp, 40, 20),
+            Mode::AnyMotion,
+            Enc::Sgr,
+            40,
+            20,
+        );
+        let down = encode_mouse_event(
+            &ev(MouseEventKind::Wheel, MouseButton::WheelDown, 40, 20),
+            Mode::AnyMotion,
+            Enc::Sgr,
+            40,
+            20,
+        );
+        assert_eq!(up, b"\x1b[<64;40;20M".to_vec());
+        assert_eq!(down, b"\x1b[<65;40;20M".to_vec());
+    }
+
+    #[test]
+    fn sgr_drag_motion_includes_motion_bit() {
+        let drag = encode_mouse_event(
+            &ev(MouseEventKind::Move, MouseButton::Left, 12, 6),
+            Mode::ButtonMotion,
+            Enc::Sgr,
+            12,
+            6,
+        );
+        // left(0) + motion(32) = 32
+        assert_eq!(drag, b"\x1b[<32;12;6M".to_vec());
+    }
+
+    #[test]
+    fn x10_encoding_uses_offset_bytes_and_release_code_3() {
+        let press = encode_mouse_event(
+            &ev(MouseEventKind::Press, MouseButton::Left, 10, 5),
+            Mode::PressRelease,
+            Enc::Default,
+            10,
+            5,
+        );
+        // ESC[M, b=0+32=32 (space), x=10+32=42 '*', y=5+32=37 '%'
+        assert_eq!(press, vec![b'\x1b', b'[', b'M', 32, 42, 37]);
+
+        let release = encode_mouse_event(
+            &ev(MouseEventKind::Release, MouseButton::Left, 10, 5),
+            Mode::PressRelease,
+            Enc::Default,
+            10,
+            5,
+        );
+        // release → button code 3 → 3+32 = 35 '#'
+        assert_eq!(release, vec![b'\x1b', b'[', b'M', 35, 42, 37]);
+    }
+
+    #[test]
+    fn x10_high_coordinates_stay_single_byte() {
+        // x=200 → 200+32=232 (≥128) must remain ONE raw byte, not UTF-8.
+        let out = encode_mouse_event(
+            &ev(MouseEventKind::Press, MouseButton::Left, 200, 100),
+            Mode::PressRelease,
+            Enc::Default,
+            200,
+            100,
+        );
+        assert_eq!(out.len(), 6, "X10 sequence is exactly 6 bytes");
+        assert_eq!(out, vec![b'\x1b', b'[', b'M', 32, 232, 132]);
+    }
+
+    #[test]
+    fn motion_degrades_under_press_release_mode() {
+        // Under ?1000 (press-release only) a move should drop the motion
+        // bit so the app sees a plain button event rather than nothing.
+        let out = encode_mouse_event(
+            &ev(MouseEventKind::Move, MouseButton::Left, 7, 7),
+            Mode::PressRelease,
+            Enc::Sgr,
+            7,
+            7,
+        );
+        assert_eq!(out, b"\x1b[<0;7;7M".to_vec());
+    }
+
+    #[test]
+    fn parse_mouse_args_defaults_and_modifiers() {
+        let args = serde_json::json!({"x": 4, "y": 9, "modifiers": ["ctrl", "alt"]});
+        let spec = parse_mouse_args(&args, MouseEventKind::Press);
+        assert_eq!(spec.x, 4);
+        assert_eq!(spec.y, 9);
+        assert_eq!(spec.button, MouseButton::Left, "default button is left");
+        assert!(spec.modifiers.ctrl && spec.modifiers.alt && !spec.modifiers.shift);
+
+        let move_args = serde_json::json!({"x": 1, "y": 1, "button": "right"});
+        let m = parse_mouse_args(&move_args, MouseEventKind::Move);
+        assert_eq!(m.button, MouseButton::Right);
+
+        let wheel_args = serde_json::json!({"x": 2, "y": 3, "button": "down"});
+        let w = parse_mouse_args(&wheel_args, MouseEventKind::Wheel);
+        assert_eq!(w.button, MouseButton::WheelDown);
+    }
+
+    #[test]
+    fn tool_schema_and_names_include_mouse_tools() {
+        use crate::tools::{TOOL_NAMES, get_tool_definitions};
+        let defs = get_tool_definitions();
+        let names: Vec<&str> = defs
+            .iter()
+            .filter_map(|t| t["function"]["name"].as_str())
+            .collect();
+        for tool in [
+            "terminal_mouse_click",
+            "terminal_mouse_press",
+            "terminal_mouse_release",
+            "terminal_mouse_move",
+            "terminal_mouse_wheel",
+        ] {
+            assert!(names.contains(&tool), "schema missing {}", tool);
+            assert!(TOOL_NAMES.contains(&tool), "TOOL_NAMES missing {}", tool);
+            let def = defs
+                .iter()
+                .find(|t| t["function"]["name"].as_str() == Some(tool))
+                .unwrap();
+            assert_eq!(
+                def["function"]["parameters"]["required"],
+                serde_json::json!(["x", "y"]),
+                "{} must require x,y",
+                tool
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_read_reports_mouse_state_field() {
+        use super::TerminalState;
+        let mut ts = TerminalState::new();
+        let r = ts.open("true");
+        assert!(r.contains("Terminal opened"), "open: {}", r);
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        let out = ts.read_buffer_incremental(None);
+        // Even with no app mouse mode, the field must be present.
+        assert!(out.get("mouse").is_some(), "mouse field missing: {}", out);
+        assert_eq!(out["mouse"]["enabled"].as_bool().unwrap(), false);
+        assert_eq!(out["mouse"]["encoding"].as_str().unwrap(), "x10");
+        ts.close();
+    }
+
+    #[test]
+    fn mouse_event_not_delivered_when_app_disabled_mouse() {
+        use super::TerminalState;
+        let mut ts = TerminalState::new();
+        ts.open("true").contains("Terminal opened");
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        // bash does not enable mouse reporting → encode returns None.
+        let ev = MouseEventSpec {
+            kind: MouseEventKind::Press,
+            button: MouseButton::Left,
+            x: 5,
+            y: 5,
+            modifiers: MouseModifiers::default(),
+        };
+        assert!(ts.encode_mouse_event(&ev).is_none());
+        let out = ts.send_mouse_event(&ev);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["delivered"].as_bool().unwrap(), false);
+        ts.close();
+    }
+
+    #[test]
+    fn mouse_event_delivered_after_app_enables_sgr() {
+        use super::TerminalState;
+        let mut ts = TerminalState::new();
+        ts.open("printf '\\033[?1000h\\033[?1006h'").contains("Terminal opened");
+        // Give the child time to emit the DECSET sequences and the reader
+        // thread time to parse them into the vt100 screen model.
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        let state = ts.mouse_state();
+        assert_eq!(
+            state["encoding"].as_str().unwrap(),
+            "sgr (?1006)",
+            "vt100 should have tracked ?1006: {}",
+            state
+        );
+        assert_eq!(state["enabled"].as_bool().unwrap(), true);
+
+        let ev = MouseEventSpec {
+            kind: MouseEventKind::Press,
+            button: MouseButton::Left,
+            x: 10,
+            y: 5,
+            modifiers: MouseModifiers::default(),
+        };
+        let encoded = ts.encode_mouse_event(&ev).expect("should encode");
+        assert_eq!(encoded, b"\x1b[<0;10;5M".to_vec());
+
+        let out = ts.send_mouse_event(&ev);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["delivered"].as_bool().unwrap(), true, "{}", out);
+        ts.close();
+    }
+}
+
 /// Extracts the model's native context window (tokens) from an Ollama
 /// `/api/show` response.
 ///
@@ -8946,6 +9725,7 @@ fn extract_context_length(json: &serde_json::Value) -> Option<u32> {
 /// per-model [`ModelParams`] into the dialect the backend speaks:
 /// OpenAI-style top-level fields for cloud models, Ollama `options` map +
 /// top-level `think` for Ollama.
+///
 fn build_chat_body(
     model: &str,
     cloud_model: Option<&CloudModel>,
@@ -8978,13 +9758,27 @@ fn build_chat_body(
         if let Some(seed) = params.seed {
             body["seed"] = serde_json::json!(seed);
         }
-        // OpenAI o-series / reasoning-capable cloud APIs take levels only.
-        // Skip for models that don't support it (e.g. Mistral on NVIDIA API).
-        if cloud.supports_reasoning_effort
-            && let Some(ref effort) = params.reasoning_effort
-            && matches!(effort.as_str(), "low" | "medium" | "high")
-        {
-            body["reasoning_effort"] = serde_json::json!(effort);
+        // Reasoning control for cloud APIs. Which request field carries it
+        // is per-model config (`reasoning_param` in models_cloud.conf):
+        // `reasoning_effort` (default, levels only) or `think` (boolean).
+        if let Some(ref effort) = params.reasoning_effort {
+            match cloud.reasoning_param {
+                ReasoningParam::ReasoningEffort => {
+                    if matches!(effort.as_str(), "low" | "medium" | "high") {
+                        body["reasoning_effort"] = serde_json::json!(effort);
+                    }
+                }
+                ReasoningParam::Think => match effort.as_str() {
+                    "off" | "none" | "false" => {
+                        body["think"] = serde_json::json!(false);
+                    }
+                    "on" | "true" | "low" | "medium" | "high" => {
+                        body["think"] = serde_json::json!(true);
+                    }
+                    _ => {}
+                },
+                ReasoningParam::None => {}
+            }
         }
         body
     } else {
@@ -9152,14 +9946,20 @@ fn stream_chat_request(
                                             if usage_from_json(&json).is_some() {
                                                 let _ = tx.send(StreamChunk::Stats(parse_usage_stats(&json)));
                                             }
-                                            // Skip reasoning_content when reasoning is disabled:
-                                            // - supports_reasoning_effort == false (model doesn't accept the parameter)
-                                            // - reasoning_effort == "off" (user explicitly turned it off)
+                                            // Skip reasoning only when the user explicitly turned
+                                            // it off (reasoning_param=none models never requested it,
+                                            // so they simply won't emit any).
                                             let reasoning_disabled =
-                                                cloud_model.as_ref().map(|c| !c.supports_reasoning_effort).unwrap_or(false)
-                                                    || params.reasoning_effort.as_deref() == Some("off");
-                                            if let Some(reasoning) = json["choices"][0]["delta"]["reasoning_content"].as_str()
-                                                && !reasoning.is_empty()
+                                                params.reasoning_effort.as_deref() == Some("off");
+                                            // Reasoning arrives under several field names depending on
+                                            // the provider: `reasoning_content` (DeepSeek/Kimi/Moonshot),
+                                            // `reasoning` (some OpenAI-compatible gateways), `thinking`
+                                            // (others). Forward whichever is present.
+                                            let reasoning = ["reasoning_content", "reasoning", "thinking"]
+                                                .iter()
+                                                .find_map(|f| json["choices"][0]["delta"][f].as_str())
+                                                .filter(|s| !s.is_empty());
+                                            if let Some(reasoning) = reasoning
                                                 && !reasoning_disabled {
                                                     let _ = tx.send(StreamChunk::Thinking(reasoning.to_string()));
                                                 }
@@ -9220,10 +10020,15 @@ fn stream_chat_request(
                                                 return;
                                             }
                                         } else {
-                                            if let Some(thinking) = json["message"]["thinking"].as_str()
-                                                && !thinking.is_empty() {
-                                                    let _ = tx.send(StreamChunk::Thinking(thinking.to_string()));
-                                                }
+                                            // Ollama streams thinking under `message.thinking`
+                                            // (older builds used `message.reasoning`).
+                                            let thinking = ["thinking", "reasoning"]
+                                                .iter()
+                                                .find_map(|f| json["message"][f].as_str())
+                                                .filter(|s| !s.is_empty());
+                                            if let Some(thinking) = thinking {
+                                                let _ = tx.send(StreamChunk::Thinking(thinking.to_string()));
+                                            }
                                             if let Some(content) = json["message"]["content"].as_str()
                                                 && !content.is_empty() {
                                                     let _ = tx.send(StreamChunk::Text(content.to_string()));
@@ -9306,7 +10111,7 @@ mod chat_body_tests {
             api_model: "test-cloud".to_string(),
             params: ModelParams::default(),
             pricing: crate::config::ModelPricing::default(),
-            supports_reasoning_effort: true,
+            reasoning_param: ReasoningParam::ReasoningEffort,
         }
     }
 
@@ -9695,7 +10500,7 @@ mod lsp_tool_tests {
         let app = test_app();
         let out = app.slash_tools();
         // Header announces the count.
-        assert!(out.starts_with("Agentic tools (18):"), "got: {}", out);
+        assert!(out.starts_with("Agentic tools (23):"), "got: {}", out);
         // Every tool: `name\ndescription\n\n` blocks separated by one
         // blank line.
         for t in get_tool_definitions() {
@@ -10251,7 +11056,7 @@ mod timestamp_tests {
 #[cfg(test)]
 mod model_dialog_cloud_tests {
     use super::{App, KeyCode, KeyEvent, KeyModifiers, ModelDialogFocus, safe_prefix};
-    use crate::config::{CloudModel, Config, ModelParams, ModelPricing};
+    use crate::config::{CloudModel, Config, ModelParams, ModelPricing, ReasoningParam};
 
     fn test_app() -> App {
         let cfg = Config {
@@ -10278,7 +11083,7 @@ mod model_dialog_cloud_tests {
                 cached_read_per_mtok: None,
                 cache_write_per_mtok: None,
             },
-            supports_reasoning_effort: true,
+            reasoning_param: ReasoningParam::ReasoningEffort,
         }
     }
 
@@ -10444,7 +11249,7 @@ mod slash_config_tests {
             api_model: "kimi-k3".to_string(),
             params: kimi_params,
             pricing: pricing.clone(),
-            supports_reasoning_effort: true,
+            reasoning_param: ReasoningParam::ReasoningEffort,
         }];
 
         ModelsConfFiles {
@@ -10572,7 +11377,7 @@ mod slash_model_tests {
             api_model: "kimi-k3-pro".to_string(),
             params,
             pricing,
-            supports_reasoning_effort: true,
+            reasoning_param: ReasoningParam::ReasoningEffort,
         }];
         let out = app.render_model_info(&ModelParamsStore {
             default: ModelParams::default(),
