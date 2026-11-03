@@ -505,6 +505,383 @@ pub(crate) const TOOL_NAMES: &[&str] = &[
     "lsp_completion",
 ];
 
+/// Returns the JSON tool definitions for all available tools, used to
+/// advertise capabilities to the LLM.
+pub(crate) fn get_tool_definitions() -> Vec<serde_json::Value> {
+    vec![
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "Read the contents of a file. For large files, use offset/limit to read a window of lines instead of the whole file.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "The file path to read (a leading ~ is expanded to the home directory)"
+                        },
+                        "offset": {
+                            "type": "integer",
+                            "description": "First line to return (1-based). Default: 1 (start of file)."
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "description": "Maximum number of lines to return. Default: no limit (whole file)."
+                        }
+                    },
+                    "required": ["path"]
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "write_file",
+                "description": "Write content to a file, creating it if it doesn't exist",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "The file path to write (a leading ~ is expanded to the home directory)"
+                        },
+                        "content": {
+                            "type": "string",
+                            "description": "The content to write"
+                        }
+                    },
+                    "required": ["path", "content"]
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "edit_file",
+                "description": "Edit a file by replacing old_string with new_string",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "The file path to edit (a leading ~ is expanded to the home directory)"
+                        },
+                        "old_string": {
+                            "type": "string",
+                            "description": "The string to find and replace"
+                        },
+                        "new_string": {
+                            "type": "string",
+                            "description": "The replacement string"
+                        }
+                    },
+                    "required": ["path", "old_string", "new_string"]
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "bash",
+                "description": "Execute a bash command and return the output",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": {
+                            "type": "string",
+                            "description": "The bash command to execute"
+                        }
+                    },
+                    "required": ["command"]
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "list_files",
+                "description": "List files and directories at a path",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "The directory path to list (a leading ~ is expanded to the home directory)"
+                        }
+                    },
+                    "required": ["path"]
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "search_files",
+                "description": "Search for files matching a glob pattern",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "pattern": {
+                            "type": "string",
+                            "description": "The glob pattern to match (e.g. '**/*.rs')"
+                        },
+                        "path": {
+                            "type": "string",
+                            "description": "The directory to search in (defaults to current directory; a leading ~ is expanded)"
+                        }
+                    },
+                    "required": ["pattern"]
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "search_content",
+                "description": "Search file contents for a pattern (regex supported). Note: for Rust symbols, prefer lsp_references / lsp_definition — they are compiler-accurate.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "pattern": {
+                            "type": "string",
+                            "description": "The regex pattern to search for"
+                        },
+                        "path": {
+                            "type": "string",
+                            "description": "The directory to search in (a leading ~ is expanded)"
+                        },
+                        "include": {
+                            "type": "string",
+                            "description": "File pattern to include (e.g. '*.rs')"
+                        }
+                    },
+                    "required": ["pattern"]
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "fetch_url",
+                "description": "Fetch content from a URL via HTTP/HTTPS GET request",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "url": {
+                            "type": "string",
+                            "description": "The URL to fetch (http:// or https://)"
+                        }
+                    },
+                    "required": ["url"]
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "web_search",
+                "description": "Search the web using DuckDuckGo and return results",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "The search query"
+                        }
+                    },
+                    "required": ["query"]
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "terminal_open",
+                "description": "Open a terminal session to run a command in a real PTY — fully interactive programs work (REPLs, ssh, top, vim, even other TUI apps). The terminal panel becomes visible so you can observe the output. Returns JSON with 'status' (message) and 'cursor' (pass this to terminal_read for incremental reads). Use terminal_send to interact (supports escape sequences for special keys) and terminal_read to check output/screen. Use terminal_close when done.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": {
+                            "type": "string",
+                            "description": "The shell command to run (e.g. 'npm run dev', 'cargo build')"
+                        }
+                    },
+                    "required": ["command"]
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "terminal_send",
+                "description": "Send input (keystrokes) to the running terminal session. The terminal is a real PTY, so interactive programs work. The input is written EXACTLY as given — nothing is appended, so you must include the Enter key yourself: to run a shell command send \"ls -la\\r\" (or end the input with \\r), to drive a TUI send bare keystrokes with no newline (e.g. \"q\" to quit less, \"\\u001bOB\\u001bOB\" for two Down presses in mc). For special keys, write backslash escapes directly in the input string — they are decoded into the real control bytes before being written to the PTY: Enter = \"\\r\", Ctrl+C = \"\\u0003\", Ctrl+D = \"\\u0004\", arrows = \"\\u001b[A/B/C/D\" (up/down/right/left), Tab = \"\\t\", Escape = \"\\u001b\", F1 = \"\\u001bOP\", PgUp/PgDn = \"\\u001b[5~\"/\"\\u001b[6~\". Example: send \"\\u0003\" to interrupt a running program.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "input": {
+                            "type": "string",
+                            "description": "The exact bytes to write to the terminal — nothing is appended. Include \\r (Enter) explicitly to submit a line (e.g. \"make build\\r\"). May contain backslash escapes (\\uXXXX, \\n, \\r, \\t) for special keys, which are decoded before sending."
+                        }
+                    },
+                    "required": ["input"]
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "terminal_read",
+                "description": "Read output from the terminal session. Returns JSON with 'output' (new raw output since 'cursor'), 'cursor' (pass on the next read for incremental output), 'gap' (true if output was lost to buffer overflow), 'screen' (the current rendered terminal screen as text — like a screenshot; this is what shows what full-screen/interactive programs are doing), and 'screen_cursor' (cursor row/col on screen). On the first read, omit 'cursor'. Use 'screen' to understand the current state of interactive/TUI programs.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "cursor": {
+                            "type": "integer",
+                            "description": "Optional cursor from a previous terminal_read response. When provided, only output written after that cursor is returned. Omit for the first read or to get the full tail window."
+                        }
+                    }
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "terminal_close",
+                "description": "Close the terminal session and hide the terminal panel. Kills the running process.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {}
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "lsp_diagnostics",
+                "description": "Get rust-analyzer compiler diagnostics (errors, warnings) for a Rust file. Always use this after editing .rs files to verify your changes compile. Requires the LSP server to be running (lsp = on in config, or /lsp on).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "The .rs file to check. Default: the most recently edited file, else a workspace-wide summary. A leading ~ is expanded."
+                        },
+                        "severity": {
+                            "type": "string",
+                            "description": "Optional filter: error | warning | hint | info. Default: all severities."
+                        }
+                    }
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "lsp_definition",
+                "description": "Jump to where a Rust symbol (function, struct, variable, etc.) is defined. Compiler-accurate via rust-analyzer — far more reliable than grep for finding the real definition. Returns the target file, line, column, and a source excerpt. Use whenever you want to know what a call site or name refers to. Requires the LSP server to be running (lsp = on in config, or /lsp on).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "The .rs file containing the symbol reference (absolute path; a leading ~ is expanded)."
+                        },
+                        "line": {
+                            "type": "integer",
+                            "description": "1-based line number of the symbol (point anywhere on the symbol's name)."
+                        },
+                        "column": {
+                            "type": "integer",
+                            "description": "1-based column number of the symbol (point anywhere on the symbol's name)."
+                        }
+                    },
+                    "required": ["path", "line", "column"]
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "lsp_symbol_info",
+                "description": "Get the type signature and documentation of any Rust symbol (function, struct, variable, etc.) at a file position, via rust-analyzer. Faster and more accurate than opening and reading the source file. Use whenever you need to understand what a symbol is or does. Requires the LSP server to be running (lsp = on in config, or /lsp on).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "The .rs file containing the symbol (absolute path; a leading ~ is expanded)."
+                        },
+                        "line": {
+                            "type": "integer",
+                            "description": "1-based line number of the symbol (point anywhere on the symbol's name)."
+                        },
+                        "column": {
+                            "type": "integer",
+                            "description": "1-based column number of the symbol (point anywhere on the symbol's name)."
+                        }
+                    },
+                    "required": ["path", "line", "column"]
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "lsp_references",
+                "description": "Find every place a Rust symbol is used, via rust-analyzer. Unlike grep, this is compiler-accurate — it won't match same-named symbols in other scopes or files. Returns each reference's file, line, column, and a source excerpt. Prefer this over search_content when working with Rust symbols. Requires the LSP server to be running (lsp = on in config, or /lsp on).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "The .rs file containing the symbol (absolute path; a leading ~ is expanded)."
+                        },
+                        "line": {
+                            "type": "integer",
+                            "description": "1-based line number of the symbol (point anywhere on the symbol's name)."
+                        },
+                        "column": {
+                            "type": "integer",
+                            "description": "1-based column number of the symbol (point anywhere on the symbol's name)."
+                        },
+                        "include_declaration": {
+                            "type": "boolean",
+                            "description": "Whether to include the declaration site itself in the results. Default: true."
+                        }
+                    },
+                    "required": ["path", "line", "column"]
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "lsp_completion",
+                "description": "List valid code completions (methods, fields, functions, variables) at a cursor position in a Rust file, via rust-analyzer. Use to discover what members a type has or what identifiers are in scope, without reading the source. Requires the LSP server to be running (lsp = on in config, or /lsp on).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "The .rs file to complete in (absolute path; a leading ~ is expanded)."
+                        },
+                        "line": {
+                            "type": "integer",
+                            "description": "1-based line number of the cursor position."
+                        },
+                        "column": {
+                            "type": "integer",
+                            "description": "1-based column number of the cursor position."
+                        }
+                    },
+                    "required": ["path", "line", "column"]
+                }
+            }
+        }),
+    ]
+}
+
 /// Parses tool calls the model embedded as plain text (fallback for
 /// models that emit JSON blobs instead of using the tools API).
 /// Recognised shapes:

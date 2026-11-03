@@ -16,121 +16,12 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
 
 use crate::config::{
-    CloudModel, Config, ModelParams, ModelParamsStore, load_agents_md,
-    load_cloud_models_with_base, load_model_params, save_model_params,
+    CloudModel, Config, ModelParams, ModelParamsStore, ModelsConfFiles, find_conf_file,
+    load_agents_md, load_cloud_models_with_base, load_model_params, read_models_conf_files,
+    save_model_params,
 };
-use crate::tools::{cap_tool_result, execute_tool_call, parse_text_tool_calls};
-
-/// Spinner frame sets for the status-bar throbber. One is picked at
-/// random for every API request (see `App::reroll_spinner`).
-pub const SPINNERS: &[&[&str]] = &[
-    // Braille circle
-    &["⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"],
-    // Braille dots (classic)
-    &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"],
-    // Clockwise quadrants
-    &["◴", "◷", "◶", "◵"],
-    // Audio equalizer bars
-    &["▂", "▃", "▄", "▆", "▇", "█", "▇", "▆", "▅", "▄", "▃", "▂"],
-    // Trigrams / radar
-    &["☰", "☱", "☳", "☷", "☶", "☴"],
-    &["⠁", "⠂", "⠄", "⡀", "⡈", "⡐", "⡠", "⣀", "⣁", "⣂", "⣄", "⣌", "⣔", "⣤", "⣥", "⣦", "⣮", "⣶", "⣷", "⣿", "⡿", "⠿", "⢟", "⠟", "⡛", "⠛", "⠫", "⢋", "⠋", "⠍", "⡉", "⠉", "⠑", "⠡", "⢁"],
-    &["⠂",
-      "-",
-      "–",
-      "—",
-      "–",
-      "-"
-    ],
-    &[
-      "┤",
-      "┘",
-      "┴",
-      "└",
-      "├",
-      "┌",
-      "┬",
-      "┐"
-    ],
-    &[
-      "✶",
-      "✸",
-      "✹",
-      "✺",
-      "✹",
-      "✷"
-    ],
-    &[
-      "◜",
-      "◠",
-      "◝",
-      "◞",
-      "◡",
-      "◟"
-    ],
-    &[
-      "◰",
-      "◳",
-      "◲",
-      "◱"],
-    &[
-      "⬆",
-      "↗",
-      "➡",
-      "↘",
-      "⬇",
-      "↙",
-      "⬅",
-      "↖"
-    ],
-    &[
-      "😄",
-      "😝"
-    ],
-    &[
-      "🕛",
-      "🕐",
-      "🕑",
-      "🕒",
-      "🕓",
-      "🕔",
-      "🕕",
-      "🕖",
-      "🕗",
-      "🕘",
-      "🕙",
-      "🕚"
-    ],
-    &[
-      "🌍",
-      "🌎",
-      "🌏"
-    ],
-    &[
-      "🌑",
-      "🌒",
-      "🌓",
-      "🌔",
-      "🌕",
-      "🌖",
-      "🌗",
-      "🌘"
-    ],
-    &[
-      "🔸",
-      "🔶",
-      "🟠",
-      "🟠",
-      "🔶",
-      "🔹",
-      "🔷",
-      "🔵",
-      "🔵",
-      "🔷"
-    ],
-    &["▉","▊","▋","▌","▍","▎","▏","▎","▍","▌","▋","▊","▉"],
-    &["🧍","🚶","🏃","🤸","🏃","🚶"],
-];
+use crate::tools::{cap_tool_result, execute_tool_call, get_tool_definitions, parse_text_tool_calls};
+pub use crate::spinners::SPINNERS;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum InputMode {
@@ -1281,6 +1172,7 @@ pub struct App {
     pub workflow_dialog_scroll: usize,
     pub max_tool_rounds: usize,
     pub max_retries: u32,
+    pub timeout_secs: u64,
     pub tool_round_count: usize,
     pub tool_call_count: usize,
     pub pending_tool_calls: Vec<serde_json::Value>,
@@ -1511,6 +1403,7 @@ impl App {
             workflow_dialog_scroll: 0,
             max_tool_rounds: cfg.max_tool_rounds,
             max_retries: cfg.max_retries,
+            timeout_secs: cfg.timeout_secs,
             tool_round_count: 0,
             tool_call_count: 0,
             pending_tool_calls: Vec::new(),
@@ -6167,7 +6060,8 @@ impl App {
         let arg = parts.get(1).map(|s| s.trim()).filter(|s| !s.is_empty());
         match cmd {
             "help" => Some(self.slash_help()),
-            "model" | "use" => Some(self.slash_model(arg)),
+            "model" => Some(self.slash_model(arg)),
+            "use" => Some(self.slash_use(arg)),
             "list" => Some(self.slash_list()),
             "tools" => Some(self.slash_tools()),
             "config" => Some(self.slash_config()),
@@ -6399,11 +6293,12 @@ impl App {
     fn slash_help(&self) -> String {
         let commands = [
             ("/help", "Show this help message"),
-            ("/model <name>", "Set model (no arg opens dialog)"),
-            ("/use <name>", "Alias for /model"),
+            ("/model", "Show current model's config"),
+            ("/model <name>", "Set model"),
+            ("/use <name>", "Set model (no arg opens dialog)"),
             ("/list", "List available models"),
             ("/tools", "List agentic tools"),
-            ("/config", "Show current configuration"),
+            ("/config", "Show configuration and model defaults"),
             ("/system", "Show current system prompt"),
             ("/setsystem <text>", "Set system prompt (no arg clears)"),
             ("/log", "Toggle logging on/off"),
@@ -6509,36 +6404,20 @@ impl App {
         }
     }
 
+    /// `/model <name>` switches the model; `/model` with no argument shows
+    /// the current model's configuration from the models*conf files.
     fn slash_model(&mut self, arg: Option<&str>) -> String {
         match arg {
-            Some(name) => {
-                if self.available_models.iter().any(|m| m == name) {
-                    self.model_name = name.to_string();
-                    self.apply_model_params();
-                    self.ollama_ctx_length = None;
-                    self.fetch_ctx_async(self.model_name.clone());
-                    format!("Model set to: {}", name)
-                } else if self.cloud_models.iter().any(|m| m.name == name) {
-                    self.model_name = name.to_string();
-                    self.apply_model_params();
-                    format!("Model set to: {} (cloud)", name)
-                } else {
-                    let mut all: Vec<&str> =
-                        self.available_models.iter().map(|s| s.as_str()).collect();
-                    for m in &self.cloud_models {
-                        all.push(&m.name);
-                    }
-                    format!(
-                        "Model '{}' not found. Available: {}",
-                        name,
-                        if all.is_empty() {
-                            "none loaded yet".to_string()
-                        } else {
-                            all.join(", ")
-                        }
-                    )
-                }
-            }
+            Some(name) => self.set_model(name),
+            None => self.slash_model_info(),
+        }
+    }
+
+    /// `/use` is the classic alias: with a name it switches, without one it
+    /// opens the model picker dialog.
+    fn slash_use(&mut self, arg: Option<&str>) -> String {
+        match arg {
+            Some(name) => self.set_model(name),
             None => {
                 let total = self.available_models.len() + self.cloud_models.len();
                 if total == 0 {
@@ -6558,6 +6437,79 @@ impl App {
                 }
             }
         }
+    }
+
+    fn set_model(&mut self, name: &str) -> String {
+        if self.available_models.iter().any(|m| m == name) {
+            self.model_name = name.to_string();
+            self.apply_model_params();
+            self.ollama_ctx_length = None;
+            self.fetch_ctx_async(self.model_name.clone());
+            format!("Model set to: {}", name)
+        } else if self.cloud_models.iter().any(|m| m.name == name) {
+            self.model_name = name.to_string();
+            self.apply_model_params();
+            format!("Model set to: {} (cloud)", name)
+        } else {
+            let mut all: Vec<&str> =
+                self.available_models.iter().map(|s| s.as_str()).collect();
+            for m in &self.cloud_models {
+                all.push(&m.name);
+            }
+            format!(
+                "Model '{}' not found. Available: {}",
+                name,
+                if all.is_empty() {
+                    "none loaded yet".to_string()
+                } else {
+                    all.join(", ")
+                }
+            )
+        }
+    }
+
+    /// `/model` with no argument: the current model's config as stored in
+    /// `models_ollama.conf` / `models_cloud.conf` (re-read from disk), plus
+    /// the effective session parameters.
+    fn slash_model_info(&self) -> String {
+        let files = read_models_conf_files();
+        let store = files
+            .as_ref()
+            .and_then(|f| f.ollama.clone())
+            .unwrap_or_else(|| self.model_params_store.clone());
+        let cloud_models = files
+            .as_ref()
+            .and_then(|f| f.cloud_models.clone())
+            .unwrap_or_else(|| self.cloud_models.clone());
+        self.render_model_info(&store, &cloud_models)
+    }
+
+    fn render_model_info(&self, store: &ModelParamsStore, cloud_models: &[CloudModel]) -> String {
+        let mut out = format!("Current model: {}", self.model_name);
+        if let Some(cm) = cloud_models.iter().find(|m| m.name == self.model_name) {
+            out.push_str(" [cloud]\n");
+            out.push_str(&format!(
+                "  api_url   = {}\n  api_model = {}\n",
+                cm.api_url, cm.api_model
+            ));
+            if let Some(s) = cm.pricing.short_summary() {
+                out.push_str(&format!("  pricing   = {s}\n"));
+            }
+            out.push_str("\nFrom models_cloud.conf:\n");
+            out.push_str(&format_model_params_lines(&cm.params, 2));
+        } else {
+            out.push_str(" [ollama]\n");
+            let section = if store.per_model.contains_key(&self.model_name) {
+                format!("[{}]", self.model_name)
+            } else {
+                "[default]".to_string()
+            };
+            out.push_str(&format!("\nFrom models_ollama.conf {section}:\n"));
+            out.push_str(&format_model_params_lines(&store.params_for(&self.model_name), 2));
+        }
+        out.push_str("\nEffective this session (slash-command overrides applied):\n");
+        out.push_str(&format_model_params_lines(&self.params, 2));
+        out
     }
 
     fn slash_list(&self) -> String {
@@ -6605,42 +6557,78 @@ impl App {
     }
 
     fn slash_config(&self) -> String {
-        let home = std::env::var("HOME").unwrap_or_default();
-        let rustama_dir = std::path::PathBuf::from(&home).join(".rustama");
-        let conf_path = if rustama_dir.is_dir() {
-            rustama_dir.join("rustama.conf")
-        } else {
-            std::path::PathBuf::from(&home)
-                .join(".config")
-                .join("rustama")
-                .join("rustama.conf")
+        let conf_path = find_conf_file()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "(not found)".to_string());
+        // Re-read the model-param files read-only so /config shows what is
+        // on disk right now; missing files fall back to the startup values.
+        let files = read_models_conf_files();
+        self.render_config(&conf_path, files.as_ref())
+    }
+
+    /// Renders the `/config` summary: the main config, then the `[default]`
+    /// sections of `models_ollama.conf` / `models_cloud.conf` (from the fresh
+    /// read-only `files` snapshot when available), then the effective
+    /// parameters of the current model.
+    fn render_config(&self, conf_path: &str, files: Option<&ModelsConfFiles>) -> String {
+        let (ollama_path, ollama_default) = match files {
+            Some(f) => (
+                f.ollama_path.display().to_string(),
+                f.ollama
+                    .as_ref()
+                    .map(|s| s.default.clone())
+                    .unwrap_or_else(|| self.model_params_store.default.clone()),
+            ),
+            None => (
+                "(config dir not found)".to_string(),
+                self.model_params_store.default.clone(),
+            ),
         };
-        let p = &self.params;
-        format!(
-            "Config file: {}\n\n  ollama_url     = {}\n  model          = {}\n  save_path      = {}\n  mode           = {}\n  max_rounds     = {}\n  timeout_secs   = {}\n  logging        = {}\n  logfile        = {}\n  justify        = {}\n\nModel parameters (per-model):\n  temperature    = {}\n  top_p          = {}\n  top_k          = {}\n  frequency_pen. = {}\n  presence_pen.  = {}\n  max_tokens     = {}\n  effort         = {}\n  seed           = {}",
-            conf_path.display(),
+        let (cloud_path, cloud_default) = match files {
+            Some(f) => (
+                f.cloud_path.display().to_string(),
+                f.cloud_default.clone(),
+            ),
+            None => ("(config dir not found)".to_string(), None),
+        };
+
+        let mut out = format!(
+            "Config file: {conf_path}\n\n  ollama_url     = {}\n  model          = {}\n  save_path      = {}\n  mode           = {}\n  max_rounds     = {}\n  max_retries    = {}\n  timeout_secs   = {}\n  logging        = {}\n  logfile        = {}\n  justify        = {}\n",
             self.ollama_url,
             self.model_name,
             self.save_path,
             self.chat_mode.label(),
             self.max_tool_rounds,
-            300,
+            self.max_retries,
+            self.timeout_secs,
             self.is_logging,
             self.log_file,
             self.justify,
-            p.temperature,
-            p.top_p,
-            p.top_k,
-            p.frequency_penalty,
-            p.presence_penalty,
-            p.max_output_tokens
-                .map(|n| n.to_string())
-                .unwrap_or_else(|| "(unset)".to_string()),
-            p.reasoning_effort.as_deref().unwrap_or("(unset)"),
-            p.seed
-                .map(|n| n.to_string())
-                .unwrap_or_else(|| "(unset)".to_string()),
-        )
+        );
+
+        out.push_str(&format!(
+            "\nOllama model defaults ({ollama_path}):\n  [default]\n"
+        ));
+        out.push_str(&format_model_params_lines(&ollama_default, 4));
+
+        out.push_str(&format!("\nCloud model defaults ({cloud_path}):\n"));
+        match &cloud_default {
+            Some((p, pricing)) => {
+                out.push_str("  [default]\n");
+                out.push_str(&format_model_params_lines(p, 4));
+                if let Some(summary) = pricing.short_summary() {
+                    out.push_str(&format!("    pricing        = {summary}\n"));
+                }
+            }
+            None => out.push_str("  [default] (not set)\n"),
+        }
+
+        out.push_str(&format!(
+            "\nEffective parameters for current model '{}' (session slash-command overrides applied):\n",
+            self.model_name
+        ));
+        out.push_str(&format_model_params_lines(&self.params, 2));
+        out
     }
 
     fn slash_log(&mut self) -> String {
@@ -7626,6 +7614,36 @@ mod sessions_dir_tests {
     }
 }
 
+/// Aligned `key = value` lines describing a [`ModelParams`], each line
+/// indented by `indent` spaces. Shared by `/config`'s model-default blocks
+/// and the effective current-model block.
+fn format_model_params_lines(p: &ModelParams, indent: usize) -> String {
+    let pad = " ".repeat(indent);
+    let unset = || "(unset)".to_string();
+    format!(
+        "{pad}temperature    = {}\n\
+         {pad}top_p          = {}\n\
+         {pad}top_k          = {}\n\
+         {pad}frequency_pen. = {}\n\
+         {pad}presence_pen.  = {}\n\
+         {pad}max_tokens     = {}\n\
+         {pad}effort         = {}\n\
+         {pad}tool_choice    = {}\n\
+         {pad}seed           = {}\n\
+         {pad}num_ctx        = {}",
+        p.temperature,
+        p.top_p,
+        p.top_k,
+        p.frequency_penalty,
+        p.presence_penalty,
+        p.max_output_tokens.map(|n| n.to_string()).unwrap_or_else(unset),
+        p.reasoning_effort.clone().unwrap_or_else(unset),
+        p.tool_choice.clone().unwrap_or_else(unset),
+        p.seed.map(|n| n.to_string()).unwrap_or_else(unset),
+        p.num_ctx.map(|n| n.to_string()).unwrap_or_else(unset),
+    )
+}
+
 /// Resolves the effective generation parameters for a model: cloud models
 /// carry their own (from `models_cloud.conf`); Ollama models look up
 /// `models_ollama.conf` (named section, then `[default]`, then built-ins).
@@ -7640,9 +7658,9 @@ fn params_for_model(
     store.params_for(model)
 }
 
-/// Tool names available in Assistant mode — general-purpose, non-coding
-/// tools only (no file editing, shell, terminal, or LSP). CURRENTLY NOT USED IN
-//the future this will be conigurable
+/* Tool names available in Assistant mode — general-purpose, non-coding
+tools only (no file editing, shell, terminal, or LSP). CURRENTLY NOT USED IN
+the future this will be conigurable
 const ASSISTANT_TOOLS: &[&str] = &[
     "read_file",
     "list_files",
@@ -7651,9 +7669,10 @@ const ASSISTANT_TOOLS: &[&str] = &[
     "fetch_url",
     "web_search",
 ];
+*/
 
-/// The tool definitions for a workflow mode. `Chat` gets none,
-/// `Assistant` `Coder` the full set.
+// The tool definitions for a workflow mode. `Chat` gets none,
+// `Assistant` `Coder` the full set.
 fn tools_for_mode(mode: ChatMode) -> Option<Vec<serde_json::Value>> {
     match mode {
         ChatMode::Chat => None,
@@ -7662,380 +7681,6 @@ fn tools_for_mode(mode: ChatMode) -> Option<Vec<serde_json::Value>> {
     }
 }
 
-fn get_tool_definitions() -> Vec<serde_json::Value> {
-    vec![
-        serde_json::json!({
-            "type": "function",
-            "function": {
-                "name": "read_file",
-                "description": "Read the contents of a file. For large files, use offset/limit to read a window of lines instead of the whole file.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "path": {
-                            "type": "string",
-                            "description": "The file path to read (a leading ~ is expanded to the home directory)"
-                        },
-                        "offset": {
-                            "type": "integer",
-                            "description": "First line to return (1-based). Default: 1 (start of file)."
-                        },
-                        "limit": {
-                            "type": "integer",
-                            "description": "Maximum number of lines to return. Default: no limit (whole file)."
-                        }
-                    },
-                    "required": ["path"]
-                }
-            }
-        }),
-        serde_json::json!({
-            "type": "function",
-            "function": {
-                "name": "write_file",
-                "description": "Write content to a file, creating it if it doesn't exist",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "path": {
-                            "type": "string",
-                            "description": "The file path to write (a leading ~ is expanded to the home directory)"
-                        },
-                        "content": {
-                            "type": "string",
-                            "description": "The content to write"
-                        }
-                    },
-                    "required": ["path", "content"]
-                }
-            }
-        }),
-        serde_json::json!({
-            "type": "function",
-            "function": {
-                "name": "edit_file",
-                "description": "Edit a file by replacing old_string with new_string",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "path": {
-                            "type": "string",
-                            "description": "The file path to edit (a leading ~ is expanded to the home directory)"
-                        },
-                        "old_string": {
-                            "type": "string",
-                            "description": "The string to find and replace"
-                        },
-                        "new_string": {
-                            "type": "string",
-                            "description": "The replacement string"
-                        }
-                    },
-                    "required": ["path", "old_string", "new_string"]
-                }
-            }
-        }),
-        serde_json::json!({
-            "type": "function",
-            "function": {
-                "name": "bash",
-                "description": "Execute a bash command and return the output",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "command": {
-                            "type": "string",
-                            "description": "The bash command to execute"
-                        }
-                    },
-                    "required": ["command"]
-                }
-            }
-        }),
-        serde_json::json!({
-            "type": "function",
-            "function": {
-                "name": "list_files",
-                "description": "List files and directories at a path",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "path": {
-                            "type": "string",
-                            "description": "The directory path to list (a leading ~ is expanded to the home directory)"
-                        }
-                    },
-                    "required": ["path"]
-                }
-            }
-        }),
-        serde_json::json!({
-            "type": "function",
-            "function": {
-                "name": "search_files",
-                "description": "Search for files matching a glob pattern",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "pattern": {
-                            "type": "string",
-                            "description": "The glob pattern to match (e.g. '**/*.rs')"
-                        },
-                        "path": {
-                            "type": "string",
-                            "description": "The directory to search in (defaults to current directory; a leading ~ is expanded)"
-                        }
-                    },
-                    "required": ["pattern"]
-                }
-            }
-        }),
-        serde_json::json!({
-            "type": "function",
-            "function": {
-                "name": "search_content",
-                "description": "Search file contents for a pattern (regex supported). Note: for Rust symbols, prefer lsp_references / lsp_definition — they are compiler-accurate.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "pattern": {
-                            "type": "string",
-                            "description": "The regex pattern to search for"
-                        },
-                        "path": {
-                            "type": "string",
-                            "description": "The directory to search in (a leading ~ is expanded)"
-                        },
-                        "include": {
-                            "type": "string",
-                            "description": "File pattern to include (e.g. '*.rs')"
-                        }
-                    },
-                    "required": ["pattern"]
-                }
-            }
-        }),
-        serde_json::json!({
-            "type": "function",
-            "function": {
-                "name": "fetch_url",
-                "description": "Fetch content from a URL via HTTP/HTTPS GET request",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "url": {
-                            "type": "string",
-                            "description": "The URL to fetch (http:// or https://)"
-                        }
-                    },
-                    "required": ["url"]
-                }
-            }
-        }),
-        serde_json::json!({
-            "type": "function",
-            "function": {
-                "name": "web_search",
-                "description": "Search the web using DuckDuckGo and return results",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "query": {
-                            "type": "string",
-                            "description": "The search query"
-                        }
-                    },
-                    "required": ["query"]
-                }
-            }
-        }),
-        serde_json::json!({
-            "type": "function",
-            "function": {
-                "name": "terminal_open",
-                "description": "Open a terminal session to run a command in a real PTY — fully interactive programs work (REPLs, ssh, top, vim, even other TUI apps). The terminal panel becomes visible so you can observe the output. Returns JSON with 'status' (message) and 'cursor' (pass this to terminal_read for incremental reads). Use terminal_send to interact (supports escape sequences for special keys) and terminal_read to check output/screen. Use terminal_close when done.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "command": {
-                            "type": "string",
-                            "description": "The shell command to run (e.g. 'npm run dev', 'cargo build')"
-                        }
-                    },
-                    "required": ["command"]
-                }
-            }
-        }),
-        serde_json::json!({
-            "type": "function",
-            "function": {
-                "name": "terminal_send",
-                "description": "Send input (keystrokes) to the running terminal session. The terminal is a real PTY, so interactive programs work. The input is written EXACTLY as given — nothing is appended, so you must include the Enter key yourself: to run a shell command send \"ls -la\\r\" (or end the input with \\r), to drive a TUI send bare keystrokes with no newline (e.g. \"q\" to quit less, \"\\u001bOB\\u001bOB\" for two Down presses in mc). For special keys, write backslash escapes directly in the input string — they are decoded into the real control bytes before being written to the PTY: Enter = \"\\r\", Ctrl+C = \"\\u0003\", Ctrl+D = \"\\u0004\", arrows = \"\\u001b[A/B/C/D\" (up/down/right/left), Tab = \"\\t\", Escape = \"\\u001b\", F1 = \"\\u001bOP\", PgUp/PgDn = \"\\u001b[5~\"/\"\\u001b[6~\". Example: send \"\\u0003\" to interrupt a running program.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "input": {
-                            "type": "string",
-                            "description": "The exact bytes to write to the terminal — nothing is appended. Include \\r (Enter) explicitly to submit a line (e.g. \"make build\\r\"). May contain backslash escapes (\\uXXXX, \\n, \\r, \\t) for special keys, which are decoded before sending."
-                        }
-                    },
-                    "required": ["input"]
-                }
-            }
-        }),
-        serde_json::json!({
-            "type": "function",
-            "function": {
-                "name": "terminal_read",
-                "description": "Read output from the terminal session. Returns JSON with 'output' (new raw output since 'cursor'), 'cursor' (pass on the next read for incremental output), 'gap' (true if output was lost to buffer overflow), 'screen' (the current rendered terminal screen as text — like a screenshot; this is what shows what full-screen/interactive programs are doing), and 'screen_cursor' (cursor row/col on screen). On the first read, omit 'cursor'. Use 'screen' to understand the current state of interactive/TUI programs.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "cursor": {
-                            "type": "integer",
-                            "description": "Optional cursor from a previous terminal_read response. When provided, only output written after that cursor is returned. Omit for the first read or to get the full tail window."
-                        }
-                    }
-                }
-            }
-        }),
-        serde_json::json!({
-            "type": "function",
-            "function": {
-                "name": "terminal_close",
-                "description": "Close the terminal session and hide the terminal panel. Kills the running process.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {}
-                }
-            }
-        }),
-        serde_json::json!({
-            "type": "function",
-            "function": {
-                "name": "lsp_diagnostics",
-                "description": "Get rust-analyzer compiler diagnostics (errors, warnings) for a Rust file. Always use this after editing .rs files to verify your changes compile. Requires the LSP server to be running (lsp = on in config, or /lsp on).",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "path": {
-                            "type": "string",
-                            "description": "The .rs file to check. Default: the most recently edited file, else a workspace-wide summary. A leading ~ is expanded."
-                        },
-                        "severity": {
-                            "type": "string",
-                            "description": "Optional filter: error | warning | hint | info. Default: all severities."
-                        }
-                    }
-                }
-            }
-        }),
-        serde_json::json!({
-            "type": "function",
-            "function": {
-                "name": "lsp_definition",
-                "description": "Jump to where a Rust symbol (function, struct, variable, etc.) is defined. Compiler-accurate via rust-analyzer — far more reliable than grep for finding the real definition. Returns the target file, line, column, and a source excerpt. Use whenever you want to know what a call site or name refers to. Requires the LSP server to be running (lsp = on in config, or /lsp on).",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "path": {
-                            "type": "string",
-                            "description": "The .rs file containing the symbol reference (absolute path; a leading ~ is expanded)."
-                        },
-                        "line": {
-                            "type": "integer",
-                            "description": "1-based line number of the symbol (point anywhere on the symbol's name)."
-                        },
-                        "column": {
-                            "type": "integer",
-                            "description": "1-based column number of the symbol (point anywhere on the symbol's name)."
-                        }
-                    },
-                    "required": ["path", "line", "column"]
-                }
-            }
-        }),
-        serde_json::json!({
-            "type": "function",
-            "function": {
-                "name": "lsp_symbol_info",
-                "description": "Get the type signature and documentation of any Rust symbol (function, struct, variable, etc.) at a file position, via rust-analyzer. Faster and more accurate than opening and reading the source file. Use whenever you need to understand what a symbol is or does. Requires the LSP server to be running (lsp = on in config, or /lsp on).",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "path": {
-                            "type": "string",
-                            "description": "The .rs file containing the symbol (absolute path; a leading ~ is expanded)."
-                        },
-                        "line": {
-                            "type": "integer",
-                            "description": "1-based line number of the symbol (point anywhere on the symbol's name)."
-                        },
-                        "column": {
-                            "type": "integer",
-                            "description": "1-based column number of the symbol (point anywhere on the symbol's name)."
-                        }
-                    },
-                    "required": ["path", "line", "column"]
-                }
-            }
-        }),
-        serde_json::json!({
-            "type": "function",
-            "function": {
-                "name": "lsp_references",
-                "description": "Find every place a Rust symbol is used, via rust-analyzer. Unlike grep, this is compiler-accurate — it won't match same-named symbols in other scopes or files. Returns each reference's file, line, column, and a source excerpt. Prefer this over search_content when working with Rust symbols. Requires the LSP server to be running (lsp = on in config, or /lsp on).",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "path": {
-                            "type": "string",
-                            "description": "The .rs file containing the symbol (absolute path; a leading ~ is expanded)."
-                        },
-                        "line": {
-                            "type": "integer",
-                            "description": "1-based line number of the symbol (point anywhere on the symbol's name)."
-                        },
-                        "column": {
-                            "type": "integer",
-                            "description": "1-based column number of the symbol (point anywhere on the symbol's name)."
-                        },
-                        "include_declaration": {
-                            "type": "boolean",
-                            "description": "Whether to include the declaration site itself in the results. Default: true."
-                        }
-                    },
-                    "required": ["path", "line", "column"]
-                }
-            }
-        }),
-        serde_json::json!({
-            "type": "function",
-            "function": {
-                "name": "lsp_completion",
-                "description": "List valid code completions (methods, fields, functions, variables) at a cursor position in a Rust file, via rust-analyzer. Use to discover what members a type has or what identifiers are in scope, without reading the source. Requires the LSP server to be running (lsp = on in config, or /lsp on).",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "path": {
-                            "type": "string",
-                            "description": "The .rs file to complete in (absolute path; a leading ~ is expanded)."
-                        },
-                        "line": {
-                            "type": "integer",
-                            "description": "1-based line number of the cursor position."
-                        },
-                        "column": {
-                            "type": "integer",
-                            "description": "1-based column number of the cursor position."
-                        }
-                    },
-                    "required": ["path", "line", "column"]
-                }
-            }
-        }),
-    ]
-}
 
 fn build_reqwest_client(proxy: &Option<String>) -> reqwest::Client {
     let mut builder = reqwest::Client::builder();
@@ -10739,5 +10384,205 @@ mod model_dialog_cloud_tests {
         app.model_dialog_focus = ModelDialogFocus::List;
         app.handle_model_dialog_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
         assert_eq!(app.model_dialog_selection, 1);
+    }
+}
+
+#[cfg(test)]
+mod slash_config_tests {
+    use super::*;
+    use crate::config::ModelPricing;
+    use std::collections::HashMap;
+
+    fn test_app() -> App {
+        let cfg = crate::config::Config {
+            logging: false,
+            logfile: std::env::temp_dir()
+                .join(format!("rustama-test-{}.log", std::process::id()))
+                .to_string_lossy()
+                .to_string(),
+            ..crate::config::Config::default()
+        };
+        App::new(cfg)
+    }
+
+    fn fake_files() -> ModelsConfFiles {
+        let dir = PathBuf::from("/tmp/fake-rustama-conf");
+        let mut default = ModelParams::default();
+        default.temperature = 0.7;
+        let mut qwen = ModelParams::default();
+        qwen.seed = Some(42);
+        qwen.num_ctx = Some(32768);
+        let mut per_model = HashMap::new();
+        per_model.insert("qwen3:8b".to_string(), qwen);
+        let store = ModelParamsStore { default, per_model };
+
+        let mut cloud_default = ModelParams::default();
+        cloud_default.reasoning_effort = Some("high".to_string());
+        cloud_default.tool_choice = Some("auto".to_string());
+        let mut pricing = ModelPricing::default();
+        pricing.input_per_mtok = Some(2.0);
+        pricing.output_per_mtok = Some(10.0);
+
+        let mut kimi_params = ModelParams::default();
+        kimi_params.max_output_tokens = Some(262144);
+        let cloud = vec![CloudModel {
+            name: "kimi-k3".to_string(),
+            api_url: "https://api.moonshot.ai/v1/chat/completions".to_string(),
+            api_key: "sk-real".to_string(),
+            api_model: "kimi-k3".to_string(),
+            params: kimi_params,
+            pricing: pricing.clone(),
+        }];
+
+        ModelsConfFiles {
+            ollama_path: dir.join(crate::config::OLLAMA_MODELS_FILE),
+            ollama: Some(store),
+            cloud_path: dir.join(crate::config::CLOUD_MODELS_FILE),
+            cloud_models: Some(cloud),
+            cloud_default: Some((cloud_default, pricing)),
+        }
+    }
+
+    #[test]
+    fn config_shows_only_defaults_from_models_conf_files() {
+        let mut app = test_app();
+        app.model_name = "qwen3:8b".to_string();
+        let files = fake_files();
+        let out = app.render_config("/tmp/fake-rustama-conf/rustama.conf", Some(&files));
+
+        // Both models*conf files are named with their [default] sections.
+        assert!(out.contains("models_ollama.conf"), "out: {out}");
+        assert!(out.contains("models_cloud.conf"), "out: {out}");
+        assert!(out.contains("Ollama model defaults"), "out: {out}");
+        assert!(out.contains("Cloud model defaults"), "out: {out}");
+        assert!(out.contains("[default]"), "out: {out}");
+        // Ollama [default] value from the file, not the program default.
+        assert!(out.contains("temperature    = 0.7"), "out: {out}");
+        // Cloud [default] with its pricing.
+        assert!(out.contains("tool_choice    = auto"), "out: {out}");
+        assert!(out.contains("effort         = high"), "out: {out}");
+        assert!(out.contains("$2/$10 per 1M"), "out: {out}");
+        // Per-model sections are NOT shown.
+        assert!(!out.contains("[qwen3:8b]"), "out: {out}");
+        assert!(!out.contains("seed           = 42"), "out: {out}");
+        assert!(!out.contains("[kimi-k3]"), "out: {out}");
+        assert!(!out.contains("max_tokens     = 262144"), "out: {out}");
+        // Effective block for the current model still present.
+        assert!(
+            out.contains("Effective parameters for current model 'qwen3:8b'"),
+            "out: {out}"
+        );
+    }
+
+    #[test]
+    fn config_without_files_falls_back_to_startup_values() {
+        let app = test_app();
+        let out = app.render_config("/tmp/x/rustama.conf", None);
+        assert!(out.contains("(config dir not found)"), "out: {out}");
+        // In-memory startup store still rendered under [default].
+        assert!(out.contains("[default]"), "out: {out}");
+        assert!(out.contains("temperature"), "out: {out}");
+    }
+
+    #[test]
+    fn slash_config_runs_and_names_config_file() {
+        let app = test_app();
+        let out = app.slash_config();
+        assert!(out.contains("Config file:"), "out: {out}");
+        assert!(out.contains("Ollama model defaults"), "out: {out}");
+        assert!(out.contains("Cloud model defaults"), "out: {out}");
+        assert!(out.contains("timeout_secs   = 300"), "out: {out}");
+    }
+}
+
+#[cfg(test)]
+mod slash_model_tests {
+    use super::*;
+    use crate::config::ModelPricing;
+    use std::collections::HashMap;
+
+    fn test_app() -> App {
+        let cfg = crate::config::Config {
+            logging: false,
+            logfile: std::env::temp_dir()
+                .join(format!("rustama-test-{}.log", std::process::id()))
+                .to_string_lossy()
+                .to_string(),
+            ..crate::config::Config::default()
+        };
+        App::new(cfg)
+    }
+
+    fn store_with_section() -> ModelParamsStore {
+        let mut per_model = HashMap::new();
+        let mut qwen = ModelParams::default();
+        qwen.temperature = 0.2;
+        per_model.insert("qwen3:8b".to_string(), qwen);
+        ModelParamsStore {
+            default: ModelParams::default(),
+            per_model,
+        }
+    }
+
+    #[test]
+    fn model_no_arg_shows_current_ollama_model_config() {
+        let mut app = test_app();
+        app.model_name = "qwen3:8b".to_string();
+        let out = app.render_model_info(&store_with_section(), &[]);
+        assert!(out.contains("Current model: qwen3:8b [ollama]"), "out: {out}");
+        assert!(out.contains("From models_ollama.conf [qwen3:8b]:"), "out: {out}");
+        assert!(out.contains("temperature    = 0.2"), "out: {out}");
+        assert!(out.contains("Effective this session"), "out: {out}");
+    }
+
+    #[test]
+    fn model_no_arg_falls_back_to_default_section() {
+        let app = test_app();
+        let out = app.render_model_info(&store_with_section(), &[]);
+        // Default model has no named section -> [default] is shown.
+        assert!(out.contains("From models_ollama.conf [default]:"), "out: {out}");
+    }
+
+    #[test]
+    fn model_no_arg_shows_cloud_model_config() {
+        let mut app = test_app();
+        app.model_name = "kimi-k3".to_string();
+        let mut pricing = ModelPricing::default();
+        pricing.input_per_mtok = Some(2.0);
+        pricing.output_per_mtok = Some(10.0);
+        let mut params = ModelParams::default();
+        params.tool_choice = Some("auto".to_string());
+        let cloud = vec![CloudModel {
+            name: "kimi-k3".to_string(),
+            api_url: "https://api.moonshot.ai/v1/chat/completions".to_string(),
+            api_key: "sk-real".to_string(),
+            api_model: "kimi-k3-pro".to_string(),
+            params,
+            pricing,
+        }];
+        let out = app.render_model_info(&ModelParamsStore {
+            default: ModelParams::default(),
+            per_model: HashMap::new(),
+        }, &cloud);
+        assert!(out.contains("Current model: kimi-k3 [cloud]"), "out: {out}");
+        assert!(out.contains("api_url   = https://api.moonshot.ai/v1/chat/completions"), "out: {out}");
+        assert!(out.contains("api_model = kimi-k3-pro"), "out: {out}");
+        assert!(out.contains("pricing   = $2/$10 per 1M"), "out: {out}");
+        assert!(out.contains("From models_cloud.conf:"), "out: {out}");
+        assert!(out.contains("tool_choice    = auto"), "out: {out}");
+    }
+
+    #[test]
+    fn use_no_arg_still_opens_dialog_and_model_switches() {
+        let mut app = test_app();
+        app.available_models = vec!["llama3.2:3b".into(), "qwen3:8b".into()];
+        let out = app.slash_use(None);
+        assert!(app.show_model_dialog, "out: {out}");
+        assert!(out.contains("Current model:"), "out: {out}");
+
+        let out = app.slash_model(Some("qwen3:8b"));
+        assert_eq!(app.model_name, "qwen3:8b");
+        assert!(out.contains("Model set to: qwen3:8b"), "out: {out}");
+        assert!(!app.show_model_dialog || app.model_name == "qwen3:8b");
     }
 }

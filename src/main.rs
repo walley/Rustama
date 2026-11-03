@@ -18,6 +18,7 @@ mod config;
 mod lsp;
 mod markdown;
 mod primary_selection;
+mod spinners;
 mod tools;
 mod ui;
 use app::{App, ChatMessage, Focus, InputMode, ModelDialogFocus, SaveDialogFocus, SettingsFocus};
