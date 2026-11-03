@@ -302,6 +302,9 @@ pub struct CloudModel {
     pub api_model: String,
     pub params: ModelParams,
     pub pricing: ModelPricing,
+    /// Whether this model accepts the `reasoning_effort` parameter.
+    /// Set to `false` for models like Mistral that reject unknown parameters.
+    pub supports_reasoning_effort: bool,
 }
 
 impl Default for Config {
@@ -1185,6 +1188,7 @@ fn parse_cloud_models(content: &str, base: &ModelParams) -> Vec<CloudModel> {
     let mut current_api_model = String::new();
     let mut current_params = default_params.clone();
     let mut current_pricing = default_pricing.clone();
+    let mut current_supports_reasoning_effort = true;
 
     for line in content.lines() {
         let line = line.trim();
@@ -1211,6 +1215,7 @@ fn parse_cloud_models(content: &str, base: &ModelParams) -> Vec<CloudModel> {
                     api_model,
                     params: current_params.clone(),
                     pricing: current_pricing.clone(),
+                    supports_reasoning_effort: current_supports_reasoning_effort,
                 });
             }
             current_name = Some(line[1..line.len() - 1].trim().to_string());
@@ -1219,6 +1224,7 @@ fn parse_cloud_models(content: &str, base: &ModelParams) -> Vec<CloudModel> {
             current_api_model.clear();
             current_params = default_params.clone();
             current_pricing = default_pricing.clone();
+            current_supports_reasoning_effort = true;
         } else if let Some((key, value)) = line.split_once('=') {
             let key = key.trim().to_lowercase();
             let value = value.trim().to_string();
@@ -1226,6 +1232,10 @@ fn parse_cloud_models(content: &str, base: &ModelParams) -> Vec<CloudModel> {
                 "api_url" => current_url = value,
                 "api_key" => current_key = value,
                 "api_model" => current_api_model = value,
+                "reasoning_effort_supported" => {
+                    current_supports_reasoning_effort =
+                        value.parse::<bool>().unwrap_or(true);
+                }
                 _ => apply_cloud_setting(&key, &value, &mut current_params, &mut current_pricing),
             }
         }
@@ -1249,6 +1259,7 @@ fn parse_cloud_models(content: &str, base: &ModelParams) -> Vec<CloudModel> {
             api_model,
             params: current_params,
             pricing: current_pricing,
+            supports_reasoning_effort: current_supports_reasoning_effort,
         });
     }
 

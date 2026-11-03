@@ -7112,6 +7112,7 @@ mod usage_tests {
                 cached_read_per_mtok: Some(0.30),
                 cache_write_per_mtok: None,
             },
+            supports_reasoning_effort: true,
         });
         // 1M fresh in * $3 + 1M cached * $0.30 + 100k out * $15
         // = 3.0 + 0.3 + 1.5 = 4.8
@@ -8978,7 +8979,9 @@ fn build_chat_body(
             body["seed"] = serde_json::json!(seed);
         }
         // OpenAI o-series / reasoning-capable cloud APIs take levels only.
-        if let Some(ref effort) = params.reasoning_effort
+        // Skip for models that don't support it (e.g. Mistral on NVIDIA API).
+        if cloud.supports_reasoning_effort
+            && let Some(ref effort) = params.reasoning_effort
             && matches!(effort.as_str(), "low" | "medium" | "high")
         {
             body["reasoning_effort"] = serde_json::json!(effort);
@@ -9296,6 +9299,7 @@ mod chat_body_tests {
             api_model: "test-cloud".to_string(),
             params: ModelParams::default(),
             pricing: crate::config::ModelPricing::default(),
+            supports_reasoning_effort: true,
         }
     }
 
@@ -10267,6 +10271,7 @@ mod model_dialog_cloud_tests {
                 cached_read_per_mtok: None,
                 cache_write_per_mtok: None,
             },
+            supports_reasoning_effort: true,
         }
     }
 
@@ -10432,6 +10437,7 @@ mod slash_config_tests {
             api_model: "kimi-k3".to_string(),
             params: kimi_params,
             pricing: pricing.clone(),
+            supports_reasoning_effort: true,
         }];
 
         ModelsConfFiles {
@@ -10559,6 +10565,7 @@ mod slash_model_tests {
             api_model: "kimi-k3-pro".to_string(),
             params,
             pricing,
+            supports_reasoning_effort: true,
         }];
         let out = app.render_model_info(&ModelParamsStore {
             default: ModelParams::default(),
