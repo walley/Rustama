@@ -2366,7 +2366,7 @@ dependencies = [
 
 [[package]]
 name = "rustama"
-version = "0.8.0"
+version = "0.9.99"
 dependencies = [
  "arboard",
  "chrono",
