@@ -9152,8 +9152,15 @@ fn stream_chat_request(
                                             if usage_from_json(&json).is_some() {
                                                 let _ = tx.send(StreamChunk::Stats(parse_usage_stats(&json)));
                                             }
+                                            // Skip reasoning_content when reasoning is disabled:
+                                            // - supports_reasoning_effort == false (model doesn't accept the parameter)
+                                            // - reasoning_effort == "off" (user explicitly turned it off)
+                                            let reasoning_disabled =
+                                                cloud_model.as_ref().map(|c| !c.supports_reasoning_effort).unwrap_or(false)
+                                                    || params.reasoning_effort.as_deref() == Some("off");
                                             if let Some(reasoning) = json["choices"][0]["delta"]["reasoning_content"].as_str()
-                                                && !reasoning.is_empty() {
+                                                && !reasoning.is_empty()
+                                                && !reasoning_disabled {
                                                     let _ = tx.send(StreamChunk::Thinking(reasoning.to_string()));
                                                 }
                                             if let Some(delta) = json["choices"][0]["delta"]["content"].as_str()
