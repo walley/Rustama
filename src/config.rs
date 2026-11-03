@@ -1487,6 +1487,60 @@ pub fn conf_dir() -> Option<PathBuf> {
     Some(home.join(".config").join("rustama"))
 }
 
+/// Read-only snapshot of the per-model config files (`models_ollama.conf`
+/// and `models_cloud.conf`) for display commands like `/config`. Unlike the
+/// `load_*` functions this never creates, migrates, or rewrites files;
+/// missing or unreadable files yield `None` fields.
+#[derive(Debug, Clone)]
+pub struct ModelsConfFiles {
+    pub ollama_path: PathBuf,
+    /// Parsed `models_ollama.conf` (`[default]` + per-model sections).
+    pub ollama: Option<ModelParamsStore>,
+    pub cloud_path: PathBuf,
+    /// Named cloud models from `models_cloud.conf` (placeholder api_keys
+    /// filtered out, like [`load_cloud_models_with_base`]).
+    pub cloud_models: Option<Vec<CloudModel>>,
+    /// The `[default]` section of `models_cloud.conf` (params + pricing)
+    /// that every named cloud model inherits.
+    pub cloud_default: Option<(ModelParams, ModelPricing)>,
+}
+
+/// Reads both model-parameter files from the config dir without any
+/// write-back side effects. Returns `None` when the config dir cannot be
+/// determined (no HOME).
+pub fn read_models_conf_files() -> Option<ModelsConfFiles> {
+    Some(read_models_conf_files_from(conf_dir()?))
+}
+
+fn read_models_conf_files_from(dir: PathBuf) -> ModelsConfFiles {
+    let ollama_path = dir.join(OLLAMA_MODELS_FILE);
+    let cloud_path = dir.join(CLOUD_MODELS_FILE);
+    let ollama = fs::read_to_string(&ollama_path)
+        .ok()
+        .map(|c| parse_model_params(&c));
+    // Cloud sections fall back to the Ollama [default] for unset params,
+    // exactly like load_cloud_models_with_base.
+    let base = ollama
+        .as_ref()
+        .map(|s| s.default.clone())
+        .unwrap_or_default();
+    let cloud_content = fs::read_to_string(&cloud_path).ok();
+    let (cloud_models, cloud_default) = match cloud_content {
+        Some(ref c) => (
+            Some(parse_cloud_models(c, &base)),
+            Some(parse_cloud_defaults(c, &base)),
+        ),
+        None => (None, None),
+    };
+    ModelsConfFiles {
+        ollama_path,
+        ollama,
+        cloud_path,
+        cloud_models,
+        cloud_default,
+    }
+}
+
 /// Resolve a `system_prompt_*` config value: if it names an existing
 /// file relative to the config directory, return the file's contents
 /// (trimmed) together with the file name; otherwise treat the value as
@@ -1811,6 +1865,65 @@ mod tests {
         assert_eq!(store.default.top_k, 40);
         assert_eq!(store.params_for("llama3.2:3b").temperature, 0.7);
         assert_eq!(store.params_for("qwen3:8b").num_ctx, Some(32768));
+    }
+
+    #[test]
+    fn read_models_conf_files_reads_both_files_without_writing() {
+        let dir = std::env::temp_dir().join(format!(
+            "rustama-test-{}-models-conf-snap",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join(OLLAMA_MODELS_FILE),
+            "[default]\ntemperature = 0.7\n\n[qwen3:8b]\nseed = 42\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join(CLOUD_MODELS_FILE),
+            "[default]\ntool_choice = auto\nreasoning_effort = high\n\n\
+             [kimi]\napi_url = https://x\napi_key = sk-real\nprice_input = 2.0\n",
+        )
+        .unwrap();
+
+        let snap = read_models_conf_files_from(dir.clone());
+        assert_eq!(snap.ollama_path, dir.join(OLLAMA_MODELS_FILE));
+        assert_eq!(snap.cloud_path, dir.join(CLOUD_MODELS_FILE));
+
+        let ollama = snap.ollama.as_ref().unwrap();
+        assert_eq!(ollama.default.temperature, 0.7);
+        assert_eq!(ollama.per_model["qwen3:8b"].seed, Some(42));
+
+        let models = snap.cloud_models.as_ref().unwrap();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].name, "kimi");
+        assert_eq!(models[0].pricing.input_per_mtok, Some(2.0));
+
+        let (cdefault, _) = snap.cloud_default.as_ref().unwrap();
+        assert_eq!(cdefault.tool_choice.as_deref(), Some("auto"));
+        assert_eq!(cdefault.reasoning_effort.as_deref(), Some("high"));
+
+        // Read-only: nothing created or rewritten (no legacy files appear).
+        let entries: Vec<_> = fs::read_dir(&dir).unwrap().collect();
+        assert_eq!(entries.len(), 2);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_models_conf_files_tolerates_missing_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "rustama-test-{}-models-conf-empty",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let snap = read_models_conf_files_from(dir.clone());
+        assert!(snap.ollama.is_none());
+        assert!(snap.cloud_models.is_none());
+        assert!(snap.cloud_default.is_none());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
