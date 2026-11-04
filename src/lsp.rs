@@ -1,41 +1,57 @@
-//! LSP client for rust-analyzer — compiler feedback for the agentic tools.
+//! LSP client — compiler feedback for the agentic tools.
+//!
+//! Supports two transports:
+//! - **Stdio**: spawns a child process (e.g. rust-analyzer) with piped
+//!   stdin/stdout.
+//! - **TCP**: connects to an already-running LSP server over a TCP socket
+//!   (e.g. Kotlin LSP on 127.0.0.1:9999).
 //!
 //! Architecture (mirrors `TerminalState` in app.rs):
 //!
-//! - The rust-analyzer child process is spawned with piped stdio; messages
-//!   use the `lsp-server` crate's `Message::read`/`Message::write` framing
-//!   (`Content-Length` headers + JSON-RPC). (`Connection::stdio()` is meant
-//!   for servers talking over *their own* stdio, so a client uses the
-//!   framing primitives directly over the child's pipes.)
+//! - Messages use the `lsp-server` crate's `Message::read`/`Message::write`
+//!   framing (`Content-Length` headers + JSON-RPC) over the chosen
+//!   transport.
 //! - A reader thread routes incoming messages: `Response`s resolve pending
 //!   requests (id → oneshot sender map), `publishDiagnostics` notifications
 //!   update the shared diagnostics store, and server→client requests get
-//!   minimal canned replies so rust-analyzer never stalls waiting on us.
+//!   minimal canned replies so the server never stalls waiting on us.
 //! - All concurrency is std `mpsc`/`Mutex` — no tokio (the app is
 //!   sync-first). Requests block the calling thread with a timeout plus a
 //!   shared cancel flag, exactly like the `bash` tool's 30 s poll loop.
 //!
-//! Lifecycle: `start()` spawns + handshakes (`initialize`/`initialized`),
-//! `shutdown()` sends `shutdown`/`exit` and kills the child if it does not
-//! exit promptly; `Drop` guarantees no orphan rust-analyzer survives.
+//! Lifecycle: `start()` connects + handshakes (`initialize`/`initialized`),
+//! `shutdown()` sends `shutdown`/`exit` and closes the connection;
+//! `Drop` guarantees no orphan server survives.
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
+use std::net::TcpStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use lsp_server::{Message, Notification, Request, RequestId, Response};
 
-/// Outbound half of the LSP connection. A trait (not a concrete
-/// `ChildStdin`) so tests — and any future in-process server — can swap in
-/// a different transport; production always uses `ChildStdin`.
-trait LspWriter: Write + Send {}
-impl LspWriter for ChildStdin {}
-#[cfg(test)]
-impl LspWriter for std::io::PipeWriter {}
+/// How to connect to the LSP server.
+pub enum LspConnect {
+    /// Spawn `bin` as a child process with piped stdio (rust-analyzer).
+    Stdio { bin: String },
+    /// Connect to `addr` (e.g. "127.0.0.1:9999") via TCP (Kotlin LSP).
+    Tcp { addr: String },
+}
+
+/// The underlying transport of an LSP connection.
+enum LspTransport {
+    /// Child process communicating over stdio pipes.
+    Stdio { child: Child },
+    /// TCP socket connection to an already-running server.
+    Tcp,
+}
+
+/// Outbound half of the LSP connection — any `Write + Send` type works.
+/// Production uses `ChildStdin` (stdio) or `TcpStream` (TCP socket).
 
 /// Default timeout for LSP requests (same ballpark as the bash tool's 30 s).
 pub const LSP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -112,16 +128,18 @@ struct Shared {
     doc_version: AtomicI64,
 }
 
-/// A running (or stopped) rust-analyzer LSP session. Cheap to keep around
-/// while stopped; `start()` is explicit because the child is heavy.
+/// A running (or stopped) LSP session. Cheap to keep around while stopped;
+/// `start()` is explicit because the connection is heavy.
 pub struct LspClient {
     shared: Arc<Shared>,
-    child: Option<Child>,
-    stdin: Option<Arc<Mutex<dyn LspWriter>>>,
+    transport: Option<LspTransport>,
+    stdin: Option<Arc<Mutex<Box<dyn Write + Send>>>>,
     reader: Option<std::thread::JoinHandle<()>>,
     /// Set to make the reader thread exit (used on shutdown/restart).
     stop_reader: Arc<AtomicBool>,
     root: PathBuf,
+    /// Server binary (stdio mode) or address (TCP mode), remembered for
+    /// restarts.
     server_bin: String,
     /// Directory for the LSP server's stderr log file (rustama-lsp.log).
     /// Defaults to current directory; set via `set_log_path()`.
@@ -160,7 +178,7 @@ impl LspClient {
                 open_docs: Mutex::new(std::collections::HashSet::new()),
                 doc_version: AtomicI64::new(0),
             }),
-            child: None,
+            transport: None,
             stdin: None,
             reader: None,
             stop_reader: Arc::new(AtomicBool::new(false)),
@@ -190,57 +208,72 @@ impl LspClient {
         self.session_id = id.to_string();
     }
 
-    /// Spawns `server_bin` rooted at `root` and performs the LSP handshake.
-    /// Any previous server is shut down first (workspace switch).
-    pub fn start(&mut self, root: PathBuf, server_bin: &str) -> Result<(), String> {
+    /// Connects to the LSP server rooted at `root` and performs the LSP
+    /// handshake. `connect` specifies whether to spawn a child process
+    /// (stdio) or connect to a TCP socket. Any previous server is shut
+    /// down first (workspace switch).
+    pub fn start(&mut self, root: PathBuf, connect: LspConnect) -> Result<(), String> {
         self.shutdown();
         self.root = root;
-        self.server_bin = server_bin.to_string();
+        match &connect {
+            LspConnect::Stdio { bin } => self.server_bin = bin.clone(),
+            LspConnect::Tcp { addr } => self.server_bin = addr.clone(),
+        }
         *self.shared.status.lock().unwrap() = LspStatus::Starting;
 
-        match self.start_inner() {
-            Ok(()) => {
-                *self.shared.status.lock().unwrap() = LspStatus::Running;
-                Ok(())
+        // Build the transport, stdin writer, and reader. We must extract
+        // stdout/stdin from the child/stream *before* storing the transport,
+        // since `ChildStdout`/`TcpStream` are not `Clone` and we need
+        // separate handles for reading vs writing.
+        let (stdin_writer, reader, transport) = match connect {
+            LspConnect::Stdio { bin } => {
+                let log_file = self
+                    .log_path
+                    .join(format!("rustama-lsp-{}.log", self.session_id));
+                let stderr: Stdio = std::fs::File::create(&log_file)
+                    .map(Stdio::from)
+                    .unwrap_or(Stdio::null());
+                let mut child = Command::new(&bin)
+                    .current_dir(&self.root)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(stderr)
+                    .spawn()
+                    .map_err(|e| format!("failed to spawn {}: {}", bin, e))?;
+                let stdin = child.stdin.take().ok_or("no stdin on LSP child")?;
+                let stdout = child.stdout.take().ok_or("no stdout on LSP child")?;
+                let reader: Box<dyn BufRead + Send> = Box::new(BufReader::new(stdout));
+                let transport = LspTransport::Stdio { child };
+                (Box::new(stdin) as Box<dyn Write + Send>, reader, transport)
             }
-            Err(e) => {
-                *self.shared.status.lock().unwrap() = LspStatus::Failed(e.clone());
-                self.kill_child();
-                Err(e)
+            LspConnect::Tcp { addr } => {
+                let stream = TcpStream::connect(&addr)
+                    .map_err(|e| format!("failed to connect to {}: {}", addr, e))?;
+                // One stream handle for writing (stdin), one for reading.
+                let write_stream = stream
+                    .try_clone()
+                    .map_err(|e| format!("failed to clone TcpStream: {}", e))?;
+                let reader: Box<dyn BufRead + Send> = Box::new(BufReader::new(stream));
+                let transport = LspTransport::Tcp;
+                (
+                    Box::new(write_stream) as Box<dyn Write + Send>,
+                    reader,
+                    transport,
+                )
             }
-        }
-    }
-
-    fn start_inner(&mut self) -> Result<(), String> {
-        // rust-analyzer logs useful progress/crash info to stderr — keep
-        // it in the configured log directory, named with the session id so
-        // concurrent instances write to separate files.
-        let log_file = self.log_path.join(format!("rustama-lsp-{}.log", self.session_id));
-        let stderr: Stdio = std::fs::File::create(&log_file)
-            .map(Stdio::from)
-            .unwrap_or(Stdio::null());
-        let mut child = Command::new(&self.server_bin)
-            .current_dir(&self.root)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(stderr)
-            .spawn()
-            .map_err(|e| format!("failed to spawn {}: {}", self.server_bin, e))?;
-
-        let stdin = child.stdin.take().ok_or("no stdin on LSP child")?;
-        let stdout = child.stdout.take().ok_or("no stdout on LSP child")?;
-        let stdin: Arc<Mutex<dyn LspWriter>> = Arc::new(Mutex::new(stdin));
+        };
+        let stdin: Arc<Mutex<Box<dyn Write + Send>>> = Arc::new(Mutex::new(stdin_writer));
 
         self.stop_reader = Arc::new(AtomicBool::new(false));
-        let reader = spawn_reader(
-            BufReader::new(stdout),
+        let reader_thread = spawn_reader(
+            reader,
             Arc::clone(&stdin),
             Arc::clone(&self.shared),
             Arc::clone(&self.stop_reader),
         );
-        self.reader = Some(reader);
+        self.reader = Some(reader_thread);
         self.stdin = Some(stdin);
-        self.child = Some(child);
+        self.transport = Some(transport);
 
         // --- handshake ---
         let root_uri = path_to_uri(&self.root)?;
@@ -257,6 +290,7 @@ impl LspClient {
             .pull_supported
             .store(init.capabilities.diagnostic_provider.is_some(), Ordering::Relaxed);
         self.notify("initialized", serde_json::json!({}))?;
+        *self.shared.status.lock().unwrap() = LspStatus::Running;
         Ok(())
     }
 
@@ -323,11 +357,10 @@ impl LspClient {
             .map_err(|e| format!("LSP write failed: {}", e))
     }
 
-    /// Politely shuts the server down (`shutdown` + `exit`), then kills the
-    /// child if it is still alive after a short grace period. Safe to call
-    /// on an already-stopped client.
+    /// Politely shuts the server down (`shutdown` + `exit`), then closes the
+    /// connection. Safe to call on an already-stopped client.
     pub fn shutdown(&mut self) {
-        if self.child.is_some() {
+        if self.transport.is_some() {
             if *self.shared.status.lock().unwrap() == LspStatus::Running {
                 let _ = self.request_value(
                     "shutdown",
@@ -343,8 +376,11 @@ impl LspClient {
         *self.shared.status.lock().unwrap() = LspStatus::Stopped;
     }
 
+    /// Closes the transport: for stdio, waits for/kills the child process;
+    /// for TCP, nothing extra to do (streams are closed by dropping stdin/
+    /// reader).
     fn kill_child(&mut self) {
-        if let Some(mut child) = self.child.take() {
+        if let Some(LspTransport::Stdio { mut child }) = self.transport.take() {
             // exit notification gives it a moment; then escalate.
             for _ in 0..20 {
                 if matches!(child.try_wait(), Ok(Some(_))) {
@@ -631,6 +667,294 @@ impl LspClient {
     }
 }
 
+/// Manages multiple LSP server connections, one per language.
+///
+/// Routes requests to the appropriate client based on file path extension
+/// (via [`language_id_for`]). App holds a single `LspManager` and operates
+/// all LSP through it — no per-language methods needed on App.
+pub struct LspManager {
+    /// LSP clients keyed by language name (e.g. "rust", "kotlin").
+    clients: HashMap<String, LspClient>,
+    /// Directory for LSP server log files.
+    log_path: PathBuf,
+    /// Session id embedded in log filenames.
+    session_id: String,
+}
+
+impl LspManager {
+    /// A stopped manager with no clients.
+    pub fn new() -> Self {
+        let mut clients = HashMap::new();
+        // Pre-populate with default (stopped) clients for known languages so
+        // that `client_for_path` always returns a client and tools report
+        // "server not running" rather than "no server configured".
+        clients.insert("rust".to_string(), LspClient::new());
+        clients.insert("kotlin".to_string(), LspClient::new());
+        LspManager {
+            clients,
+            log_path: PathBuf::new(),
+            session_id: String::new(),
+        }
+    }
+
+    /// Set the directory for LSP server log files. Call before `start()`.
+    pub fn set_log_path(&mut self, path: PathBuf) {
+        let clone = path.clone();
+        self.log_path = path;
+        for client in self.clients.values_mut() {
+            client.set_log_path(clone.clone());
+        }
+    }
+
+    /// Set the session id embedded in log filenames.
+    pub fn set_session_id(&mut self, id: &str) {
+        self.session_id = id.to_string();
+        for client in self.clients.values_mut() {
+            client.set_session_id(id);
+        }
+    }
+
+    /// Starts (or restarts) the LSP server for `language` rooted at `root`.
+    /// `connect` specifies how to connect (stdio child process or TCP).
+    pub fn start(
+        &mut self,
+        language: &str,
+        root: PathBuf,
+        connect: LspConnect,
+    ) -> Result<(), String> {
+        let mut client = self.clients.remove(language).unwrap_or_else(LspClient::new);
+        client.set_log_path(self.log_path.clone());
+        client.set_session_id(&self.session_id);
+        let result = client.start(root, connect);
+        if result.is_ok() {
+            self.clients.insert(language.to_string(), client);
+        } else {
+            // Put the failed client back so its state is preserved
+            self.clients.insert(language.to_string(), client);
+        }
+        result
+    }
+
+    /// Stops the LSP server for `language`, if one is running.
+    pub fn stop(&mut self, language: &str) {
+        if let Some(mut client) = self.clients.remove(language) {
+            client.shutdown();
+            self.clients.insert(language.to_string(), client);
+        }
+    }
+
+    /// Stops all LSP servers.
+    pub fn stop_all(&mut self) {
+        for client in self.clients.values_mut() {
+            client.shutdown();
+        }
+    }
+
+    /// Returns the LSP client responsible for `path`, based on file
+    /// extension. Returns `None` if no client is configured for that
+    /// language.
+    pub fn client_for_path(&self, path: &Path) -> Option<&LspClient> {
+        let lang = language_id_for(path);
+        self.clients.get(lang)
+    }
+
+    /// Returns the status of the LSP server for `language`.
+    pub fn status_for(&self, language: &str) -> LspStatus {
+        self.clients
+            .get(language)
+            .map(|c| c.status())
+            .unwrap_or(LspStatus::Stopped)
+    }
+
+    /// Returns true if any LSP server is running.
+    pub fn any_running(&self) -> bool {
+        self.clients
+            .values()
+            .any(|c| matches!(c.status(), LspStatus::Running))
+    }
+
+    /// Returns true if the LSP server for `path`'s language is running.
+    pub fn is_running_for_path(&self, path: &Path) -> bool {
+        self.client_for_path(path)
+            .map(|c| matches!(c.status(), LspStatus::Running))
+            .unwrap_or(false)
+    }
+
+    /// Diagnostics for `path` (routes to the client for that file's
+    /// language). Empty if no client is configured or no diagnostics.
+    pub fn diagnostics_for(&self, path: &Path) -> Vec<lsp_types::Diagnostic> {
+        match self.client_for_path(path) {
+            Some(client) => client.diagnostics_for(path),
+            None => Vec::new(),
+        }
+    }
+
+    /// Combined (errors, warnings) across all LSP servers.
+    pub fn diagnostics_summary(&self) -> (usize, usize) {
+        let mut errors = 0;
+        let mut warnings = 0;
+        for client in self.clients.values() {
+            let (e, w) = client.diagnostics_summary();
+            errors += e;
+            warnings += w;
+        }
+        (errors, warnings)
+    }
+
+    /// Diagnostics version for `path` (0 if no client configured).
+    pub fn diag_version(&self, path: &Path) -> u64 {
+        self.client_for_path(path)
+            .map(|c| c.diag_version(path))
+            .unwrap_or(0)
+    }
+
+    /// Whether pull diagnostics are supported by the client for `path`'s
+    /// language.
+    pub fn pull_supported_for_path(&self, path: &Path) -> bool {
+        self.client_for_path(path)
+            .map(|c| c.pull_supported())
+            .unwrap_or(false)
+    }
+
+    /// Root of the LSP server for `path`'s language.
+    pub fn root_for_path(&self, path: &Path) -> Option<PathBuf> {
+        self.client_for_path(path).map(|c| c.root().to_path_buf())
+    }
+
+    /// Syncs `path` into the appropriate LSP server.
+    pub fn sync_file(&self, path: &Path) -> Result<(), String> {
+        match self.client_for_path(path) {
+            Some(client) => client.sync_file(path),
+            None => Err(format!(
+                "no LSP server configured for {} files",
+                path.extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("unknown")
+            )),
+        }
+    }
+
+    /// Pull diagnostics for `path` via its language's LSP server.
+    pub fn pull_diagnostics(
+        &self,
+        path: &Path,
+        timeout: Duration,
+        cancel: &AtomicBool,
+    ) -> Result<Vec<lsp_types::Diagnostic>, String> {
+        match self.client_for_path(path) {
+            Some(client) => client.pull_diagnostics(path, timeout, cancel),
+            None => Err("no LSP server configured for this file type".to_string()),
+        }
+    }
+
+    /// Wait for fresh diagnostics for `path`.
+    pub fn wait_for_diagnostics(
+        &self,
+        path: &Path,
+        since: u64,
+        timeout: Duration,
+        cancel: &AtomicBool,
+    ) -> u64 {
+        match self.client_for_path(path) {
+            Some(client) => client.wait_for_diagnostics(path, since, timeout, cancel),
+            None => 0,
+        }
+    }
+
+    /// Goto definition for `path` via its language's LSP server.
+    pub fn goto_definition(
+        &self,
+        path: &Path,
+        line: u32,
+        character: u32,
+        timeout: Duration,
+        cancel: &AtomicBool,
+    ) -> Result<Vec<lsp_types::Location>, String> {
+        match self.client_for_path(path) {
+            Some(client) => client.goto_definition(path, line, character, timeout, cancel),
+            None => Err("no LSP server configured for this file type".to_string()),
+        }
+    }
+
+    /// Hover info for `path` via its language's LSP server.
+    pub fn hover(
+        &self,
+        path: &Path,
+        line: u32,
+        character: u32,
+        timeout: Duration,
+        cancel: &AtomicBool,
+    ) -> Result<String, String> {
+        match self.client_for_path(path) {
+            Some(client) => client.hover(path, line, character, timeout, cancel),
+            None => Ok(String::new()),
+        }
+    }
+
+    /// References for `path` via its language's LSP server.
+    pub fn references(
+        &self,
+        path: &Path,
+        line: u32,
+        character: u32,
+        include_declaration: bool,
+        timeout: Duration,
+        cancel: &AtomicBool,
+    ) -> Result<Vec<lsp_types::Location>, String> {
+        match self.client_for_path(path) {
+            Some(client) => {
+                client.references(path, line, character, include_declaration, timeout, cancel)
+            }
+            None => Err("no LSP server configured for this file type".to_string()),
+        }
+    }
+
+    /// Completions for `path` via its language's LSP server.
+    pub fn completion(
+        &self,
+        path: &Path,
+        line: u32,
+        character: u32,
+        timeout: Duration,
+        cancel: &AtomicBool,
+    ) -> Result<Vec<String>, String> {
+        match self.client_for_path(path) {
+            Some(client) => client.completion(path, line, character, timeout, cancel),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// Returns the server name for `path`'s language (for error messages).
+    pub fn server_name_for_path(&self, path: &Path) -> &'static str {
+        match language_id_for(path) {
+            "kotlin" => "Kotlin LSP",
+            _ => "rust-analyzer",
+        }
+    }
+
+    /// Returns the config key for `path`'s language.
+    pub fn config_key_for_path(&self, path: &Path) -> &'static str {
+        match language_id_for(path) {
+            "kotlin" => "kotlin_lsp",
+            _ => "lsp",
+        }
+    }
+
+    /// Returns an iterator over (language, status) pairs for all clients.
+    pub fn statuses(&self) -> Vec<(String, LspStatus)> {
+        self.clients
+            .iter()
+            .map(|(lang, client)| (lang.clone(), client.status()))
+            .collect()
+    }
+}
+
+impl Default for LspManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Drop for LspClient {
     fn drop(&mut self) {
         self.shutdown();
@@ -654,8 +978,8 @@ fn extract_report_items(
 /// diagnostics, and answers server→client requests with minimal replies so
 /// rust-analyzer never blocks on us.
 fn spawn_reader(
-    mut stdout: impl BufRead + Send + 'static,
-    stdin: Arc<Mutex<dyn LspWriter>>,
+    mut stdout: Box<dyn BufRead + Send>,
+    stdin: Arc<Mutex<Box<dyn Write + Send>>>,
     shared: Arc<Shared>,
     stop: Arc<AtomicBool>,
 ) -> std::thread::JoinHandle<()> {
@@ -764,10 +1088,12 @@ pub fn uri_to_path(uri: &str) -> Option<PathBuf> {
     Some(PathBuf::from(decoded.into_owned()))
 }
 
-/// LSP `languageId` for a path (only Rust matters today).
+/// LSP `languageId` for a path. Handles Rust, Kotlin, and common config files.
 fn language_id_for(path: &Path) -> &'static str {
     match path.extension().and_then(|e| e.to_str()) {
         Some("rs") => "rust",
+        Some("kt") => "kotlin",
+        Some("kts") => "kotlin",
         Some("toml") => "toml",
         _ => "rust",
     }
@@ -1174,9 +1500,10 @@ mod lsp_tests {
 
         let mut client = LspClient::new();
         client.stop_reader = Arc::new(AtomicBool::new(false));
-        let stdin: Arc<Mutex<dyn LspWriter>> = Arc::new(Mutex::new(client_writer));
+        let stdin: Arc<Mutex<Box<dyn Write + Send>>> =
+            Arc::new(Mutex::new(Box::new(client_writer) as Box<dyn Write + Send>));
         client.reader = Some(spawn_reader(
-            BufReader::new(client_reader),
+            Box::new(BufReader::new(client_reader)) as Box<dyn BufRead + Send>,
             Arc::clone(&stdin),
             Arc::clone(&client.shared),
             Arc::clone(&client.stop_reader),
@@ -1394,7 +1721,12 @@ fn lsp_real_rust_analyzer() {
 
     let mut client = LspClient::new();
     client
-        .start(root.clone(), "rust-analyzer")
+        .start(
+            root.clone(),
+            LspConnect::Stdio {
+                bin: "rust-analyzer".to_string(),
+            },
+        )
         .expect("rust-analyzer should start (is it installed?)");
     assert_eq!(client.status(), LspStatus::Running);
     assert!(client.pull_supported(), "rust-analyzer supports pull diagnostics");

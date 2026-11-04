@@ -57,6 +57,13 @@ pub struct Config {
     /// After edit_file/write_file tool calls, automatically append fresh
     /// LSP diagnostics to the tool result.
     pub lsp_auto_diagnostics: bool,
+    /// Launch a Kotlin LSP server for Kotlin compiler feedback
+    /// (`lsp_diagnostics` tool on .kt/.kts files). Default: off.
+    pub kotlin_lsp: bool,
+    /// TCP address of the Kotlin LSP server (e.g. "127.0.0.1:9999").
+    pub kotlin_lsp_server: String,
+    /// Kotlin LSP workspace root. Empty = directory of `save_path`, else cwd.
+    pub kotlin_lsp_workspace: String,
 }
 
 /// Per-model sampling / generation parameters.
@@ -352,6 +359,9 @@ impl Default for Config {
             lsp_server: "rust-analyzer".to_string(),
             lsp_workspace: String::new(),
             lsp_auto_diagnostics: true,
+            kotlin_lsp: false,
+            kotlin_lsp_server: "127.0.0.1:9999".to_string(),
+            kotlin_lsp_workspace: String::new(),
             session_dir: None,
             log_directory: "logs".to_string(),
         }
@@ -428,6 +438,15 @@ impl Config {
                     (
                         "lsp_auto_diagnostics".to_string(),
                         if dflt.lsp_auto_diagnostics { "on" } else { "off" }.to_string(),
+                    ),
+                    ("kotlin_lsp".to_string(), if dflt.kotlin_lsp { "on" } else { "off" }.to_string()),
+                    (
+                        "kotlin_lsp_server".to_string(),
+                        dflt.kotlin_lsp_server.clone(),
+                    ),
+                    (
+                        "kotlin_lsp_workspace".to_string(),
+                        dflt.kotlin_lsp_workspace.clone(),
                     ),
                     ("session_dir".to_string(), dflt.session_dir.clone().unwrap_or_default()),
                     ("log_directory".to_string(), dflt.log_directory.clone()),
@@ -530,6 +549,13 @@ impl Config {
              # Append LSP diagnostics to edit_file/write_file results\n\
              # (on/off, default: on)\n\
              lsp_auto_diagnostics = {}\n\n\
+             # Launch Kotlin LSP for Kotlin compiler feedback (on/off,\n\
+             # default: off)\n\
+             kotlin_lsp = {}\n\n\
+             # TCP address of the Kotlin LSP server (default: 127.0.0.1:9999)\n\
+             kotlin_lsp_server = {}\n\n\
+             # Kotlin LSP workspace root (default: dir of save_path, else cwd)\n\
+             kotlin_lsp_workspace = {}\n\n\
              # Directory for session files (default: <DOCUMENTS>/rustama)\n\
              session_dir = {}\n\n\
              # Directory for log files (default: <session_dir>/logs)\n\
@@ -557,6 +583,9 @@ impl Config {
             self.lsp_server,
             self.lsp_workspace,
             if self.lsp_auto_diagnostics { "on" } else { "off" },
+            if self.kotlin_lsp { "on" } else { "off" },
+            self.kotlin_lsp_server.clone(),
+            self.kotlin_lsp_workspace.clone(),
             self.session_dir.clone().unwrap_or_default(),
             self.log_directory.clone(),
         )
@@ -663,6 +692,18 @@ impl Config {
         }
         if let Some(v) = values.get("lsp_auto_diagnostics") {
             cfg.lsp_auto_diagnostics = parse_bool(v);
+        }
+        if let Some(v) = values.get("kotlin_lsp") {
+            cfg.kotlin_lsp = parse_bool(v);
+        }
+        if let Some(v) = values.get("kotlin_lsp_server") {
+            cfg.kotlin_lsp_server = v.clone();
+        }
+        if let Some(v) = values.get("kotlin_lsp_workspace") {
+            let v = v.trim();
+            if !v.is_empty() {
+                cfg.kotlin_lsp_workspace = v.to_string();
+            }
         }
         if let Some(v) = values.get("session_dir") {
             let v = v.trim();

@@ -1338,6 +1338,7 @@ pub enum MenuAction {
     ToggleHintbar,
     OpenSettingsDialog,
     OpenThemeDialog,
+    OpenLspDialog,
     ShowAbout,
 }
 
@@ -1370,7 +1371,7 @@ impl MainMenu {
     pub fn item_names(&self) -> Vec<&'static str> {
         match self.active {
             ActiveMenu::File => vec!["New", "Load", "Save", "Export...", "\u{2500}", "Exit"],
-            ActiveMenu::Edit => vec!["Set Model", "Workflow... F5", "\u{2500}", "Theme...", "Settings..."],
+            ActiveMenu::Edit => vec!["Set Model", "Workflow... F5", "\u{2500}", "Theme...", "Settings...", "LSP..."],
             ActiveMenu::View => vec!["Terminal", "Hintbar"],
             ActiveMenu::Help => vec!["About"],
             ActiveMenu::None => vec![],
@@ -1463,6 +1464,7 @@ impl MainMenu {
             (ActiveMenu::Edit, 1) => MenuAction::OpenWorkflowDialog,
             (ActiveMenu::Edit, 3) => MenuAction::OpenThemeDialog,
             (ActiveMenu::Edit, 4) => MenuAction::OpenSettingsDialog,
+            (ActiveMenu::Edit, 5) => MenuAction::OpenLspDialog,
             (ActiveMenu::View, 0) => MenuAction::ToggleTerminal,
             (ActiveMenu::View, 1) => MenuAction::ToggleHintbar,
             (ActiveMenu::Help, 0) => MenuAction::ShowAbout,

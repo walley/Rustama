@@ -21,7 +21,7 @@ mod primary_selection;
 mod spinners;
 mod tools;
 mod ui;
-use app::{App, ChatMessage, Focus, InputMode, ModelDialogFocus, SaveDialogFocus, SettingsFocus};
+use app::{App, ChatMessage, Focus, InputMode, LspDialogFocus, ModelDialogFocus, SaveDialogFocus, SettingsFocus};
 use config::Config;
 use markdown::render_markdown;
 use ui::{Button, CODE_BLOCK_BG, ConfirmationBox, FileActionDialog, MC_GREEN, Theme, dialog_block};
@@ -321,6 +321,10 @@ fn ui(f: &mut Frame, app: &mut App) {
 
     if app.show_settings_dialog {
         render_settings_dialog(f, app, area);
+    }
+
+    if app.show_lsp_dialog {
+        render_lsp_dialog(f, app, area);
     }
 
     if app.show_theme_dialog {
@@ -1705,7 +1709,6 @@ fn render_settings_dialog(f: &mut Frame, app: &App, area: Rect) {
         ("Max Retries:", SettingsFocus::MaxRetries),
         ("Num Ctx:", SettingsFocus::NumCtx),
         ("Justify:", SettingsFocus::Justify),
-        ("LSP:", SettingsFocus::Lsp),
     ];
 
     for (i, (label, focus)) in field_labels.iter().enumerate() {
@@ -1731,10 +1734,9 @@ fn render_settings_dialog(f: &mut Frame, app: &App, area: Rect) {
         };
         f.render_widget(label_para, label_area);
 
-        if matches!(*focus, SettingsFocus::Justify | SettingsFocus::Lsp) {
+        if matches!(*focus, SettingsFocus::Justify) {
             let checked = match *focus {
                 SettingsFocus::Justify => app.settings_justify,
-                SettingsFocus::Lsp => app.settings_lsp,
                 _ => unreachable!(),
             };
             let toggle_text = if checked { "[X]" } else { "[ ]" };
@@ -1847,6 +1849,189 @@ fn render_settings_dialog(f: &mut Frame, app: &App, area: Rect) {
     )
     .with_pressed_at(
         app.pressed_button == Some(app::PressedButton::SettingsDialogCancel),
+        app.mouse_pos.0,
+        app.mouse_pos.1,
+    );
+
+    let (save_text, save_style) = save_btn.render();
+    let (cancel_text, cancel_style) = cancel_btn.render();
+
+    let buttons = Line::from(vec![
+        Span::styled(save_text, save_style),
+        Span::raw(" ".repeat(gap as usize)),
+        Span::styled(cancel_text, cancel_style),
+    ]);
+
+    let btn_area = Rect {
+        x: btn_start_x,
+        y: btn_y,
+        width: total_btn_w,
+        height: 1,
+    };
+    f.render_widget(Paragraph::new(buttons), btn_area);
+}
+
+/// Renders the LSP configuration dialog (Edit → LSP ...).
+/// Uses ui.rs components: dialog_block for the border/title, Paragraph
+/// for labels/values/toggles, and Button for Save/Cancel.
+fn render_lsp_dialog(f: &mut Frame, app: &App, area: Rect) {
+    const DIALOG_W: u16 = 60;
+    const FIELD_COUNT: u16 = 7;
+    let dialog_h = FIELD_COUNT * 2 + 6;
+
+    let popup = Rect {
+        x: area.x + (area.width.saturating_sub(DIALOG_W)) / 2,
+        y: area.y + (area.height.saturating_sub(dialog_h)) / 2,
+        width: DIALOG_W,
+        height: dialog_h,
+    };
+    let inner = popup.inner(Margin::new(2, 1));
+
+    f.render_widget(Clear, popup);
+    f.render_widget(dialog_block("LSP Configuration", &app.theme), popup);
+
+    let field_labels = [
+        ("Rust-analyzer LSP:", LspDialogFocus::LspEnabled),
+        ("Server:", LspDialogFocus::LspServer),
+        ("Workspace:", LspDialogFocus::LspWorkspace),
+        ("Auto-diagnostics:", LspDialogFocus::LspAutoDiagnostics),
+        ("Kotlin LSP:", LspDialogFocus::KotlinLspEnabled),
+        ("Kotlin Server:", LspDialogFocus::KotlinLspServer),
+        ("Kotlin Workspace:", LspDialogFocus::KotlinLspWorkspace),
+    ];
+
+    for (i, (label, focus)) in field_labels.iter().enumerate() {
+        let field_y = inner.y + i as u16 * 2;
+
+        let label_style = if *focus == app.lsp_dialog_focus {
+            Style::default()
+                .fg(app.theme.dialog_fg)
+                .bg(app.theme.dialog_focus_bg)
+        } else {
+            Style::default().fg(app.theme.dialog_fg)
+        };
+
+        let label_para = Paragraph::new(Line::from(Span::styled(
+            format!("  {:<16}", label),
+            label_style,
+        )));
+        let label_area = Rect {
+            x: inner.x,
+            y: field_y,
+            width: 18,
+            height: 1,
+        };
+        f.render_widget(label_para, label_area);
+
+        if focus.is_toggle() {
+            let checked = match *focus {
+                LspDialogFocus::LspEnabled => app.lsp_enabled,
+                LspDialogFocus::LspAutoDiagnostics => app.settings_lsp_auto_diagnostics,
+                LspDialogFocus::KotlinLspEnabled => app.kotlin_lsp_enabled,
+                _ => false,
+            };
+            let toggle_text = if checked { "[X]" } else { "[ ]" };
+            let toggle_style = if *focus == app.lsp_dialog_focus {
+                Style::default()
+                    .fg(app.theme.dialog_fg)
+                    .bg(app.theme.dialog_focus_bg)
+            } else {
+                Style::default()
+                    .fg(app.theme.dialog_input_fg)
+                    .bg(app.theme.dialog_focus_bg)
+            };
+            let toggle_para = Paragraph::new(Line::from(Span::styled(
+                format!(" {:<5} ", toggle_text),
+                toggle_style,
+            )));
+            let toggle_area = Rect {
+                x: inner.x + 17,
+                y: field_y,
+                width: 7,
+                height: 1,
+            };
+            f.render_widget(toggle_para, toggle_area);
+        } else {
+            let value = match *focus {
+                LspDialogFocus::LspServer => &app.settings_lsp_server,
+                LspDialogFocus::LspWorkspace => &app.settings_lsp_workspace,
+                LspDialogFocus::KotlinLspServer => &app.settings_kotlin_lsp_server,
+                LspDialogFocus::KotlinLspWorkspace => &app.settings_kotlin_lsp_workspace,
+                _ => "",
+            };
+
+            let value_style = if *focus == app.lsp_dialog_focus {
+                Style::default()
+                    .fg(app.theme.dialog_fg)
+                    .bg(app.theme.dialog_focus_bg)
+            } else {
+                Style::default()
+                    .fg(app.theme.dialog_input_fg)
+                    .bg(app.theme.dialog_focus_bg)
+            };
+
+            let max_w = inner.width.saturating_sub(19);
+            let display_val = if value.len() > max_w as usize {
+                format!("{}...", &value[..(max_w as usize - 3)])
+            } else {
+                value.to_string()
+            };
+
+            let value_para = Paragraph::new(Line::from(Span::styled(
+                format!(
+                    " {:<width$} ",
+                    display_val,
+                    width = max_w.saturating_sub(1) as usize
+                ),
+                value_style,
+            )));
+            let value_area = Rect {
+                x: inner.x + 17,
+                y: field_y,
+                width: max_w + 2,
+                height: 1,
+            };
+            f.render_widget(value_para, value_area);
+
+            if *focus == app.lsp_dialog_focus {
+                let cursor_x = value_area.x + 1 + app.lsp_dialog_cursor as u16;
+                f.set_cursor_position(Position::new(cursor_x, field_y));
+            }
+        }
+    }
+
+    let btn_y = inner.y + FIELD_COUNT * 2;
+    let save_label = "Save";
+    let cancel_label = "Cancel";
+    let save_w = save_label.len() as u16 + 4;
+    let cancel_w = cancel_label.len() as u16 + 4;
+    let gap: u16 = 4;
+    let total_btn_w = save_w + gap + cancel_w;
+    let btn_start_x = inner.x + (inner.width.saturating_sub(total_btn_w)) / 2;
+
+    let save_btn = Button::new(
+        save_label,
+        btn_start_x,
+        btn_y,
+        app.lsp_dialog_focus == LspDialogFocus::Save,
+        app.theme.dialog_fg,
+        app.theme.dialog_focus_bg,
+    )
+    .with_pressed_at(
+        app.pressed_button == Some(app::PressedButton::LspDialogConfirm),
+        app.mouse_pos.0,
+        app.mouse_pos.1,
+    );
+    let cancel_btn = Button::new(
+        cancel_label,
+        btn_start_x + save_w + gap,
+        btn_y,
+        app.lsp_dialog_focus == LspDialogFocus::Cancel,
+        app.theme.dialog_fg,
+        app.theme.dialog_focus_bg,
+    )
+    .with_pressed_at(
+        app.pressed_button == Some(app::PressedButton::LspDialogCancel),
         app.mouse_pos.0,
         app.mouse_pos.1,
     );

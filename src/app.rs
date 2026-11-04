@@ -167,14 +167,13 @@ pub enum SettingsFocus {
     MaxRetries,
     NumCtx,
     Justify,
-    Lsp,
     Save,
     Cancel,
 }
 
 impl SettingsFocus {
     /// Field order used by Tab/BackTab and Up/Down navigation.
-    const ORDER: [SettingsFocus; 16] = [
+    const ORDER: [SettingsFocus; 15] = [
         SettingsFocus::Proxy,
         SettingsFocus::OllamaUrl,
         SettingsFocus::Temperature,
@@ -188,7 +187,6 @@ impl SettingsFocus {
         SettingsFocus::MaxRetries,
         SettingsFocus::NumCtx,
         SettingsFocus::Justify,
-        SettingsFocus::Lsp,
         SettingsFocus::Save,
         SettingsFocus::Cancel,
     ];
@@ -218,6 +216,64 @@ impl SettingsFocus {
                 | SettingsFocus::MaxToolRounds
                 | SettingsFocus::MaxRetries
                 | SettingsFocus::NumCtx
+        )
+    }
+}
+
+/// Which control of the LSP dialog has focus.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum LspDialogFocus {
+    LspEnabled,
+    LspServer,
+    LspWorkspace,
+    LspAutoDiagnostics,
+    KotlinLspEnabled,
+    KotlinLspServer,
+    KotlinLspWorkspace,
+    Save,
+    Cancel,
+}
+
+impl LspDialogFocus {
+    /// Field order used by Tab/BackTab and Up/Down navigation.
+    const ORDER: [LspDialogFocus; 9] = [
+        LspDialogFocus::LspEnabled,
+        LspDialogFocus::LspServer,
+        LspDialogFocus::LspWorkspace,
+        LspDialogFocus::LspAutoDiagnostics,
+        LspDialogFocus::KotlinLspEnabled,
+        LspDialogFocus::KotlinLspServer,
+        LspDialogFocus::KotlinLspWorkspace,
+        LspDialogFocus::Save,
+        LspDialogFocus::Cancel,
+    ];
+
+    fn next(self) -> LspDialogFocus {
+        let idx = Self::ORDER.iter().position(|f| *f == self).unwrap_or(0);
+        Self::ORDER[(idx + 1) % Self::ORDER.len()]
+    }
+
+    fn prev(self) -> LspDialogFocus {
+        let idx = Self::ORDER.iter().position(|f| *f == self).unwrap_or(0);
+        Self::ORDER[(idx + Self::ORDER.len() - 1) % Self::ORDER.len()]
+    }
+
+    fn is_text_field(self) -> bool {
+        matches!(
+            self,
+            LspDialogFocus::LspServer
+                | LspDialogFocus::LspWorkspace
+                | LspDialogFocus::KotlinLspServer
+                | LspDialogFocus::KotlinLspWorkspace
+        )
+    }
+
+    pub fn is_toggle(self) -> bool {
+        matches!(
+            self,
+            LspDialogFocus::LspEnabled
+                | LspDialogFocus::LspAutoDiagnostics
+                | LspDialogFocus::KotlinLspEnabled
         )
     }
 }
@@ -1385,6 +1441,8 @@ pub enum PressedButton {
     WorkflowDialogCancel,
     SettingsDialogSave,
     SettingsDialogCancel,
+    LspDialogConfirm,
+    LspDialogCancel,
     QuitConfirmYes,
     QuitConfirmNo,
     /// The OK button of a [`MessageBox`] (About / Retry Paused).
@@ -1564,8 +1622,22 @@ pub struct App {
     pub terminal_state: TerminalState,
     pub justify: bool,
     pub settings_justify: bool,
-    /// Settings-dialog staging for the LSP on/off checkbox (applied on Save).
-    pub settings_lsp: bool,
+    /// LSP dialog: whether the dialog is open.
+    pub show_lsp_dialog: bool,
+    /// LSP dialog: which control has focus.
+    pub lsp_dialog_focus: LspDialogFocus,
+    /// LSP dialog: staging for the LSP server binary path.
+    pub settings_lsp_server: String,
+    /// LSP dialog: staging for the LSP workspace root.
+    pub settings_lsp_workspace: String,
+    /// LSP dialog: staging for auto-diagnostics toggle.
+    pub settings_lsp_auto_diagnostics: bool,
+    /// LSP dialog: staging for Kotlin LSP server TCP address.
+    pub settings_kotlin_lsp_server: String,
+    /// LSP dialog: staging for Kotlin LSP workspace root.
+    pub settings_kotlin_lsp_workspace: String,
+    /// LSP dialog: cursor position in the current text field.
+    pub lsp_dialog_cursor: usize,
     /// Show the hint bar (second-to-last line) with key hints and the
     /// focus indicator. Config: `hintbar` in rustama.conf (default off).
     pub hintbar: bool,
@@ -1586,17 +1658,23 @@ pub struct App {
     /// Token usage received mid-stream (via `StreamChunk::Stats`) that has not
     /// been committed to `token_stats` yet.
     last_stats: TokenStats,
-    /// rust-analyzer LSP session (compiler feedback for the agentic tools).
-    /// Stopped unless `lsp = on` in the config or `/workspace` starts it.
-    pub lsp: crate::lsp::LspClient,
-    /// Server binary from config (`lsp_server`), remembered for restarts.
-    pub lsp_server: String,
-    /// Whether config asked for LSP at startup (`lsp = on`).
+    /// Multi-language LSP manager (compiler feedback for the agentic tools).
+    /// Holds one LSP client per language (rust-analyzer for .rs, Kotlin LSP
+    /// for .kt/.kts). Stopped unless `lsp = on` or `kotlin_lsp = on` in the
+    /// config, or a Kotlin/Android Studio project is auto-detected.
+    pub lsp: crate::lsp::LspManager,
+    /// Config mirror: whether rust-analyzer LSP is enabled.
     pub lsp_enabled: bool,
-    /// Configured LSP workspace root (`lsp_workspace`); empty = derive
-    /// from `save_path`/cwd. Remembered so `/lsp on` and the Settings
-    /// checkbox can restart the server on the same root.
+    /// Config mirror: rust-analyzer server binary.
+    pub lsp_server: String,
+    /// Config mirror: rust-analyzer workspace root.
     pub lsp_workspace: String,
+    /// Config mirror: whether Kotlin LSP is enabled.
+    pub kotlin_lsp_enabled: bool,
+    /// Config mirror: Kotlin LSP TCP address.
+    pub kotlin_lsp_server: String,
+    /// Config mirror: Kotlin LSP workspace root.
+    pub kotlin_lsp_workspace: String,
     /// Append fresh diagnostics to edit_file/write_file tool results
     /// (`lsp_auto_diagnostics`).
     pub lsp_auto_diagnostics: bool,
@@ -1651,6 +1729,8 @@ impl App {
         let params = params_for_model(&cfg.model, &cloud_models, &model_params_store);
         // Resolved before `cfg` fields move into the struct below.
         let lsp_root = resolve_lsp_workspace(&cfg.lsp_workspace, &cfg.save_path);
+        let kotlin_lsp_root =
+            resolve_lsp_workspace(&cfg.kotlin_lsp_workspace, &cfg.save_path);
         let mut app = App {
             messages: vec![ChatMessage::app(
                 "Welcome to Rustama. Start typing your message.".to_string(),
@@ -1782,7 +1862,14 @@ impl App {
             },
             justify: cfg.justify,
             settings_justify: cfg.justify,
-            settings_lsp: cfg.lsp,
+            show_lsp_dialog: false,
+            lsp_dialog_focus: LspDialogFocus::LspEnabled,
+            settings_lsp_server: cfg.lsp_server.clone(),
+            settings_lsp_workspace: cfg.lsp_workspace.clone(),
+            settings_lsp_auto_diagnostics: cfg.lsp_auto_diagnostics,
+            settings_kotlin_lsp_server: cfg.kotlin_lsp_server.clone(),
+            settings_kotlin_lsp_workspace: cfg.kotlin_lsp_workspace.clone(),
+            lsp_dialog_cursor: 0,
             hintbar: cfg.hintbar,
             selection_start: None,
             selection_end: None,
@@ -1795,10 +1882,13 @@ impl App {
             auto_continue_count: 0,
             max_auto_continues: cfg.max_auto_continues,
             last_stats: TokenStats::default(),
-            lsp: crate::lsp::LspClient::new(),
-            lsp_server: cfg.lsp_server.clone(),
+            lsp: crate::lsp::LspManager::new(),
             lsp_enabled: cfg.lsp,
+            lsp_server: cfg.lsp_server.clone(),
             lsp_workspace: cfg.lsp_workspace.clone(),
+            kotlin_lsp_enabled: cfg.kotlin_lsp,
+            kotlin_lsp_server: cfg.kotlin_lsp_server.clone(),
+            kotlin_lsp_workspace: cfg.kotlin_lsp_workspace.clone(),
             lsp_auto_diagnostics: cfg.lsp_auto_diagnostics,
             last_edited_file: None,
             last_autosave: None,
@@ -1816,10 +1906,24 @@ impl App {
             "START",
             "Program started",
         );
-        // LSP: opt-in (lsp = on) — rust-analyzer is a heavy process.
-        if app.lsp_enabled {
-            let server = app.lsp_server.clone();
-            app.start_lsp(lsp_root, server);
+        // LSP: start servers for enabled languages.
+        if cfg.lsp {
+            let server = cfg.lsp_server.clone();
+            let _ = app.lsp.start(
+                "rust",
+                lsp_root.clone(),
+                crate::lsp::LspConnect::Stdio { bin: server },
+            );
+        }
+        // Kotlin LSP: connect if enabled in config, or auto-detected from
+        // a Kotlin / Android Studio project in the workspace.
+        if cfg.kotlin_lsp || detect_kotlin_project(&kotlin_lsp_root) {
+            let addr = cfg.kotlin_lsp_server.clone();
+            let _ = app.lsp.start(
+                "kotlin",
+                kotlin_lsp_root,
+                crate::lsp::LspConnect::Tcp { addr },
+            );
         }
         app.fetch_models_async();
         // Kick off auto-detection of the default model's context window so
@@ -1951,6 +2055,10 @@ impl App {
         }
         if self.show_settings_dialog {
             self.handle_settings_dialog_key(key);
+            return;
+        }
+        if self.show_lsp_dialog {
+            self.handle_lsp_dialog_key(key);
             return;
         }
         if self.show_theme_dialog {
@@ -2239,6 +2347,7 @@ impl App {
             }
             MenuAction::OpenSettingsDialog => self.open_settings_dialog(),
             MenuAction::OpenThemeDialog => self.open_theme_dialog(),
+            MenuAction::OpenLspDialog => self.open_lsp_dialog(),
             MenuAction::ShowAbout => self.show_about = true,
         }
         if !matches!(action, MenuAction::None) {
@@ -2362,9 +2471,12 @@ impl App {
                 root.display()
             )));
         }
-        match self.lsp.start(root.clone(), &server_bin) {
+        match self.lsp.start(
+            "rust",
+            root.clone(),
+            crate::lsp::LspConnect::Stdio { bin: server_bin },
+        ) {
             Ok(()) => {
-                self.lsp_enabled = true;
                 self.status_message = format!("LSP: rust-analyzer running ({})", root.display());
                 self.log_event("LSP", &format!("started in {}", root.display()));
             }
@@ -2375,11 +2487,17 @@ impl App {
         }
     }
 
-    /// Stops the LSP server (`shutdown` + `exit`, then kill).
+    /// Stops the LSP server for a language (`shutdown` + `exit`, then kill).
     pub fn stop_lsp(&mut self) {
-        self.lsp.shutdown();
+        self.lsp.stop("rust");
         self.status_message = "LSP: stopped".to_string();
         self.log_event("LSP", "stopped");
+    }
+
+    /// Selects the LSP client for the given file path: Kotlin LSP for
+    /// `.kt`/`.kts` files, rust-analyzer for everything else.
+    fn lsp_client_for_path(&self, path: &Path) -> Option<&crate::lsp::LspClient> {
+        self.lsp.client_for_path(path)
     }
 
     /// Executes the LSP-flavored tools; `None` = not an LSP tool (caller
@@ -2470,25 +2588,36 @@ impl App {
             return "lsp_definition: `line` and `column` are 1-based (>= 1).".to_string();
         }
 
-        match self.lsp.status() {
+        let path = PathBuf::from(path);
+        let Some(client) = self.lsp_client_for_path(&path) else {
+            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("unknown");
+            return format!(
+                "lsp_definition: no LSP server configured for .{} files",
+                ext
+            );
+        };
+        let server_name = self.lsp.server_name_for_path(&path);
+        let key = self.lsp.config_key_for_path(&path);
+
+        match client.status() {
             LspStatus::Running => {}
             LspStatus::Stopped => {
-                return "lsp_definition: server not running. Enable it with `lsp = on` in \
-                    rustama.conf (or /workspace <dir>) — requires rust-analyzer."
-                    .to_string();
+                return format!(
+                    "lsp_definition: server not running. Enable it with `{key} = on` in \
+                    rustama.conf (or /workspace <dir>) — requires {server_name}."
+                );
             }
             LspStatus::Failed(e) => return format!("lsp_definition: server failed: {}", e),
             LspStatus::Starting => {} // rare; request below waits for analysis
         }
 
-        let path = PathBuf::from(path);
-        if let Err(e) = self.lsp.sync_file(&path) {
+        if let Err(e) = client.sync_file(&path) {
             return format!("lsp_definition: cannot sync {}: {}", path.display(), e);
         }
 
-        let root = self.lsp.root().to_path_buf();
+        let root = client.root().to_path_buf();
         let cancel = AtomicBool::new(false);
-        let locs = match self.lsp.goto_definition(
+        let locs = match client.goto_definition(
             &path,
             (line - 1) as u32,
             (column - 1) as u32,
@@ -2562,19 +2691,29 @@ impl App {
         path: &Path,
     ) -> Result<(), String> {
         use crate::lsp::LspStatus;
-        match self.lsp.status() {
+        let Some(client) = self.lsp_client_for_path(path) else {
+            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("unknown");
+            return Err(format!(
+                "{}: no LSP server configured for .{} files",
+                tool, ext
+            ));
+        };
+        let server_name = self.lsp.server_name_for_path(path);
+        let key = self.lsp.config_key_for_path(path);
+
+        match client.status() {
             LspStatus::Running => {}
             LspStatus::Stopped => {
                 return Err(format!(
-                    "{}: server not running. Enable it with `lsp = on` in \
-                    rustama.conf (or /workspace <dir>) — requires rust-analyzer.",
+                    "{}: server not running. Enable it with `{key} = on` in \
+                    rustama.conf (or /workspace <dir>) — requires {server_name}.",
                     tool
                 ));
             }
             LspStatus::Failed(e) => return Err(format!("{}: server failed: {}", tool, e)),
             LspStatus::Starting => {} // rare; request below waits for analysis
         }
-        if let Err(e) = self.lsp.sync_file(path) {
+        if let Err(e) = client.sync_file(path) {
             return Err(format!("{}: cannot sync {}: {}", tool, path.display(), e));
         }
         Ok(())
@@ -2597,8 +2736,11 @@ impl App {
         if let Err(e) = self.lsp_position_preflight("lsp_symbol_info", &path) {
             return e;
         }
+        let Some(client) = self.lsp_client_for_path(&path) else {
+            return "lsp_symbol_info: no LSP server configured for this file type".to_string();
+        };
         let cancel = AtomicBool::new(false);
-        let text = match self.lsp.hover(
+        let text = match client.hover(
             &path,
             (line - 1) as u32,
             (column - 1) as u32,
@@ -2650,8 +2792,11 @@ impl App {
         if let Err(e) = self.lsp_position_preflight("lsp_references", &path) {
             return e;
         }
+        let Some(client) = self.lsp_client_for_path(&path) else {
+            return "lsp_references: no LSP server configured for this file type".to_string();
+        };
         let cancel = AtomicBool::new(false);
-        let locs = match self.lsp.references(
+        let locs = match client.references(
             &path,
             (line - 1) as u32,
             (column - 1) as u32,
@@ -2676,7 +2821,7 @@ impl App {
                 column
             );
         }
-        let root = self.lsp.root().to_path_buf();
+        let root = client.root().to_path_buf();
         let formatted = crate::lsp::format_locations(&locs, &root);
         format!(
             "References to {}:{}:{} ({}):\n{}",
@@ -2705,8 +2850,11 @@ impl App {
         if let Err(e) = self.lsp_position_preflight("lsp_completion", &path) {
             return e;
         }
+        let Some(client) = self.lsp_client_for_path(&path) else {
+            return "lsp_completion: no LSP server configured for this file type".to_string();
+        };
         let cancel = AtomicBool::new(false);
-        let items = match self.lsp.completion(
+        let items = match client.completion(
             &path,
             (line - 1) as u32,
             (column - 1) as u32,
@@ -2766,15 +2914,11 @@ impl App {
             },
         };
 
-        match self.lsp.status() {
-            LspStatus::Running => {}
-            LspStatus::Stopped => {
-                return "LSP: server not running. Enable it with `lsp = on` in rustama.conf \
-                    (or /workspace <dir>) — requires rust-analyzer."
-                    .to_string();
-            }
-            LspStatus::Failed(e) => return format!("LSP: server failed: {}", e),
-            LspStatus::Starting => {} // rare; wait below handles it
+        // If no LSP server is running, report it before doing anything else.
+        if self.lsp.status_for("rust") != crate::lsp::LspStatus::Running {
+            return "LSP: server not running. Enable it with `lsp = on` in rustama.conf \
+                (or /workspace <dir>) — requires rust-analyzer."
+                .to_string();
         }
 
         // No path → workspace summary of everything published so far.
@@ -2784,31 +2928,56 @@ impl App {
                 Some(p) => p.clone(),
                 None => {
                     let (errors, warnings) = self.lsp.diagnostics_summary();
+                    let root = self
+                        .lsp
+                        .root_for_path(Path::new("."))
+                        .map_or("(none)".to_string(), |r| r.display().to_string());
                     return format!(
                         "LSP workspace ({}): {} errors, {} warnings (cached; open a file for details)",
-                        self.lsp.root().display(),
-                        errors,
-                        warnings
+                        root, errors, warnings
                     );
                 }
             },
         };
 
-        if let Err(e) = self.lsp.sync_file(&path) {
+        // Determine which LSP client handles this file.
+        let Some(client) = self.lsp.client_for_path(&path) else {
+            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("unknown");
+            return format!(
+                "LSP: no server configured for .{} files",
+                ext
+            );
+        };
+
+        match client.status() {
+            LspStatus::Running => {}
+            LspStatus::Stopped => {
+                let server_name = self.lsp.server_name_for_path(&path);
+                let key = self.lsp.config_key_for_path(&path);
+                return format!(
+                    "LSP: server not running. Enable it with `{key} = on` in rustama.conf \
+                    (or /workspace <dir>) — requires {server_name}."
+                );
+            }
+            LspStatus::Failed(e) => return format!("LSP: server failed: {}", e),
+            LspStatus::Starting => {} // rare; wait below handles it
+        }
+
+        if let Err(e) = client.sync_file(&path) {
             return format!("LSP: cannot sync {}: {}", path.display(), e);
         }
 
-        let root = self.lsp.root().to_path_buf();
+        let root = client.root().to_path_buf();
         let cancel = AtomicBool::new(false);
 
         // Pull diagnostics when the server supports it (rust-analyzer
         // does) — a direct answer beats waiting for a push. The server
         // *cancels* pulls invalidated by a fresh didChange ("server
         // cancelled the request"): retry briefly while it re-analyzes.
-        let diags = if self.lsp.pull_supported() {
+        let diags = if client.pull_supported() {
             let mut result = None;
             for _ in 0..10 {
-                match self.lsp.pull_diagnostics(&path, timeout, &cancel) {
+                match client.pull_diagnostics(&path, timeout, &cancel) {
                     Ok(d) => {
                         result = Some(d);
                         break;
@@ -2863,20 +3032,27 @@ impl App {
         if !self.lsp_auto_diagnostics
             || !matches!(name, "edit_file" | "write_file")
             || result.starts_with("Error")
-            || self.lsp.status() != crate::lsp::LspStatus::Running
         {
             return;
         }
         let args: serde_json::Value =
             serde_json::from_str(args_json).unwrap_or(serde_json::json!({}));
         let Some(path) = args["path"].as_str() else { return };
-        if std::path::Path::new(path).extension().and_then(|e| e.to_str()) != Some("rs") {
+        let path = Path::new(path);
+        let ext = path.extension().and_then(|e| e.to_str());
+        if ext != Some("rs") && ext != Some("kt") && ext != Some("kts") {
+            return;
+        }
+        let Some(client) = self.lsp_client_for_path(path) else {
+            return;
+        };
+        if client.status() != crate::lsp::LspStatus::Running {
             return;
         }
         // Fresh analysis takes a moment after didChange; give it a
         // bounded wait so the feedback reflects the edit, not the past.
         let diag = self.lsp_diagnostics(
-            Some(path),
+            Some(path.to_string_lossy().as_ref()),
             None,
             std::time::Duration::from_secs(15),
         );
@@ -4486,6 +4662,10 @@ impl App {
             self.handle_settings_dialog_click(col, row, width, height, ClickPhase::Press);
             return;
         }
+        if self.show_lsp_dialog {
+            self.handle_lsp_dialog_click(col, row, width, height, ClickPhase::Press);
+            return;
+        }
         if self.show_theme_dialog {
             self.handle_theme_dialog_click(col, row, width, height, ClickPhase::Press);
             return;
@@ -4736,6 +4916,11 @@ impl App {
             PressedButton::SettingsDialogSave | PressedButton::SettingsDialogCancel => {
                 if self.show_settings_dialog {
                     self.handle_settings_dialog_click(col, row, width, height, ClickPhase::Release);
+                }
+            }
+            PressedButton::LspDialogConfirm | PressedButton::LspDialogCancel => {
+                if self.show_lsp_dialog {
+                    self.handle_lsp_dialog_click(col, row, width, height, ClickPhase::Release);
                 }
             }
             PressedButton::QuitConfirmYes | PressedButton::QuitConfirmNo => {
@@ -5405,7 +5590,6 @@ impl App {
             self.params.reasoning_effort.clone().unwrap_or_default();
         self.settings_max_tool_rounds = self.max_tool_rounds.to_string();
         self.settings_justify = self.justify;
-        self.settings_lsp = self.lsp_enabled;
         self.settings_num_ctx = self
             .params
             .num_ctx
@@ -5413,12 +5597,20 @@ impl App {
             .unwrap_or_default();
     }
 
+    fn open_lsp_dialog(&mut self) {
+        self.show_lsp_dialog = true;
+        self.lsp_dialog_focus = LspDialogFocus::LspEnabled;
+        self.lsp_dialog_cursor = 0;
+        self.settings_lsp_server = self.lsp_server.clone();
+        self.settings_lsp_workspace = self.lsp_workspace.clone();
+        self.settings_lsp_auto_diagnostics = self.lsp_auto_diagnostics;
+        self.settings_kotlin_lsp_server = self.kotlin_lsp_server.clone();
+        self.settings_kotlin_lsp_workspace = self.kotlin_lsp_workspace.clone();
+    }
+
     fn handle_settings_dialog_key(&mut self, key: KeyEvent) {
         let is_text_field = self.settings_focus.is_text_field();
-        let is_toggle = matches!(
-            self.settings_focus,
-            SettingsFocus::Justify | SettingsFocus::Lsp
-        );
+        let is_toggle = matches!(self.settings_focus, SettingsFocus::Justify);
 
         match key.code {
             KeyCode::Esc => {
@@ -5525,12 +5717,135 @@ impl App {
         }
     }
 
+    /// Handles keyboard input in the LSP dialog.
+    fn handle_lsp_dialog_key(&mut self, key: KeyEvent) {
+        let is_text_field = self.lsp_dialog_focus.is_text_field();
+        let is_toggle = self.lsp_dialog_focus.is_toggle();
+
+        match key.code {
+            KeyCode::Esc => {
+                self.show_lsp_dialog = false;
+            }
+            KeyCode::Tab => {
+                self.lsp_dialog_cursor = 0;
+                self.lsp_dialog_focus = self.lsp_dialog_focus.next();
+            }
+            KeyCode::BackTab => {
+                self.lsp_dialog_cursor = 0;
+                self.lsp_dialog_focus = self.lsp_dialog_focus.prev();
+            }
+            KeyCode::Up => {
+                self.lsp_dialog_cursor = 0;
+                self.lsp_dialog_focus = self.lsp_dialog_focus.prev();
+            }
+            KeyCode::Down => {
+                self.lsp_dialog_cursor = 0;
+                self.lsp_dialog_focus = self.lsp_dialog_focus.next();
+            }
+            KeyCode::Left => {
+                if is_text_field {
+                    self.lsp_dialog_cursor = self.lsp_dialog_cursor.saturating_sub(1);
+                } else if is_toggle {
+                    self.toggle_lsp_dialog_checkbox();
+                } else if self.lsp_dialog_focus == LspDialogFocus::Save {
+                    self.lsp_dialog_focus = LspDialogFocus::Cancel;
+                } else if self.lsp_dialog_focus == LspDialogFocus::Cancel {
+                    self.lsp_dialog_focus = LspDialogFocus::Save;
+                }
+            }
+            KeyCode::Right => {
+                if is_text_field {
+                    let field = self.lsp_dialog_field_text();
+                    if self.lsp_dialog_cursor < field.chars().count() {
+                        self.lsp_dialog_cursor += 1;
+                    }
+                } else if is_toggle {
+                    self.toggle_lsp_dialog_checkbox();
+                } else if self.lsp_dialog_focus == LspDialogFocus::Save {
+                    self.lsp_dialog_focus = LspDialogFocus::Cancel;
+                } else if self.lsp_dialog_focus == LspDialogFocus::Cancel {
+                    self.lsp_dialog_focus = LspDialogFocus::Save;
+                }
+            }
+            KeyCode::Home => {
+                if is_text_field {
+                    self.lsp_dialog_cursor = 0;
+                }
+            }
+            KeyCode::End => {
+                if is_text_field {
+                    let field = self.lsp_dialog_field_text();
+                    self.lsp_dialog_cursor = field.chars().count();
+                }
+            }
+            KeyCode::Char(c) if is_text_field => {
+                let cursor = self.lsp_dialog_cursor;
+                let field = self.lsp_dialog_field_mut();
+                let byte_idx = field
+                    .char_indices()
+                    .nth(cursor)
+                    .map_or(field.len(), |(i, _)| i);
+                field.insert(byte_idx, c);
+                self.lsp_dialog_cursor = cursor + 1;
+            }
+            KeyCode::Backspace if is_text_field => {
+                if self.lsp_dialog_cursor > 0 {
+                    self.lsp_dialog_cursor -= 1;
+                    let cursor = self.lsp_dialog_cursor;
+                    let field = self.lsp_dialog_field_mut();
+                    let byte_idx = field
+                        .char_indices()
+                        .nth(cursor)
+                        .map_or(field.len(), |(i, _)| i);
+                    field.remove(byte_idx);
+                }
+            }
+            KeyCode::Delete if is_text_field => {
+                let cursor = self.lsp_dialog_cursor;
+                let field_text = self.lsp_dialog_field_text();
+                if cursor < field_text.chars().count() {
+                    let field = self.lsp_dialog_field_mut();
+                    let byte_idx = field
+                        .char_indices()
+                        .nth(cursor)
+                        .map_or(field.len(), |(i, _)| i);
+                    field.remove(byte_idx);
+                }
+            }
+            KeyCode::Enter | KeyCode::Char(' ') if !is_text_field => {
+                if is_toggle {
+                    self.toggle_lsp_dialog_checkbox();
+                } else {
+                    match self.lsp_dialog_focus {
+                        LspDialogFocus::Save => self.confirm_lsp_dialog(),
+                        LspDialogFocus::Cancel => self.show_lsp_dialog = false,
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Toggles the checkbox field currently focused in the LSP dialog.
+    fn toggle_lsp_dialog_checkbox(&mut self) {
+        match self.lsp_dialog_focus {
+            LspDialogFocus::LspEnabled => self.lsp_enabled = !self.lsp_enabled,
+            LspDialogFocus::LspAutoDiagnostics => {
+                self.settings_lsp_auto_diagnostics = !self.settings_lsp_auto_diagnostics
+            }
+            LspDialogFocus::KotlinLspEnabled => {
+                self.kotlin_lsp_enabled = !self.kotlin_lsp_enabled
+            }
+            _ => {}
+        }
+    }
+
     /// Toggles the checkbox field currently focused in the Settings
-    /// dialog (Justify or LSP). No-op on text fields / buttons.
+    /// dialog (Justify). No-op on text fields / buttons.
     fn toggle_settings_checkbox(&mut self) {
         match self.settings_focus {
             SettingsFocus::Justify => self.settings_justify = !self.settings_justify,
-            SettingsFocus::Lsp => self.settings_lsp = !self.settings_lsp,
             _ => {}
         }
     }
@@ -5571,6 +5886,26 @@ impl App {
         }
     }
 
+    fn lsp_dialog_field_text(&self) -> &str {
+        match self.lsp_dialog_focus {
+            LspDialogFocus::LspServer => &self.settings_lsp_server,
+            LspDialogFocus::LspWorkspace => &self.settings_lsp_workspace,
+            LspDialogFocus::KotlinLspServer => &self.settings_kotlin_lsp_server,
+            LspDialogFocus::KotlinLspWorkspace => &self.settings_kotlin_lsp_workspace,
+            _ => "",
+        }
+    }
+
+    fn lsp_dialog_field_mut(&mut self) -> &mut String {
+        match self.lsp_dialog_focus {
+            LspDialogFocus::LspServer => &mut self.settings_lsp_server,
+            LspDialogFocus::LspWorkspace => &mut self.settings_lsp_workspace,
+            LspDialogFocus::KotlinLspServer => &mut self.settings_kotlin_lsp_server,
+            LspDialogFocus::KotlinLspWorkspace => &mut self.settings_kotlin_lsp_workspace,
+            _ => unreachable!(),
+        }
+    }
+
     fn confirm_settings(&mut self) {
         let proxy_val = self.settings_proxy.trim().to_string();
         self.proxy = if proxy_val.is_empty() || proxy_val.eq_ignore_ascii_case("off") {
@@ -5604,21 +5939,44 @@ impl App {
             self.max_retries = v;
         }
         self.justify = self.settings_justify;
-        // LSP checkbox: apply immediately — start/stop rust-analyzer to
-        // match the new state (on the configured/default workspace root).
-        if self.settings_lsp != self.lsp_enabled {
-            if self.settings_lsp {
-                let root = resolve_lsp_workspace(&self.lsp_workspace, &self.save_path);
-                let server = self.lsp_server.clone();
-                self.start_lsp(root, server);
-            } else {
-                self.stop_lsp();
-                self.lsp_enabled = false;
-            }
-        }
         let _ = self.save_config();
         self.show_settings_dialog = false;
         self.status_message = "Settings saved".to_string();
+    }
+
+    fn confirm_lsp_dialog(&mut self) {
+        self.lsp_server = self.settings_lsp_server.trim().to_string();
+        self.lsp_workspace = self.settings_lsp_workspace.trim().to_string();
+        self.lsp_auto_diagnostics = self.settings_lsp_auto_diagnostics;
+        self.kotlin_lsp_server = self.settings_kotlin_lsp_server.trim().to_string();
+        self.kotlin_lsp_workspace = self.settings_kotlin_lsp_workspace.trim().to_string();
+
+        // Apply LSP changes: start/stop rust-analyzer to match the new state.
+        if self.lsp_enabled {
+            let root = resolve_lsp_workspace(&self.lsp_workspace, &self.save_path);
+            let server = self.lsp_server.clone();
+            self.start_lsp(root, server);
+        } else {
+            self.lsp.stop("rust");
+        }
+
+        // Apply Kotlin LSP changes: connect/disconnect the Kotlin LSP server.
+        if self.kotlin_lsp_enabled {
+            let root = resolve_lsp_workspace(&self.kotlin_lsp_workspace, &self.save_path);
+            let _ = self.lsp.start(
+                "kotlin",
+                root,
+                crate::lsp::LspConnect::Tcp {
+                    addr: self.kotlin_lsp_server.clone(),
+                },
+            );
+        } else {
+            self.lsp.stop("kotlin");
+        }
+
+        let _ = self.save_config();
+        self.show_lsp_dialog = false;
+        self.status_message = "LSP settings saved".to_string();
     }
 
     fn handle_settings_dialog_click(
@@ -5665,14 +6023,13 @@ impl App {
             (SettingsFocus::MaxRetries, "Max Retries:"),
             (SettingsFocus::NumCtx, "Num Ctx:"),
             (SettingsFocus::Justify, "Justify:"),
-            (SettingsFocus::Lsp, "LSP:"),
         ];
 
         for (i, (focus, _label)) in fields.iter().enumerate() {
             let field_y = inner_y + i as u16 * 2;
             let max_w = inner_w.saturating_sub(16);
             if row == field_y {
-                if matches!(*focus, SettingsFocus::Justify | SettingsFocus::Lsp) {
+                if matches!(*focus, SettingsFocus::Justify) {
                     if phase == ClickPhase::Press {
                         self.settings_focus = *focus;
                         self.toggle_settings_checkbox();
@@ -5720,6 +6077,107 @@ impl App {
                         self.confirm_settings();
                     } else {
                         self.show_settings_dialog = false;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Handles mouse clicks in the LSP dialog. Geometry is shared with
+    /// `render_lsp_dialog` (main.rs) so drawn and clickable coordinates
+    /// always agree.
+    fn handle_lsp_dialog_click(
+        &mut self,
+        col: u16,
+        row: u16,
+        width: u16,
+        height: u16,
+        phase: ClickPhase,
+    ) {
+        // LSP dialog geometry: 60 wide, fields at inner_y + i*2, buttons at bottom.
+        const DIALOG_W: u16 = 60;
+        const FIELD_COUNT: u16 = 7;
+        let popup = Rect {
+            x: (width.saturating_sub(DIALOG_W)) / 2,
+            y: (height.saturating_sub(FIELD_COUNT * 2 + 6)) / 2,
+            width: DIALOG_W,
+            height: FIELD_COUNT * 2 + 6,
+        };
+        let inner_x = popup.x + 2;
+        let inner_y = popup.y + 1;
+        let inner_w = DIALOG_W.saturating_sub(4);
+
+        if col < popup.x
+            || col >= popup.x + popup.width
+            || row < popup.y
+            || row >= popup.y + popup.height
+        {
+            if phase == ClickPhase::Press {
+                self.show_lsp_dialog = false;
+            }
+            return;
+        }
+
+        let fields = [
+            (LspDialogFocus::LspEnabled, "Rust-analyzer LSP:"),
+            (LspDialogFocus::LspServer, "Server:"),
+            (LspDialogFocus::LspWorkspace, "Workspace:"),
+            (LspDialogFocus::LspAutoDiagnostics, "Auto-diagnostics:"),
+            (LspDialogFocus::KotlinLspEnabled, "Kotlin LSP:"),
+            (LspDialogFocus::KotlinLspServer, "Kotlin Server:"),
+            (LspDialogFocus::KotlinLspWorkspace, "Kotlin Workspace:"),
+        ];
+
+        for (i, (focus, _label)) in fields.iter().enumerate() {
+            let field_y = inner_y + i as u16 * 2;
+            let max_w = inner_w.saturating_sub(16);
+            if row == field_y {
+                if focus.is_toggle() {
+                    if phase == ClickPhase::Press {
+                        self.lsp_dialog_focus = *focus;
+                        self.toggle_lsp_dialog_checkbox();
+                    }
+                    return;
+                } else if col >= inner_x + 14 && col < inner_x + 14 + max_w + 2 {
+                    if phase == ClickPhase::Press {
+                        self.lsp_dialog_focus = *focus;
+                    }
+                    return;
+                }
+            }
+        }
+
+        let btn_y = popup.y + 1 + FIELD_COUNT * 2;
+        let save_label = "Save";
+        let cancel_label = "Cancel";
+        let save_w = save_label.len() as u16 + 4;
+        let cancel_w = cancel_label.len() as u16 + 4;
+        let gap: u128 = 4;
+        let total_btn_w = save_w + gap as u16 + cancel_w;
+        let btn_start_x = inner_x + (inner_w.saturating_sub(total_btn_w)) / 2;
+
+        if row == btn_y {
+            let save_hit = col >= btn_start_x && col < btn_start_x + save_w;
+            let cancel_hit =
+                col >= btn_start_x + save_w + gap as u16 && col < btn_start_x + total_btn_w;
+            if save_hit || cancel_hit {
+                let pressed_id = if save_hit {
+                    PressedButton::LspDialogConfirm
+                } else {
+                    PressedButton::LspDialogCancel
+                };
+                if phase == ClickPhase::Press {
+                    self.lsp_dialog_focus = if save_hit {
+                        LspDialogFocus::Save
+                    } else {
+                        LspDialogFocus::Cancel
+                    };
+                    self.pressed_button = Some(pressed_id);
+                } else if self.pressed_button == Some(pressed_id) {
+                    if save_hit {
+                        self.confirm_lsp_dialog();
+                    } else {
+                        self.show_lsp_dialog = false;
                     }
                 }
             }
@@ -7053,7 +7511,7 @@ impl App {
     fn slash_workspace(&mut self, arg: Option<&str>) -> String {
         match arg {
             None => {
-                let status = match self.lsp.status() {
+                let rust_status = match self.lsp.status_for("rust") {
                     crate::lsp::LspStatus::Running => {
                         let (e, w) = self.lsp.diagnostics_summary();
                         format!("running ({} errors, {} warnings cached)", e, w)
@@ -7062,16 +7520,45 @@ impl App {
                     crate::lsp::LspStatus::Stopped => "stopped".to_string(),
                     crate::lsp::LspStatus::Failed(err) => format!("failed: {}", err),
                 };
+                let kt_status = match self.lsp.status_for("kotlin") {
+                    crate::lsp::LspStatus::Running => {
+                        let (e, w) = self.lsp.diagnostics_summary();
+                        format!("running ({} errors, {} warnings cached)", e, w)
+                    }
+                    crate::lsp::LspStatus::Starting => "starting…".to_string(),
+                    crate::lsp::LspStatus::Stopped => "stopped".to_string(),
+                    crate::lsp::LspStatus::Failed(err) => format!("failed: {}", err),
+                };
+                let rust_root = self
+                    .lsp
+                    .root_for_path(Path::new("."))
+                    .map_or("(not set)".to_string(), |r| {
+                        if r.as_os_str().is_empty() {
+                            "(not set)".to_string()
+                        } else {
+                            r.display().to_string()
+                        }
+                    });
+                let kt_root = self
+                    .lsp
+                    .root_for_path(Path::new("src/main.kt"))
+                    .map_or("(not set)".to_string(), |r| {
+                        if r.as_os_str().is_empty() {
+                            "(not set)".to_string()
+                        } else {
+                            r.display().to_string()
+                        }
+                    });
                 format!(
-                    "LSP workspace: {}\nLSP server:    {} ({})\nStatus:        {}",
-                    if self.lsp.root().as_os_str().is_empty() {
-                        "(not set)".to_string()
-                    } else {
-                        self.lsp.root().display().to_string()
-                    },
+                    "LSP workspace: {}\nLSP server:    {} ({})\nStatus:        {}\nKotlin LSP:    {}\nKotlin server: {} ({})\nKotlin status: {}",
+                    rust_root,
                     self.lsp_server,
                     if self.lsp_enabled { "enabled" } else { "disabled" },
-                    status
+                    rust_status,
+                    kt_root,
+                    self.kotlin_lsp_server,
+                    if self.kotlin_lsp_enabled { "enabled" } else { "disabled" },
+                    kt_status
                 )
             }
             Some("off") => {
@@ -7085,7 +7572,7 @@ impl App {
                     return format!("No such directory: {}", dir);
                 }
                 self.start_lsp(root.clone(), self.lsp_server.clone());
-                if self.lsp.status() == crate::lsp::LspStatus::Running {
+                if self.lsp.status_for("rust") == crate::lsp::LspStatus::Running {
                     format!("LSP workspace: {} (rust-analyzer running)", root.display())
                 } else {
                     format!("LSP failed to start in {}: {}", root.display(), self.status_message)
@@ -7094,24 +7581,26 @@ impl App {
         }
     }
 
-    /// `/lsp` controls the rust-analyzer LSP server.
+    /// `/lsp` controls LSP servers (rust-analyzer for .rs, Kotlin LSP for .kt/.kts).
     /// - `/lsp` → show current server state (same as `/lsp status`).
-    /// - `/lsp on` → start in the configured/default workspace root.
-    /// - `/lsp off` → stop the server.
+    /// - `/lsp on` → start rust-analyzer in the configured/default workspace root.
+    /// - `/lsp off` → stop rust-analyzer.
     /// - `/lsp status` → show server status (same as `/workspace`).
+    /// Use `/kotlin-lsp on|off|status` for the Kotlin LSP server.
     fn slash_lsp(&mut self, arg: Option<&str>) -> String {
-        let running = self.lsp.status() == crate::lsp::LspStatus::Running;
+        let running = self.lsp.status_for("rust") == crate::lsp::LspStatus::Running;
         match arg {
             Some("on") => {
                 if running {
-                    return format!(
-                        "LSP: already running (workspace: {})",
-                        self.lsp.root().display()
-                    );
+                    let root = self
+                        .lsp
+                        .root_for_path(Path::new("."))
+                        .map_or_else(|| "(unknown)".to_string(), |r| r.display().to_string());
+                    return format!("LSP: already running (workspace: {root})");
                 }
                 let root = resolve_lsp_workspace(&self.lsp_workspace, &self.save_path);
                 self.start_lsp(root.clone(), self.lsp_server.clone());
-                if self.lsp.status() == crate::lsp::LspStatus::Running {
+                if self.lsp.status_for("rust") == crate::lsp::LspStatus::Running {
                     format!("LSP: on — rust-analyzer running ({})", root.display())
                 } else {
                     format!("LSP failed to start: {}", self.status_message)
@@ -7119,7 +7608,7 @@ impl App {
             }
             Some("off") => {
                 if !running
-                    && self.lsp.status() == crate::lsp::LspStatus::Stopped
+                    && self.lsp.status_for("rust") == crate::lsp::LspStatus::Stopped
                     && !self.lsp_enabled
                 {
                     return "LSP: already off".to_string();
@@ -7295,6 +7784,15 @@ impl App {
         }
         if s.tokens_per_sec > 0.0 {
             parts.push(format!("{:.1} tok/s", s.tokens_per_sec));
+        }
+
+        // Context window usage (Ollama models)
+        if let Some(ctx_max) = self.ollama_ctx_length {
+            if ctx_max > 0 {
+                let used = s.prompt_tokens + s.response_tokens;
+                let pct = used as f64 / ctx_max as f64 * 100.0;
+                parts.push(format!("ctx:{}/{} ({:.0}%)", used, ctx_max, pct));
+            }
         }
 
         // Running session cost once the model has pricing configured and
@@ -7941,6 +8439,37 @@ fn resolve_lsp_workspace(configured: &str, save_path: &str) -> PathBuf {
         Some(d) if d.is_dir() => d,
         _ => std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
     }
+}
+
+/// Detects whether the workspace looks like a Kotlin / Android Studio
+/// project by checking for Gradle build files, AndroidManifest.xml, or
+/// any `.kt`/`.kts` source files.
+fn detect_kotlin_project(root: &Path) -> bool {
+    let markers = [
+        "build.gradle",
+        "build.gradle.kts",
+        "settings.gradle",
+        "settings.gradle.kts",
+        "AndroidManifest.xml",
+    ];
+    for marker in &markers {
+        if root.join(marker).is_file() {
+            return true;
+        }
+    }
+    // Also check for any .kt/.kts source files (shallow scan of src/ and
+    // the root).
+    for entry in std::fs::read_dir(root).ok().into_iter().flatten() {
+        if let Ok(entry) = entry {
+            let path = entry.path();
+            if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                if ext == "kt" || ext == "kts" {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 /// Autogenerated session id: 16 hex chars from the current unix
