@@ -182,7 +182,7 @@ max_output_tokens = 8192
 | `frequency_penalty` | float | `0.0` | Frequency penalty (−2.0–2.0) |
 | `presence_penalty` | float | `0.0` | Presence penalty (−2.0–2.0) |
 | `max_output_tokens` | integer | _(provider default)_ | Max output tokens; `off`/`none` to unset |
-| `reasoning_effort` | string | _(unset)_ | `low`, `medium`, `high`, or `on`/`off` to toggle thinking |
+| `reasoning_effort` | string | _(unset)_ | `low`, `medium`, `high`, or `on`/`off` to toggle thinking. Put a Cisco-style prefix in front of the parameter to control when it is sent: `no reasoning_effort` (never send it) or `once reasoning_effort = high` (only on the session's first request) |
 | `tool_choice` | string | `auto` | Cloud only: `auto`, `none`, or `required` |
 | `seed` | integer | _(unset)_ | Sampling seed; `off`/`none` to unset |
 
@@ -228,7 +228,7 @@ reasoning_effort = high
 | `api_model` | no | section name | Actual model name sent to the API |
 | `max_output_tokens` | no | `16384` | Maximum output tokens per response |
 | `tool_choice` | no | `auto` | How tools are selected: `auto`, `none`, or `required` (cloud only) |
-| `reasoning_effort` | no | `high` | Reasoning level: `low`, `medium`, or `high` (cloud only) |
+| `reasoning_effort` | no | `high` | Reasoning level: `low`, `medium`, or `high` (cloud only). Prefix in front of the key with `no` (never send) or `once` (first request only) — e.g. `once reasoning_effort = high` for Mistral Large on NVIDIA NIM, which rejects `reasoning_effort` on follow-up requests |
 | _(any other model parameter key)_ | no | `[default]` section | Per-model overrides (temperature, penalties, seed, …) |
 
 Cloud models appear in the model picker alongside local Ollama models. Use `/model` or `/list` to browse and switch between them.

@@ -66,6 +66,47 @@ pub struct Config {
     pub kotlin_lsp_workspace: String,
 }
 
+/// Cisco-style send policy for a model parameter, set by a `no` / `once`
+/// prefix in front of the parameter in the config line (e.g.
+/// `once reasoning_effort = high`): `no` — the parameter must never be
+/// sent; `once` — send it only on the first request of a session;
+/// otherwise it is sent on every request.
+///
+/// Motivated by strict gateways such as NVIDIA NIM, which reject
+/// `reasoning_effort` on follow-up requests that replay reasoning history
+/// (hard 400), so Mistral Large via NVIDIA needs `once` while other
+/// providers want it on every request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ParamSend {
+    #[default]
+    Always,
+    /// `no <param>`: never send the parameter.
+    Never,
+    /// `once <param>`: send the parameter only on the first request.
+    Once,
+}
+
+/// Splits a Cisco-style send-policy prefix off the front of a config key:
+/// `no reasoning_effort` → ([`ParamSend::Never`], `reasoning_effort`),
+/// `once reasoning_effort` → ([`ParamSend::Once`], `reasoning_effort`),
+/// anything else → ([`ParamSend::Always`], key unchanged).
+/// The prefix must be a whole word, so e.g. `none` is not a `no` prefix.
+fn split_send_prefix(key: &str) -> (ParamSend, &str) {
+    let k = key.trim();
+    let lower = k.to_lowercase();
+    for (prefix, policy) in [("no", ParamSend::Never), ("once", ParamSend::Once)] {
+        if lower == prefix {
+            return (policy, "");
+        }
+        if let Some(rest) = lower.strip_prefix(prefix)
+            && rest.starts_with(char::is_whitespace)
+        {
+            return (policy, k[prefix.len()..].trim_start());
+        }
+    }
+    (ParamSend::Always, k)
+}
+
 /// Per-model sampling / generation parameters.
 ///
 /// Used both for cloud models (parsed from the model's section in
@@ -85,6 +126,11 @@ pub struct ModelParams {
     /// Cloud: sent as `reasoning_effort` (levels only). Ollama: maps to the
     /// top-level `think` field (bool or level string).
     pub reasoning_effort: Option<String>,
+    /// Cisco-style send policy for `reasoning_effort`, from a `no` / `once`
+    /// prefix in front of the key (`once reasoning_effort = high`):
+    /// `no` never sends it, `once` sends it only on the session's first
+    /// request (strict gateways like NVIDIA NIM reject it on follow-ups).
+    pub reasoning_effort_send: ParamSend,
     /// Cloud only: `auto`, `none`, or `required`, sent as `tool_choice`.
     /// `None` falls back to `auto` when tools are attached.
     pub tool_choice: Option<String>,
@@ -106,6 +152,7 @@ impl Default for ModelParams {
             presence_penalty: 0.0,
             max_output_tokens: None,
             reasoning_effort: None,
+            reasoning_effort_send: ParamSend::default(),
             tool_choice: None,
             seed: None,
             num_ctx: None,
@@ -114,9 +161,15 @@ impl Default for ModelParams {
 }
 
 impl ModelParams {
-    /// Applies one `key = value` config line. Returns true if the key was
-    /// recognized (even if the value turned out invalid and was ignored).
+    /// Applies one `key = value` config line. The key may carry a
+    /// Cisco-style send-policy prefix in front of the parameter name
+    /// (`no reasoning_effort = ...`, `once reasoning_effort = high`);
+    /// currently only `reasoning_effort` has a send policy, so the prefix
+    /// is honored for that key and ignored for others.
+    /// Returns true if the key was recognized (even if the value turned
+    /// out invalid and was ignored).
     pub fn apply_key(&mut self, key: &str, value: &str) -> bool {
+        let (send, key) = split_send_prefix(key);
         match key {
             "temperature" => {
                 if let Ok(n) = value.parse::<f64>()
@@ -164,15 +217,21 @@ impl ModelParams {
                 }
             }
             "reasoning_effort" | "effort" => {
+                // The Cisco-style prefix arrived in front of the key
+                // (`no reasoning_effort`, `once reasoning_effort = high`).
                 let v = value.trim().to_lowercase();
                 if v.is_empty() || v == "none" {
                     self.reasoning_effort = None;
+                    self.reasoning_effort_send = send;
                 } else if matches!(
                     v.as_str(),
                     "low" | "medium" | "high" | "on" | "off" | "true" | "false"
                 ) {
                     self.reasoning_effort = Some(v);
+                    self.reasoning_effort_send = send;
                 }
+                // An invalid value is ignored entirely, value and policy
+                // unchanged — as before.
             }
             "tool_choice" => {
                 let v = value.trim().to_lowercase();
@@ -205,6 +264,54 @@ impl ModelParams {
         true
     }
 
+    /// The config-file key/value pair for `reasoning_effort`, with the
+    /// `no`/`once` prefix in front of the key (e.g. `("once reasoning_effort",
+    /// "high")`), so the entry round-trips through [`ModelParams::apply_key`]
+    /// unchanged. A `no` policy is written even when the value is unset.
+    pub fn reasoning_effort_conf_key_value(&self) -> (String, String) {
+        let prefix = match self.reasoning_effort_send {
+            ParamSend::Always => "",
+            ParamSend::Never => "no",
+            ParamSend::Once => "once",
+        };
+        let key = if prefix.is_empty() {
+            "reasoning_effort".to_string()
+        } else {
+            format!("{} reasoning_effort", prefix)
+        };
+        (key, self.reasoning_effort.clone().unwrap_or_default())
+    }
+
+    /// Human-readable form for status output: the `no`/`once` prefix in
+    /// front, e.g. `once high`, `no`, or just `high`. Empty when unset
+    /// with no prefix.
+    pub fn reasoning_effort_display(&self) -> String {
+        let prefix = match self.reasoning_effort_send {
+            ParamSend::Always => "",
+            ParamSend::Never => "no",
+            ParamSend::Once => "once",
+        };
+        match &self.reasoning_effort {
+            Some(v) if !prefix.is_empty() => format!("{} {}", prefix, v),
+            Some(v) => v.clone(),
+            None if !prefix.is_empty() => prefix.to_string(),
+            None => String::new(),
+        }
+    }
+
+    /// Applies a `/effort`-style argument that may carry the Cisco-style
+    /// prefix in front: `once high`, `no`, `high`. Returns true if the
+    /// argument was recognized.
+    pub fn apply_effort_arg(&mut self, arg: &str) -> bool {
+        let (send, rest) = split_send_prefix(arg);
+        let key = match send {
+            ParamSend::Always => "reasoning_effort",
+            ParamSend::Never => "no reasoning_effort",
+            ParamSend::Once => "once reasoning_effort",
+        };
+        self.apply_key(key, rest)
+    }
+
     /// Key/value pairs as written back to config files.
     pub fn to_conf_entries(&self) -> Vec<(String, String)> {
         let mut out = vec![
@@ -223,8 +330,11 @@ impl ModelParams {
         if let Some(n) = self.max_output_tokens {
             out.push(("max_output_tokens".to_string(), n.to_string()));
         }
-        if let Some(ref e) = self.reasoning_effort {
-            out.push(("reasoning_effort".to_string(), e.clone()));
+        // A `no`/`once` policy must round-trip even when the value is
+        // unset (`no reasoning_effort =`), so write the prefixed key.
+        if self.reasoning_effort.is_some() || self.reasoning_effort_send != ParamSend::Always {
+            let (key, value) = self.reasoning_effort_conf_key_value();
+            out.push((key, value));
         }
         if let Some(ref choice) = self.tool_choice {
             out.push(("tool_choice".to_string(), choice.clone()));
@@ -958,7 +1068,11 @@ fn default_cloud_conf() -> String {
          \n\
          # [default] applies to every cloud model; named sections override it.\n\
          # tool_choice: auto, none, or required\n\
-         # reasoning_effort: low, medium, high, or on/off\n\
+         # reasoning_effort: low, medium, high, or on/off — put a Cisco-style\n\
+         #   prefix in front of the parameter to control when it is sent:\n\
+         #   `no reasoning_effort` (never send it) or\n\
+         #   `once reasoning_effort = high` (first request of a session only),\n\
+         #   e.g. for strict gateways like NVIDIA NIM that reject it on follow-ups.\n\
          [default]\n",
     );
     for (key, value) in cloud_default_entries() {
@@ -2112,6 +2226,86 @@ mod tests {
         assert!(p.apply_key("max_output_tokens", "off"));
         assert_eq!(p.max_output_tokens, None);
         assert!(!p.apply_key("not_a_param", "1"));
+    }
+
+    #[test]
+    fn reasoning_effort_no_once_prefixes_parse() {
+        let mut p = ModelParams::default();
+        // Plain line: sent on every request (the default, old behavior).
+        assert!(p.apply_key("reasoning_effort", "high"));
+        assert_eq!(p.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(p.reasoning_effort_send, ParamSend::Always);
+
+        // `once` prefix in front of the parameter: sent only on the
+        // first request of a session.
+        assert!(p.apply_key("once reasoning_effort", "high"));
+        assert_eq!(p.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(p.reasoning_effort_send, ParamSend::Once);
+
+        // `no` prefix: the parameter must never be sent.
+        assert!(p.apply_key("no reasoning_effort", "high"));
+        assert_eq!(p.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(p.reasoning_effort_send, ParamSend::Never);
+        assert!(p.apply_key("no reasoning_effort", ""));
+        assert_eq!(p.reasoning_effort, None);
+        assert_eq!(p.reasoning_effort_send, ParamSend::Never);
+
+        // A plain value after a prefix resets the policy to Always.
+        assert!(p.apply_key("reasoning_effort", "low"));
+        assert_eq!(p.reasoning_effort.as_deref(), Some("low"));
+        assert_eq!(p.reasoning_effort_send, ParamSend::Always);
+
+        // `none` as a value is still just "unset", not a `no` prefix.
+        assert!(p.apply_key("reasoning_effort", "none"));
+        assert_eq!(p.reasoning_effort, None);
+        assert_eq!(p.reasoning_effort_send, ParamSend::Always);
+
+        // Invalid value with a prefix: ignored entirely.
+        assert!(p.apply_key("once reasoning_effort", "high"));
+        assert!(p.apply_key("once reasoning_effort", "bogus"));
+        assert_eq!(p.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(p.reasoning_effort_send, ParamSend::Once);
+    }
+
+    #[test]
+    fn reasoning_effort_conf_entry_roundtrips_through_apply_key() {
+        for (key, value) in [
+            ("reasoning_effort", "high"),
+            ("once reasoning_effort", "high"),
+            ("no reasoning_effort", "high"),
+            ("no reasoning_effort", ""),
+            ("reasoning_effort", "none"),
+            ("reasoning_effort", ""),
+        ] {
+            let mut p = ModelParams::default();
+            assert!(p.apply_key(key, value));
+            let (wkey, wvalue) = p.reasoning_effort_conf_key_value();
+            // What to_conf_entries writes must parse back to the same state.
+            let mut q = ModelParams::default();
+            assert!(q.apply_key(&wkey, &wvalue));
+            assert_eq!(q.reasoning_effort, p.reasoning_effort, "value for {:?}", key);
+            assert_eq!(q.reasoning_effort_send, p.reasoning_effort_send, "policy for {:?}", key);
+            assert_eq!(q.reasoning_effort_conf_key_value(), (wkey.clone(), wvalue.clone()), "stable for {:?}", key);
+        }
+        // `no` with an unset value is still written back (policy survives).
+        let mut p = ModelParams::default();
+        assert!(p.apply_key("no reasoning_effort", ""));
+        let entries = p.to_conf_entries();
+        assert!(entries.contains(&("no reasoning_effort".to_string(), String::new())));
+    }
+
+    #[test]
+    fn apply_effort_arg_accepts_prefix_in_front() {
+        let mut p = ModelParams::default();
+        assert!(p.apply_effort_arg("once high"));
+        assert_eq!(p.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(p.reasoning_effort_send, ParamSend::Once);
+        assert!(p.apply_effort_arg("no"));
+        assert_eq!(p.reasoning_effort, None);
+        assert_eq!(p.reasoning_effort_send, ParamSend::Never);
+        assert!(p.apply_effort_arg("medium"));
+        assert_eq!(p.reasoning_effort.as_deref(), Some("medium"));
+        assert_eq!(p.reasoning_effort_send, ParamSend::Always);
     }
 
     #[test]

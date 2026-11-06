@@ -16,8 +16,8 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
 
 use crate::config::{
-    CloudModel, CloudProvider, Config, ModelParams, ModelParamsStore, ModelsConfFiles, ReasoningParam,
-    find_conf_file, load_agents_md, load_cloud_models_with_base, load_model_params,
+    CloudModel, CloudProvider, Config, ModelParams, ModelParamsStore, ModelsConfFiles, ParamSend,
+    ReasoningParam, find_conf_file, load_agents_md, load_cloud_models_with_base, load_model_params,
     read_models_conf_files, save_model_params,
 };
 use crate::tools::{cap_tool_result, execute_tool_call, get_tool_definitions, parse_text_tool_calls};
@@ -1649,6 +1649,10 @@ pub struct App {
     pub retry_paused_message: String,
     pub pending_continuation: bool,
     pub continuation_count: u32,
+    /// Requests sent since the session started (new/load). Used by the
+    /// `once` param policy: `once <param>` is sent only when this is 0,
+    /// i.e. on the very first request of the session.
+    pub request_count: u32,
     /// Automatic "continue" nudges sent this turn because the model stopped
     /// with `finish_reason="stop"` right after an unfinished-looking text
     /// (see `needs_continuation`). Reset on fresh user input.
@@ -1879,6 +1883,7 @@ impl App {
             retry_paused_message: String::new(),
             pending_continuation: false,
             continuation_count: 0,
+            request_count: 0,
             auto_continue_count: 0,
             max_auto_continues: cfg.max_auto_continues,
             last_stats: TokenStats::default(),
@@ -3764,10 +3769,6 @@ impl App {
         let log_file = self.log_file.clone();
         let session_id = self.session_id.clone();
         let mut params = self.params.clone();
-        // NVIDIA's API rejects reasoning_effort in follow-up requests after
-        // tool results are returned. Clear it here so build_chat_body doesn't
-        // send it on the second request.
-        params.reasoning_effort = None;
         // Use the auto-detected model context window unless the user set
         // an explicit num_ctx. Cloud models manage their own context.
         if cloud_model.is_none() && params.num_ctx.is_none() {
@@ -3780,6 +3781,9 @@ impl App {
         };
         let max_retries = self.max_retries;
         let mode = self.chat_mode;
+        // `once <param>` policy: only the session's first request counts.
+        let first_request = self.request_count == 0;
+        self.request_count += 1;
 
         self.log_event(
             "PROMPT",
@@ -3799,6 +3803,7 @@ impl App {
             params,
             proxy,
             max_retries,
+            first_request,
             cancel.clone(),
         );
         self.response_rx = Some(rx);
@@ -3973,6 +3978,9 @@ impl App {
             None
         };
         let max_retries = self.max_retries;
+        // `once <param>` policy: only the session's first request counts.
+        let first_request = self.request_count == 0;
+        self.request_count += 1;
 
         self.log_event(
             "PROMPT",
@@ -3992,6 +4000,7 @@ impl App {
             params,
             proxy,
             max_retries,
+            first_request,
             cancel.clone(),
         );
         self.response_rx = Some(rx);
@@ -4273,6 +4282,7 @@ impl App {
         self.session_usage = TokenStats::default();
         self.tool_round_count = 0;
         self.tool_call_count = 0;
+        self.request_count = 0;
         self.pending_tool_calls.clear();
         self.tool_call_log.clear();
         self.scroll_offset = 0;
@@ -4293,6 +4303,9 @@ impl App {
         patch_tool_call_ids(&mut msgs);
         self.messages = msgs;
         self.streaming_text.clear();
+        // A loaded session with history is not a fresh conversation: its
+        // next request must not count as the "first" for `once <param>`.
+        self.request_count = if self.messages.is_empty() { 0 } else { 1 };
         self.session_name = sess_id.to_string();
         if let Some(model) = data["model"].as_str() {
             self.model_name = model.to_string();
@@ -4354,6 +4367,8 @@ impl App {
         patch_tool_call_ids(&mut msgs);
         self.messages = msgs;
         self.streaming_text.clear();
+        // Same as load_session: history means the next request is not first.
+        self.request_count = if self.messages.is_empty() { 0 } else { 1 };
         if let Some(model) = data["model"].as_str() {
             self.model_name = model.to_string();
             self.apply_model_params();
@@ -5592,8 +5607,7 @@ impl App {
             .max_output_tokens
             .map(|n| n.to_string())
             .unwrap_or_default();
-        self.settings_reasoning_effort =
-            self.params.reasoning_effort.clone().unwrap_or_default();
+        self.settings_reasoning_effort = self.params.reasoning_effort.clone().unwrap_or_default();
         self.settings_max_tool_rounds = self.max_tool_rounds.to_string();
         self.settings_justify = self.justify;
         self.settings_num_ctx = self
@@ -5930,8 +5944,15 @@ impl App {
             .apply_key("presence_penalty", self.settings_presence_penalty.trim());
         self.params
             .apply_key("max_output_tokens", self.settings_max_tokens.trim());
+        // Keep the `no`/`once` send policy (prefix in front of the key)
+        // when saving the dialog: the field holds only the value.
+        let effort_key = match self.params.reasoning_effort_send {
+            ParamSend::Always => "reasoning_effort",
+            ParamSend::Never => "no reasoning_effort",
+            ParamSend::Once => "once reasoning_effort",
+        };
         self.params
-            .apply_key("reasoning_effort", self.settings_reasoning_effort.trim());
+            .apply_key(effort_key, self.settings_reasoning_effort.trim());
         self.params
             .apply_key("num_ctx", self.settings_num_ctx.trim());
         if let Ok(v) = self.settings_max_tool_rounds.trim().parse::<usize>()
@@ -7020,24 +7041,27 @@ impl App {
             }),
             "effort" => Some(match arg {
                 Some(level) => {
-                    let before = self.params.reasoning_effort.clone();
-                    self.params.apply_key("reasoning_effort", level);
-                    if self.params.reasoning_effort != before {
+                    let before = self.params.reasoning_effort_display();
+                    self.params.apply_effort_arg(level);
+                    if self.params.reasoning_effort_display() != before {
                         match &self.params.reasoning_effort {
                             Some(e) => format!("Reasoning effort set to {}", e),
                             None => "Reasoning effort cleared".to_string(),
                         }
                     } else {
                         format!(
-                            "Invalid effort '{}'. Use low, medium, high, on, off or none.",
+                            "Invalid effort '{}'. Use low, medium, high, on, off, none, or a no/once prefix in front (e.g. /effort once high).",
                             level
                         )
                     }
                 }
-                None => format!(
-                    "Current reasoning_effort: {} (usage: /effort <low|medium|high|on|off|none>)",
-                    self.params.reasoning_effort.as_deref().unwrap_or("(unset)")
-                ),
+                None => {
+                    let cur = self.params.reasoning_effort_display();
+                    format!(
+                        "Current reasoning_effort: {} (usage: /effort <low|medium|high|on|off|none|no|once> [value])",
+                        if cur.is_empty() { "(unset)".to_string() } else { cur }
+                    )
+                }
             }),
             "maxtokens" => Some(match arg {
                 Some(n) => {
@@ -9907,19 +9931,19 @@ mod reasoning_tests {
         let mut p = ModelParams::default();
 
         p.reasoning_effort = Some("high".to_string());
-        let body = build_chat_body("m", None, ChatMode::Chat, &msgs(), &p);
+        let body = build_chat_body("m", None, ChatMode::Chat, &msgs(), &p, true);
         assert_eq!(body["think"], "high");
 
         p.reasoning_effort = Some("on".to_string());
-        let body = build_chat_body("m", None, ChatMode::Chat, &msgs(), &p);
+        let body = build_chat_body("m", None, ChatMode::Chat, &msgs(), &p, true);
         assert_eq!(body["think"], true);
 
         p.reasoning_effort = Some("off".to_string());
-        let body = build_chat_body("m", None, ChatMode::Chat, &msgs(), &p);
+        let body = build_chat_body("m", None, ChatMode::Chat, &msgs(), &p, true);
         assert_eq!(body["think"], false);
 
         p.reasoning_effort = None;
-        let body = build_chat_body("m", None, ChatMode::Chat, &msgs(), &p);
+        let body = build_chat_body("m", None, ChatMode::Chat, &msgs(), &p, true);
         assert!(body.get("think").is_none(), "unset effort must not send think");
     }
 
@@ -9938,19 +9962,19 @@ mod reasoning_tests {
         };
         let mut p = ModelParams::default();
         p.reasoning_effort = Some("medium".to_string());
-        let body = build_chat_body("c", Some(&cloud), ChatMode::Chat, &msgs(), &p);
+        let body = build_chat_body("c", Some(&cloud), ChatMode::Chat, &msgs(), &p, true);
         assert_eq!(body["reasoning_effort"], "medium");
 
         // "on" is an Ollama-style toggle, not a cloud level — must not be sent.
         p.reasoning_effort = Some("on".to_string());
-        let body = build_chat_body("c", Some(&cloud), ChatMode::Chat, &msgs(), &p);
+        let body = build_chat_body("c", Some(&cloud), ChatMode::Chat, &msgs(), &p, true);
         assert!(body.get("reasoning_effort").is_none());
 
         // reasoning_param=none → never sent, regardless of effort.
         let mut cloud2 = cloud.clone();
         cloud2.reasoning_param = ReasoningParam::None;
         p.reasoning_effort = Some("high".to_string());
-        let body = build_chat_body("c", Some(&cloud2), ChatMode::Chat, &msgs(), &p);
+        let body = build_chat_body("c", Some(&cloud2), ChatMode::Chat, &msgs(), &p, true);
         assert!(body.get("reasoning_effort").is_none());
         assert!(body.get("think").is_none());
     }
@@ -9973,20 +9997,20 @@ mod reasoning_tests {
         let mut p = ModelParams::default();
 
         p.reasoning_effort = Some("high".to_string());
-        let body = build_chat_body("m", Some(&cloud), ChatMode::Chat, &msgs(), &p);
+        let body = build_chat_body("m", Some(&cloud), ChatMode::Chat, &msgs(), &p, true);
         assert_eq!(body["think"], true, "got: {}", body);
         assert!(body.get("reasoning_effort").is_none());
 
         p.reasoning_effort = Some("off".to_string());
-        let body = build_chat_body("m", Some(&cloud), ChatMode::Chat, &msgs(), &p);
+        let body = build_chat_body("m", Some(&cloud), ChatMode::Chat, &msgs(), &p, true);
         assert_eq!(body["think"], false);
 
         p.reasoning_effort = Some("on".to_string());
-        let body = build_chat_body("m", Some(&cloud), ChatMode::Chat, &msgs(), &p);
+        let body = build_chat_body("m", Some(&cloud), ChatMode::Chat, &msgs(), &p, true);
         assert_eq!(body["think"], true);
 
         p.reasoning_effort = None;
-        let body = build_chat_body("m", Some(&cloud), ChatMode::Chat, &msgs(), &p);
+        let body = build_chat_body("m", Some(&cloud), ChatMode::Chat, &msgs(), &p, true);
         assert!(body.get("think").is_none(), "unset effort sends nothing");
     }
 }
@@ -10270,12 +10294,25 @@ fn build_chat_body(
     mode: ChatMode,
     api_messages: &[serde_json::Value],
     params: &ModelParams,
+    first_request: bool,
 ) -> serde_json::Value {
     // Determine the model name and whether to speak the Ollama protocol.
     // Pure Ollama models (cloud_model == None) always use Ollama format.
     // Cloud models with `provider_api = ollama` also use Ollama format.
     let model_name = cloud_model.map_or_else(|| model.to_string(), |c| c.api_model.clone());
     let is_ollama = cloud_model.map_or(true, |c| c.provider_api == CloudProvider::Ollama);
+
+    // Cisco-style send policy for reasoning_effort (`no` / `once` prefix in
+    // front of the key in the model config): `no` never sends it, `once`
+    // only on the session's first request. Strict gateways like NVIDIA NIM
+    // reject reasoning_effort on follow-up requests that replay reasoning
+    // history (hard 400), so Mistral Large via NVIDIA is configured
+    // `once reasoning_effort = high`.
+    let effort: Option<&str> = match params.reasoning_effort_send {
+        ParamSend::Never => None,
+        ParamSend::Once if !first_request => None,
+        _ => params.reasoning_effort.as_deref(),
+    };
 
     if is_ollama {
         // Ollama protocol: `options` map + top-level `think`.
@@ -10311,7 +10348,7 @@ fn build_chat_body(
         body["options"] = options;
         // Ollama `think`: bool toggle, or a level string for models
         // that support graded thinking (e.g. gpt-oss).
-        match params.reasoning_effort.as_deref() {
+        match effort {
             Some("off" | "none" | "false") => {
                 body["think"] = serde_json::json!(false);
             }
@@ -10353,14 +10390,14 @@ fn build_chat_body(
         // Reasoning control for cloud APIs. Which request field carries it
         // is per-model config (`reasoning_param` in models_cloud.conf):
         // `reasoning_effort` (default, levels only) or `think` (boolean).
-        if let Some(ref effort) = params.reasoning_effort {
+        if let Some(effort) = effort {
             match cloud.reasoning_param {
                 ReasoningParam::ReasoningEffort => {
-                    if matches!(effort.as_str(), "low" | "medium" | "high") {
+                    if matches!(effort, "low" | "medium" | "high") {
                         body["reasoning_effort"] = serde_json::json!(effort);
                     }
                 }
-                ReasoningParam::Think => match effort.as_str() {
+                ReasoningParam::Think => match effort {
                     "off" | "none" | "false" => {
                         body["think"] = serde_json::json!(false);
                     }
@@ -10398,6 +10435,7 @@ fn stream_chat_request(
     params: ModelParams,
     proxy: Option<String>,
     max_retries: u32,
+    first_request: bool,
     cancel: Arc<AtomicBool>,
 ) -> mpsc::Receiver<StreamChunk> {
     let (tx, rx) = mpsc::channel();
@@ -10411,7 +10449,7 @@ fn stream_chat_request(
         rt.block_on(async {
             let client = build_reqwest_client(&proxy);
 
-            let body = build_chat_body(&model, cloud_model.as_ref(), mode, &api_messages, &params);
+            let body = build_chat_body(&model, cloud_model.as_ref(), mode, &api_messages, &params, first_request);
             let (api_url, headers) = if let Some(ref cloud) = cloud_model {
                 let mut headers = reqwest::header::HeaderMap::new();
                 headers.insert(
@@ -10672,11 +10710,12 @@ mod chat_body_tests {
             presence_penalty: -0.5,
             max_output_tokens: Some(4096),
             reasoning_effort: Some("high".to_string()),
+            reasoning_effort_send: ParamSend::default(),
             tool_choice: None,
             seed: Some(42),
             num_ctx: Some(202752),
         };
-        let body = build_chat_body("llama3.2:3b", None, ChatMode::Coder, &msgs(), &params);
+        let body = build_chat_body("llama3.2:3b", None, ChatMode::Coder, &msgs(), &params, true);
         assert_eq!(body["model"], "llama3.2:3b");
         let o = &body["options"];
         assert_eq!(o["temperature"], 0.7);
@@ -10694,7 +10733,7 @@ mod chat_body_tests {
     #[test]
     fn ollama_body_defaults_send_only_basics() {
         let params = ModelParams::default();
-        let body = build_chat_body("m", None, ChatMode::Chat, &msgs(), &params);
+        let body = build_chat_body("m", None, ChatMode::Chat, &msgs(), &params, true);
         let o = &body["options"];
         assert_eq!(o["temperature"], 1.0);
         assert_eq!(o["top_p"], 0.9);
@@ -10713,17 +10752,17 @@ mod chat_body_tests {
         let mut params = ModelParams::default();
         params.reasoning_effort = Some("off".to_string());
         assert_eq!(
-            build_chat_body("m", None, ChatMode::Chat, &msgs(), &params)["think"],
+            build_chat_body("m", None, ChatMode::Chat, &msgs(), &params, true)["think"],
             false
         );
         params.reasoning_effort = Some("on".to_string());
         assert_eq!(
-            build_chat_body("m", None, ChatMode::Chat, &msgs(), &params)["think"],
+            build_chat_body("m", None, ChatMode::Chat, &msgs(), &params, true)["think"],
             true
         );
         params.reasoning_effort = Some("low".to_string());
         assert_eq!(
-            build_chat_body("m", None, ChatMode::Chat, &msgs(), &params)["think"],
+            build_chat_body("m", None, ChatMode::Chat, &msgs(), &params, true)["think"],
             "low"
         );
     }
@@ -10739,11 +10778,12 @@ mod chat_body_tests {
             presence_penalty: 0.1,
             max_output_tokens: Some(8192),
             reasoning_effort: Some("medium".to_string()),
+            reasoning_effort_send: ParamSend::default(),
             tool_choice: Some("required".to_string()),
             seed: Some(7),
             num_ctx: Some(9999), // not an OpenAI concept — must not be sent
         };
-        let body = build_chat_body("test-cloud", Some(&cloud), ChatMode::Coder, &msgs(), &params);
+        let body = build_chat_body("test-cloud", Some(&cloud), ChatMode::Coder, &msgs(), &params, true);
         assert_eq!(body["model"], "test-cloud");
         assert_eq!(body["temperature"], 0.6);
         assert_eq!(body["top_p"], 0.95);
@@ -10764,7 +10804,7 @@ mod chat_body_tests {
     fn cloud_body_tool_choice_falls_back_to_auto() {
         let cloud = cloud();
         let params = ModelParams::default();
-        let body = build_chat_body("test-cloud", Some(&cloud), ChatMode::Coder, &msgs(), &params);
+        let body = build_chat_body("test-cloud", Some(&cloud), ChatMode::Coder, &msgs(), &params, true);
         assert!(body["tools"].is_array());
         assert_eq!(body["tool_choice"], "auto");
     }
@@ -10773,7 +10813,7 @@ mod chat_body_tests {
     fn cloud_body_omits_tool_choice_without_tools() {
         let cloud = cloud();
         let params = ModelParams::default();
-        let body = build_chat_body("test-cloud", Some(&cloud), ChatMode::Chat, &msgs(), &params);
+        let body = build_chat_body("test-cloud", Some(&cloud), ChatMode::Chat, &msgs(), &params, true);
         assert!(body.get("tools").is_none());
         assert!(body.get("tool_choice").is_none());
     }
@@ -10782,7 +10822,7 @@ mod chat_body_tests {
     fn cloud_body_skips_unset_and_toggle_effort() {
         let cloud = cloud();
         let mut params = ModelParams::default();
-        let body = build_chat_body("test-cloud", Some(&cloud), ChatMode::Coder, &msgs(), &params);
+        let body = build_chat_body("test-cloud", Some(&cloud), ChatMode::Coder, &msgs(), &params, true);
         assert!(body.get("max_tokens").is_none());
         assert!(body.get("frequency_penalty").is_none());
         assert!(body.get("presence_penalty").is_none());
@@ -10791,8 +10831,63 @@ mod chat_body_tests {
 
         // "off"/"on" are toggles, not levels — cloud APIs reject them.
         params.reasoning_effort = Some("off".to_string());
-        let body = build_chat_body("test-cloud", Some(&cloud), ChatMode::Coder, &msgs(), &params);
+        let body = build_chat_body("test-cloud", Some(&cloud), ChatMode::Coder, &msgs(), &params, true);
         assert!(body.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn cloud_body_once_sends_effort_only_on_first_request() {
+        // NVIDIA NIM case: Mistral Large via NVIDIA rejects reasoning_effort
+        // on follow-up requests, so the model is configured `once high`.
+        let cloud = cloud();
+        let mut params = ModelParams::default();
+        assert!(params.apply_key("once reasoning_effort", "high"));
+        assert_eq!(params.reasoning_effort_send, ParamSend::Once);
+
+        let first = build_chat_body("test-cloud", Some(&cloud), ChatMode::Coder, &msgs(), &params, true);
+        assert_eq!(first["reasoning_effort"], "high", "first request carries it");
+        let followup = build_chat_body("test-cloud", Some(&cloud), ChatMode::Coder, &msgs(), &params, false);
+        assert!(
+            followup.get("reasoning_effort").is_none(),
+            "follow-up must not carry it: {}",
+            followup
+        );
+    }
+
+    #[test]
+    fn cloud_body_no_never_sends_effort() {
+        let cloud = cloud();
+        let mut params = ModelParams::default();
+        assert!(params.apply_key("no reasoning_effort", ""));
+        assert_eq!(params.reasoning_effort_send, ParamSend::Never);
+        for first_request in [true, false] {
+            let body = build_chat_body("test-cloud", Some(&cloud), ChatMode::Coder, &msgs(), &params, first_request);
+            assert!(body.get("reasoning_effort").is_none());
+            assert!(body.get("think").is_none());
+        }
+    }
+
+    #[test]
+    fn cloud_body_always_sends_effort_on_every_request() {
+        // Default (no prefix) restores the old behavior: always sent.
+        let cloud = cloud();
+        let mut params = ModelParams::default();
+        assert!(params.apply_key("reasoning_effort", "high"));
+        assert_eq!(params.reasoning_effort_send, ParamSend::Always);
+        for first_request in [true, false] {
+            let body = build_chat_body("test-cloud", Some(&cloud), ChatMode::Coder, &msgs(), &params, first_request);
+            assert_eq!(body["reasoning_effort"], "high");
+        }
+    }
+
+    #[test]
+    fn ollama_think_respects_once_policy() {
+        let mut params = ModelParams::default();
+        assert!(params.apply_key("once reasoning_effort", "high"));
+        let first = build_chat_body("m", None, ChatMode::Chat, &msgs(), &params, true);
+        assert_eq!(first["think"], "high");
+        let followup = build_chat_body("m", None, ChatMode::Chat, &msgs(), &params, false);
+        assert!(followup.get("think").is_none());
     }
 
     #[test]
