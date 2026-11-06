@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
 
 use crate::config::{
-    CloudModel, Config, ModelParams, ModelParamsStore, ModelsConfFiles, ReasoningParam,
+    CloudModel, CloudProvider, Config, ModelParams, ModelParamsStore, ModelsConfFiles, ReasoningParam,
     find_conf_file, load_agents_md, load_cloud_models_with_base, load_model_params,
     read_models_conf_files, save_model_params,
 };
@@ -3685,12 +3685,11 @@ impl App {
                 ChatMessage::App { .. } => {}
                 ChatMessage::Thinking { text: t, .. } => {
                     if is_cloud {
-                        // Cloud APIs have no slot for orphaned thinking; keep it
-                        // as a system note so it isn't lost entirely.
-                        api_messages.push(serde_json::json!({
-                            "role": "system",
-                            "content": format!("Your previous reasoning (interrupted): {}", t),
-                        }));
+                        // NVIDIA's API rejects thinking content as system
+                        // messages in follow-up requests after tool results.
+                        // Ollama: thinking is attached to the assistant message
+                        // itself (see Assistant arm above), so nothing to push
+                        // here for either backend in this context.
                     }
                     // Ollama: thinking is attached to the assistant message
                     // itself (see Assistant arm above), so nothing to push here.
@@ -3724,11 +3723,14 @@ impl App {
                         }
                         tc["type"] = serde_json::json!("function");
                     }
-                    api_messages.push(serde_json::json!({
+                    let mut assistant_msg = serde_json::json!({
                         "role": "assistant",
-                        "content": "",
                         "tool_calls": [tc],
-                    }));
+                    });
+                    if !is_cloud {
+                        assistant_msg["content"] = serde_json::json!("");
+                    }
+                    api_messages.push(assistant_msg);
                 }
                 ChatMessage::ToolResult {
                     name,
@@ -3762,6 +3764,10 @@ impl App {
         let log_file = self.log_file.clone();
         let session_id = self.session_id.clone();
         let mut params = self.params.clone();
+        // NVIDIA's API rejects reasoning_effort in follow-up requests after
+        // tool results are returned. Clear it here so build_chat_body doesn't
+        // send it on the second request.
+        params.reasoning_effort = None;
         // Use the auto-detected model context window unless the user set
         // an explicit num_ctx. Cloud models manage their own context.
         if cloud_model.is_none() && params.num_ctx.is_none() {
@@ -7996,7 +8002,7 @@ mod usage_tests {
 
     #[test]
     fn session_cost_uses_current_model_pricing() {
-        use crate::config::{CloudModel, ModelParams, ModelPricing};
+        use crate::config::{CloudModel, CloudProvider, ModelParams, ModelPricing};
         let mut app = test_app();
         app.session_usage = TokenStats {
             prompt_tokens: 2_000_000,
@@ -8019,6 +8025,7 @@ mod usage_tests {
                 cache_write_per_mtok: None,
             },
             reasoning_param: ReasoningParam::ReasoningEffort,
+            provider_api: CloudProvider::default(),
         });
         // 1M fresh in * $3 + 1M cached * $0.30 + 100k out * $15
         // = 3.0 + 0.3 + 1.5 = 4.8
@@ -9927,6 +9934,7 @@ mod reasoning_tests {
             params: ModelParams::default(),
             pricing: crate::config::ModelPricing::default(),
             reasoning_param: ReasoningParam::ReasoningEffort,
+            provider_api: CloudProvider::default(),
         };
         let mut p = ModelParams::default();
         p.reasoning_effort = Some("medium".to_string());
@@ -9960,6 +9968,7 @@ mod reasoning_tests {
             params: ModelParams::default(),
             pricing: crate::config::ModelPricing::default(),
             reasoning_param: ReasoningParam::Think,
+            provider_api: CloudProvider::default(),
         };
         let mut p = ModelParams::default();
 
@@ -10262,7 +10271,61 @@ fn build_chat_body(
     api_messages: &[serde_json::Value],
     params: &ModelParams,
 ) -> serde_json::Value {
-    if let Some(cloud) = cloud_model {
+    // Determine the model name and whether to speak the Ollama protocol.
+    // Pure Ollama models (cloud_model == None) always use Ollama format.
+    // Cloud models with `provider_api = ollama` also use Ollama format.
+    let model_name = cloud_model.map_or_else(|| model.to_string(), |c| c.api_model.clone());
+    let is_ollama = cloud_model.map_or(true, |c| c.provider_api == CloudProvider::Ollama);
+
+    if is_ollama {
+        // Ollama protocol: `options` map + top-level `think`.
+        let mut body = serde_json::json!({
+            "model": model_name,
+            "messages": api_messages,
+            "stream": true,
+        });
+        if let Some(tools) = tools_for_mode(mode) {
+            body["tools"] = serde_json::json!(tools);
+        }
+        let mut options = serde_json::json!({});
+        options["temperature"] = serde_json::json!(params.temperature);
+        options["top_p"] = serde_json::json!(params.top_p);
+        if params.top_k > 0 {
+            options["top_k"] = serde_json::json!(params.top_k);
+        }
+        if params.frequency_penalty != 0.0 {
+            options["frequency_penalty"] = serde_json::json!(params.frequency_penalty);
+        }
+        if params.presence_penalty != 0.0 {
+            options["presence_penalty"] = serde_json::json!(params.presence_penalty);
+        }
+        if let Some(seed) = params.seed {
+            options["seed"] = serde_json::json!(seed);
+        }
+        if let Some(num_predict) = params.max_output_tokens {
+            options["num_predict"] = serde_json::json!(num_predict);
+        }
+        if let Some(num_ctx) = params.num_ctx {
+            options["num_ctx"] = serde_json::json!(num_ctx);
+        }
+        body["options"] = options;
+        // Ollama `think`: bool toggle, or a level string for models
+        // that support graded thinking (e.g. gpt-oss).
+        match params.reasoning_effort.as_deref() {
+            Some("off" | "none" | "false") => {
+                body["think"] = serde_json::json!(false);
+            }
+            Some("on" | "true") => {
+                body["think"] = serde_json::json!(true);
+            }
+            Some(level @ ("low" | "medium" | "high")) => {
+                body["think"] = serde_json::json!(level);
+            }
+            _ => {}
+        }
+        body
+    } else {
+        let cloud = cloud_model.unwrap();
         let mut body = serde_json::json!({
             "model": cloud.api_model,
             "messages": api_messages,
@@ -10308,52 +10371,6 @@ fn build_chat_body(
                 },
                 ReasoningParam::None => {}
             }
-        }
-        body
-    } else {
-        let mut body = serde_json::json!({
-            "model": model,
-            "messages": api_messages,
-            "stream": true,
-        });
-        if let Some(tools) = tools_for_mode(mode) {
-            body["tools"] = serde_json::json!(tools);
-        }
-        let mut options = serde_json::json!({});
-        options["temperature"] = serde_json::json!(params.temperature);
-        options["top_p"] = serde_json::json!(params.top_p);
-        if params.top_k > 0 {
-            options["top_k"] = serde_json::json!(params.top_k);
-        }
-        if params.frequency_penalty != 0.0 {
-            options["frequency_penalty"] = serde_json::json!(params.frequency_penalty);
-        }
-        if params.presence_penalty != 0.0 {
-            options["presence_penalty"] = serde_json::json!(params.presence_penalty);
-        }
-        if let Some(seed) = params.seed {
-            options["seed"] = serde_json::json!(seed);
-        }
-        if let Some(num_predict) = params.max_output_tokens {
-            options["num_predict"] = serde_json::json!(num_predict);
-        }
-        if let Some(num_ctx) = params.num_ctx {
-            options["num_ctx"] = serde_json::json!(num_ctx);
-        }
-        body["options"] = options;
-        // Ollama `think`: bool toggle, or a level string for models
-        // that support graded thinking (e.g. gpt-oss).
-        match params.reasoning_effort.as_deref() {
-            Some("off" | "none" | "false") => {
-                body["think"] = serde_json::json!(false);
-            }
-            Some("on" | "true") => {
-                body["think"] = serde_json::json!(true);
-            }
-            Some(level @ ("low" | "medium" | "high")) => {
-                body["think"] = serde_json::json!(level);
-            }
-            _ => {}
         }
         body
     }
@@ -10414,7 +10431,7 @@ fn stream_chat_request(
 
             let result = send_with_retry(&client, reqwest::Method::POST, &api_url, headers, &body, max_retries, &tx, is_logging, &log_file, &session_id, &cancel).await;
 
-            let is_cloud = cloud_model.is_some();
+            let is_openai = cloud_model.map_or(false, |c| c.provider_api == CloudProvider::OpenAI);
             match result {
                 SendOutcome::Cancelled => {
                     // F7 "Stop" during connect/retry backoff — nothing
@@ -10454,7 +10471,7 @@ fn stream_chat_request(
                                     if raw.is_empty() {
                                         continue;
                                     }
-                                    let line = if is_cloud {
+                                    let line = if is_openai {
                                         raw.strip_prefix("data: ").unwrap_or(&raw).trim().to_string()
                                     } else {
                                         raw
@@ -10469,7 +10486,7 @@ fn stream_chat_request(
                                         continue;
                                     }
                                     if let Ok(json) = serde_json::from_str::<serde_json::Value>(&line) {
-                                        if is_cloud {
+                                        if is_openai {
                                             // Usage can ride on any chunk (nested under
                                             // choices[i] or top-level); forward it whenever present.
                                             if usage_from_json(&json).is_some() {
@@ -10641,6 +10658,7 @@ mod chat_body_tests {
             params: ModelParams::default(),
             pricing: crate::config::ModelPricing::default(),
             reasoning_param: ReasoningParam::ReasoningEffort,
+            provider_api: CloudProvider::default(),
         }
     }
 
@@ -11585,7 +11603,7 @@ mod timestamp_tests {
 #[cfg(test)]
 mod model_dialog_cloud_tests {
     use super::{App, KeyCode, KeyEvent, KeyModifiers, ModelDialogFocus, safe_prefix};
-    use crate::config::{CloudModel, Config, ModelParams, ModelPricing, ReasoningParam};
+    use crate::config::{CloudModel, CloudProvider, Config, ModelParams, ModelPricing, ReasoningParam};
 
     fn test_app() -> App {
         let cfg = Config {
@@ -11613,6 +11631,7 @@ mod model_dialog_cloud_tests {
                 cache_write_per_mtok: None,
             },
             reasoning_param: ReasoningParam::ReasoningEffort,
+            provider_api: CloudProvider::default(),
         }
     }
 
@@ -11779,6 +11798,7 @@ mod slash_config_tests {
             params: kimi_params,
             pricing: pricing.clone(),
             reasoning_param: ReasoningParam::ReasoningEffort,
+            provider_api: CloudProvider::default(),
         }];
 
         ModelsConfFiles {
@@ -11907,6 +11927,7 @@ mod slash_model_tests {
             params,
             pricing,
             reasoning_param: ReasoningParam::ReasoningEffort,
+            provider_api: CloudProvider::default(),
         }];
         let out = app.render_model_info(&ModelParamsStore {
             default: ModelParams::default(),

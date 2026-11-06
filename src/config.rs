@@ -317,6 +317,11 @@ pub struct CloudModel {
     ///     (api.mistral.ai magistral-* / reasoning-capable models).
     ///   - `none` — never send any reasoning parameter.
     pub reasoning_param: ReasoningParam,
+    /// Which API protocol this cloud model speaks: `openai` (default) or
+    /// `ollama`. Ollama models use a different request/response format
+    /// (raw JSON lines, `message.content`, `options` map) than OpenAI
+    /// compatible APIs (SSE, `choices[].delta.content`, top-level fields).
+    pub provider_api: CloudProvider,
 }
 
 /// Which request field carries the reasoning toggle for a cloud model.
@@ -331,6 +336,18 @@ pub enum ReasoningParam {
     Think,
     /// Never send a reasoning parameter.
     None,
+}
+
+/// Which API protocol a cloud model speaks.
+/// - `openai` (default): OpenAI-compatible chat/completions API (SSE,
+///   `choices[].delta.content`, Bearer auth, top-level request fields).
+/// - `ollama`: Ollama chat API (raw JSON lines, `message.content`,
+///   optional Bearer auth, `options` map for params).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CloudProvider {
+    #[default]
+    OpenAI,
+    Ollama,
 }
 
 impl Default for Config {
@@ -1252,6 +1269,7 @@ fn parse_cloud_models(content: &str, base: &ModelParams) -> Vec<CloudModel> {
     let mut current_params = default_params.clone();
     let mut current_pricing = default_pricing.clone();
     let mut current_reasoning_param = ReasoningParam::default();
+    let mut current_provider_api = CloudProvider::default();
 
     for line in content.lines() {
         let line = line.trim();
@@ -1279,6 +1297,7 @@ fn parse_cloud_models(content: &str, base: &ModelParams) -> Vec<CloudModel> {
                     params: current_params.clone(),
                     pricing: current_pricing.clone(),
                     reasoning_param: current_reasoning_param,
+                    provider_api: current_provider_api,
                 });
             }
             current_name = Some(line[1..line.len() - 1].trim().to_string());
@@ -1288,6 +1307,7 @@ fn parse_cloud_models(content: &str, base: &ModelParams) -> Vec<CloudModel> {
             current_params = default_params.clone();
             current_pricing = default_pricing.clone();
             current_reasoning_param = ReasoningParam::default();
+            current_provider_api = CloudProvider::default();
         } else if let Some((key, value)) = line.split_once('=') {
             let key = key.trim().to_lowercase();
             let value = value.trim().to_string();
@@ -1310,6 +1330,13 @@ fn parse_cloud_models(content: &str, base: &ModelParams) -> Vec<CloudModel> {
                     if !value.parse::<bool>().unwrap_or(true) {
                         current_reasoning_param = ReasoningParam::None;
                     }
+                }
+                // Which API protocol this cloud model speaks: `openai` or `ollama`.
+                "provider_api" => {
+                    current_provider_api = match value.trim().to_lowercase().as_str() {
+                        "ollama" => CloudProvider::Ollama,
+                        _ => CloudProvider::OpenAI,
+                    };
                 }
                 _ => apply_cloud_setting(&key, &value, &mut current_params, &mut current_pricing),
             }
@@ -1335,6 +1362,7 @@ fn parse_cloud_models(content: &str, base: &ModelParams) -> Vec<CloudModel> {
             params: current_params,
             pricing: current_pricing,
             reasoning_param: current_reasoning_param,
+            provider_api: current_provider_api,
         });
     }
 
