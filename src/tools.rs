@@ -120,6 +120,23 @@ fn home_dir() -> Option<String> {
     std::env::var("HOME").ok().filter(|h| !h.is_empty())
 }
 
+/// Expands a shell-style `~` in the `path` argument of a tool-call JSON
+/// string, so `~/git/Rustama` reaches the tool (and the LSP layer) as a
+/// filesystem-valid path. Stateless tools expand again themselves — a
+/// no-op on absolute paths. Non-JSON input is returned unchanged.
+pub(crate) fn expand_path_args(args: &str) -> String {
+    let Ok(mut parsed) = serde_json::from_str::<serde_json::Value>(args) else {
+        return args.to_string();
+    };
+    if let Some(path) = parsed["path"].as_str() {
+        let expanded = expand_tilde(path);
+        if expanded != path {
+            parsed["path"] = serde_json::Value::String(expanded);
+        }
+    }
+    parsed.to_string()
+}
+
 /// Looks up `user`'s home directory in `/etc/passwd`. Lines are
 /// `name:passwd:uid:gid:gecos:home:shell`, so the home directory is
 /// field 6 (0-based index 5) of the first line naming `user`.
@@ -1184,6 +1201,31 @@ pub(crate) fn unified_diff(old: &str, new: &str, path: &str, context: usize) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn expand_path_args_expands_tilde_only_in_path() {
+        let home = std::env::var("HOME").unwrap_or_default();
+        if home.is_empty() {
+            return;
+        }
+        // `path` is expanded, sibling args are left alone.
+        let out = expand_path_args(r#"{"path": "~/git/Rustama", "limit": 3}"#);
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(parsed["path"], format!("{home}/git/Rustama"));
+        assert_eq!(parsed["limit"], 3);
+
+        // Absolute paths and a missing `path` key pass through verbatim.
+        assert_eq!(
+            expand_path_args(r#"{"path": "/tmp/x.rs"}"#),
+            r#"{"path":"/tmp/x.rs"}"#
+        );
+        assert_eq!(
+            expand_path_args(r#"{"command": "ls ~"}"#),
+            r#"{"command":"ls ~"}"#
+        );
+        // Malformed JSON: returned unchanged so the tool reports it.
+        assert_eq!(expand_path_args("not json"), "not json");
+    }
 
     #[test]
     fn read_file_offset_limit() {

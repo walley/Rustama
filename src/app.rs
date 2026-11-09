@@ -1732,9 +1732,9 @@ impl App {
         let cloud_models = load_cloud_models_with_base(&model_params_store.default);
         let params = params_for_model(&cfg.model, &cloud_models, &model_params_store);
         // Resolved before `cfg` fields move into the struct below.
-        let lsp_root = resolve_lsp_workspace(&cfg.lsp_workspace, &cfg.save_path);
+        let lsp_root = crate::lsp::resolve_workspace(&cfg.lsp_workspace, &cfg.save_path);
         let kotlin_lsp_root =
-            resolve_lsp_workspace(&cfg.kotlin_lsp_workspace, &cfg.save_path);
+            crate::lsp::resolve_workspace(&cfg.kotlin_lsp_workspace, &cfg.save_path);
         let mut app = App {
             messages: vec![ChatMessage::app(
                 "Welcome to Rustama. Start typing your message.".to_string(),
@@ -1922,7 +1922,7 @@ impl App {
         }
         // Kotlin LSP: connect if enabled in config, or auto-detected from
         // a Kotlin / Android Studio project in the workspace.
-        if cfg.kotlin_lsp || detect_kotlin_project(&kotlin_lsp_root) {
+        if cfg.kotlin_lsp || crate::lsp::detect_kotlin_project(&kotlin_lsp_root) {
             let addr = cfg.kotlin_lsp_server.clone();
             let _ = app.lsp.start(
                 "kotlin",
@@ -2499,571 +2499,6 @@ impl App {
         self.log_event("LSP", "stopped");
     }
 
-    /// Selects the LSP client for the given file path: Kotlin LSP for
-    /// `.kt`/`.kts` files, rust-analyzer for everything else.
-    fn lsp_client_for_path(&self, path: &Path) -> Option<&crate::lsp::LspClient> {
-        self.lsp.client_for_path(path)
-    }
-
-    /// Executes the LSP-flavored tools; `None` = not an LSP tool (caller
-    /// falls through to the stateless `execute_tool_call`).
-    fn execute_lsp_tool(&mut self, name: &str, args_json: &str) -> Option<String> {
-        if name == "lsp_diagnostics" {
-            let args: serde_json::Value =
-                serde_json::from_str(args_json).unwrap_or(serde_json::json!({}));
-            return Some(self.lsp_diagnostics(
-                args["path"].as_str(),
-                args["severity"].as_str(),
-                crate::lsp::LSP_REQUEST_TIMEOUT,
-            ));
-        }
-        if name == "lsp_definition" {
-            let args: serde_json::Value =
-                serde_json::from_str(args_json).unwrap_or(serde_json::json!({}));
-            return Some(self.lsp_goto_definition(
-                args["path"].as_str(),
-                args["line"].as_u64(),
-                args["column"].as_u64(),
-                crate::lsp::LSP_REQUEST_TIMEOUT,
-            ));
-        }
-        if name == "lsp_symbol_info" {
-            let args: serde_json::Value =
-                serde_json::from_str(args_json).unwrap_or(serde_json::json!({}));
-            return Some(self.lsp_symbol_info(
-                args["path"].as_str(),
-                args["line"].as_u64(),
-                args["column"].as_u64(),
-                crate::lsp::LSP_REQUEST_TIMEOUT,
-            ));
-        }
-        if name == "lsp_references" {
-            let args: serde_json::Value =
-                serde_json::from_str(args_json).unwrap_or(serde_json::json!({}));
-            return Some(self.lsp_references(
-                args["path"].as_str(),
-                args["line"].as_u64(),
-                args["column"].as_u64(),
-                args["include_declaration"].as_bool(),
-                crate::lsp::LSP_REQUEST_TIMEOUT,
-            ));
-        }
-        if name == "lsp_completion" {
-            let args: serde_json::Value =
-                serde_json::from_str(args_json).unwrap_or(serde_json::json!({}));
-            return Some(self.lsp_completion(
-                args["path"].as_str(),
-                args["line"].as_u64(),
-                args["column"].as_u64(),
-                crate::lsp::LSP_REQUEST_TIMEOUT,
-            ));
-        }
-        None
-    }
-
-    /// Core of the `lsp_definition` tool: sync the file into the server,
-    /// resolve the symbol at (line, column), format the target location(s).
-    /// `line`/`column` are 1-based in the tool interface (matching how
-    /// diagnostics are reported) but are converted to LSP's 0-based
-    /// positions internally.
-    fn lsp_goto_definition(
-        &mut self,
-        path: Option<&str>,
-        line: Option<u64>,
-        column: Option<u64>,
-        timeout: std::time::Duration,
-    ) -> String {
-        use crate::lsp::LspStatus;
-
-        // A definition needs a concrete symbol position, so a path is
-        // mandatory (unlike lsp_diagnostics which can fall back to a
-        // workspace summary).
-        let Some(path) = path else {
-            return "lsp_definition: `path` is required (the file to search in) and \
-                `line`/`column` (1-based) must point at the symbol."
-                .to_string();
-        };
-        let Some(line) = line else {
-            return "lsp_definition: `line` (1-based) is required.".to_string();
-        };
-        let Some(column) = column else {
-            return "lsp_definition: `column` (1-based) is required.".to_string();
-        };
-        if line == 0 || column == 0 {
-            return "lsp_definition: `line` and `column` are 1-based (>= 1).".to_string();
-        }
-
-        let path = PathBuf::from(path);
-        let Some(client) = self.lsp_client_for_path(&path) else {
-            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("unknown");
-            return format!(
-                "lsp_definition: no LSP server configured for .{} files",
-                ext
-            );
-        };
-        let server_name = self.lsp.server_name_for_path(&path);
-        let key = self.lsp.config_key_for_path(&path);
-
-        match client.status() {
-            LspStatus::Running => {}
-            LspStatus::Stopped => {
-                return format!(
-                    "lsp_definition: server not running. Enable it with `{key} = on` in \
-                    rustama.conf (or /workspace <dir>) — requires {server_name}."
-                );
-            }
-            LspStatus::Failed(e) => return format!("lsp_definition: server failed: {}", e),
-            LspStatus::Starting => {} // rare; request below waits for analysis
-        }
-
-        if let Err(e) = client.sync_file(&path) {
-            return format!("lsp_definition: cannot sync {}: {}", path.display(), e);
-        }
-
-        let root = client.root().to_path_buf();
-        let cancel = AtomicBool::new(false);
-        let locs = match client.goto_definition(
-            &path,
-            (line - 1) as u32,
-            (column - 1) as u32,
-            timeout,
-            &cancel,
-        ) {
-            Ok(locs) => locs,
-            Err(e) if e.contains("cancelled") => {
-                return format!(
-                    "lsp_definition: {} not analyzed yet (server busy re-analyzing — try again)",
-                    path.display()
-                );
-            }
-            Err(e) => return format!("lsp_definition: request failed: {}", e),
-        };
-
-        if locs.is_empty() {
-            return format!(
-                "lsp_definition: no definition found for {}:{}:{}",
-                path.display(),
-                line,
-                column
-            );
-        }
-        let formatted = crate::lsp::format_locations(&locs, &root);
-        format!(
-            "Definition of {}:{}:{}:\n{}",
-            path.display(),
-            line,
-            column,
-            formatted.trim_end()
-        )
-    }
-
-    /// Shared arg validation for the position-based LSP tools
-    /// (`lsp_symbol_info`, `lsp_references`, `lsp_completion`): all need a
-    /// `path` plus 1-based `line`/`column`. Returns `Ok((path, line,
-    /// column))` or an error string describing the missing/invalid arg.
-    fn lsp_position_args(
-        &self,
-        tool: &str,
-        path: Option<&str>,
-        line: Option<u64>,
-        column: Option<u64>,
-    ) -> Result<(PathBuf, u64, u64), String> {
-        let Some(path) = path else {
-            return Err(format!(
-                "{}: `path` is required (the file to search in) and \
-                `line`/`column` (1-based) must point at the symbol.",
-                tool
-            ));
-        };
-        let Some(line) = line else {
-            return Err(format!("{}: `line` (1-based) is required.", tool));
-        };
-        let Some(column) = column else {
-            return Err(format!("{}: `column` (1-based) is required.", tool));
-        };
-        if line == 0 || column == 0 {
-            return Err(format!("{}: `line` and `column` are 1-based (>= 1).", tool));
-        }
-        Ok((PathBuf::from(path), line, column))
-    }
-
-    /// Shared preflight for the position-based LSP tools: checks the
-    /// server status and syncs the file. On success returns `()`;
-    /// on failure returns a ready-to-return error string.
-    fn lsp_position_preflight(
-        &self,
-        tool: &str,
-        path: &Path,
-    ) -> Result<(), String> {
-        use crate::lsp::LspStatus;
-        let Some(client) = self.lsp_client_for_path(path) else {
-            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("unknown");
-            return Err(format!(
-                "{}: no LSP server configured for .{} files",
-                tool, ext
-            ));
-        };
-        let server_name = self.lsp.server_name_for_path(path);
-        let key = self.lsp.config_key_for_path(path);
-
-        match client.status() {
-            LspStatus::Running => {}
-            LspStatus::Stopped => {
-                return Err(format!(
-                    "{}: server not running. Enable it with `{key} = on` in \
-                    rustama.conf (or /workspace <dir>) — requires {server_name}.",
-                    tool
-                ));
-            }
-            LspStatus::Failed(e) => return Err(format!("{}: server failed: {}", tool, e)),
-            LspStatus::Starting => {} // rare; request below waits for analysis
-        }
-        if let Err(e) = client.sync_file(path) {
-            return Err(format!("{}: cannot sync {}: {}", tool, path.display(), e));
-        }
-        Ok(())
-    }
-
-    /// Core of the `lsp_symbol_info` tool: sync the file, fetch hover info for
-    /// the symbol at (line, column), return the rendered text.
-    fn lsp_symbol_info(
-        &mut self,
-        path: Option<&str>,
-        line: Option<u64>,
-        column: Option<u64>,
-        timeout: std::time::Duration,
-    ) -> String {
-        let (path, line, column) = match self.lsp_position_args("lsp_symbol_info", path, line, column)
-        {
-            Ok(t) => t,
-            Err(e) => return e,
-        };
-        if let Err(e) = self.lsp_position_preflight("lsp_symbol_info", &path) {
-            return e;
-        }
-        let Some(client) = self.lsp_client_for_path(&path) else {
-            return "lsp_symbol_info: no LSP server configured for this file type".to_string();
-        };
-        let cancel = AtomicBool::new(false);
-        let text = match client.hover(
-            &path,
-            (line - 1) as u32,
-            (column - 1) as u32,
-            timeout,
-            &cancel,
-        ) {
-            Ok(t) => t,
-            Err(e) if e.contains("cancelled") => {
-                return format!(
-                    "lsp_symbol_info: {} not analyzed yet (server busy re-analyzing — try again)",
-                    path.display()
-                );
-            }
-            Err(e) => return format!("lsp_symbol_info: request failed: {}", e),
-        };
-        if text.trim().is_empty() {
-            format!(
-                "lsp_symbol_info: no hover information for {}:{}:{}",
-                path.display(),
-                line,
-                column
-            )
-        } else {
-            format!(
-                "Hover for {}:{}:{}:\n{}",
-                path.display(),
-                line,
-                column,
-                text.trim_end()
-            )
-        }
-    }
-
-    /// Core of the `lsp_references` tool: sync the file, find all
-    /// references to the symbol at (line, column), format the locations.
-    fn lsp_references(
-        &mut self,
-        path: Option<&str>,
-        line: Option<u64>,
-        column: Option<u64>,
-        include_declaration: Option<bool>,
-        timeout: std::time::Duration,
-    ) -> String {
-        let (path, line, column) =
-            match self.lsp_position_args("lsp_references", path, line, column) {
-                Ok(t) => t,
-                Err(e) => return e,
-            };
-        if let Err(e) = self.lsp_position_preflight("lsp_references", &path) {
-            return e;
-        }
-        let Some(client) = self.lsp_client_for_path(&path) else {
-            return "lsp_references: no LSP server configured for this file type".to_string();
-        };
-        let cancel = AtomicBool::new(false);
-        let locs = match client.references(
-            &path,
-            (line - 1) as u32,
-            (column - 1) as u32,
-            include_declaration.unwrap_or(true),
-            timeout,
-            &cancel,
-        ) {
-            Ok(l) => l,
-            Err(e) if e.contains("cancelled") => {
-                return format!(
-                    "lsp_references: {} not analyzed yet (server busy re-analyzing — try again)",
-                    path.display()
-                );
-            }
-            Err(e) => return format!("lsp_references: request failed: {}", e),
-        };
-        if locs.is_empty() {
-            return format!(
-                "lsp_references: no references found for {}:{}:{}",
-                path.display(),
-                line,
-                column
-            );
-        }
-        let root = client.root().to_path_buf();
-        let formatted = crate::lsp::format_locations(&locs, &root);
-        format!(
-            "References to {}:{}:{} ({}):\n{}",
-            path.display(),
-            line,
-            column,
-            locs.len(),
-            formatted.trim_end()
-        )
-    }
-
-    /// Core of the `lsp_completion` tool: sync the file, request
-    /// completions at (line, column), return the list.
-    fn lsp_completion(
-        &mut self,
-        path: Option<&str>,
-        line: Option<u64>,
-        column: Option<u64>,
-        timeout: std::time::Duration,
-    ) -> String {
-        let (path, line, column) = match self.lsp_position_args("lsp_completion", path, line, column)
-        {
-            Ok(t) => t,
-            Err(e) => return e,
-        };
-        if let Err(e) = self.lsp_position_preflight("lsp_completion", &path) {
-            return e;
-        }
-        let Some(client) = self.lsp_client_for_path(&path) else {
-            return "lsp_completion: no LSP server configured for this file type".to_string();
-        };
-        let cancel = AtomicBool::new(false);
-        let items = match client.completion(
-            &path,
-            (line - 1) as u32,
-            (column - 1) as u32,
-            timeout,
-            &cancel,
-        ) {
-            Ok(items) => items,
-            Err(e) if e.contains("cancelled") => {
-                return format!(
-                    "lsp_completion: {} not analyzed yet (server busy re-analyzing — try again)",
-                    path.display()
-                );
-            }
-            Err(e) => return format!("lsp_completion: request failed: {}", e),
-        };
-        if items.is_empty() {
-            return format!(
-                "lsp_completion: no completions for {}:{}:{}",
-                path.display(),
-                line,
-                column
-            );
-        }
-        let mut out = format!(
-            "Completions at {}:{}:{}:\n",
-            path.display(),
-            line,
-            column
-        );
-        for item in items {
-            out.push_str(&format!("- {}\n", item));
-        }
-        out.trim_end().to_string()
-    }
-
-    /// Core of the `lsp_diagnostics` tool: sync the file into the server,
-    /// wait for fresh analysis, format the results. Shared by the tool,
-    /// the auto-feedback hook, and tests.
-    fn lsp_diagnostics(
-        &mut self,
-        path: Option<&str>,
-        severity: Option<&str>,
-        timeout: std::time::Duration,
-    ) -> String {
-        use crate::lsp::{LspStatus, SeverityFilter};
-
-        let filter = match severity {
-            None => SeverityFilter::All,
-            Some(s) => match SeverityFilter::parse(s) {
-                Some(f) => f,
-                None => {
-                    return format!(
-                        "LSP: unknown severity '{}' (use error|warning|hint|info)",
-                        s
-                    );
-                }
-            },
-        };
-
-        // If no LSP server is running, report it before doing anything else.
-        if self.lsp.status_for("rust") != crate::lsp::LspStatus::Running {
-            return "LSP: server not running. Enable it with `lsp = on` in rustama.conf \
-                (or /workspace <dir>) — requires rust-analyzer."
-                .to_string();
-        }
-
-        // No path → workspace summary of everything published so far.
-        let path = match path {
-            Some(p) => PathBuf::from(p),
-            None => match &self.last_edited_file {
-                Some(p) => p.clone(),
-                None => {
-                    let (errors, warnings) = self.lsp.diagnostics_summary();
-                    let root = self
-                        .lsp
-                        .root_for_path(Path::new("."))
-                        .map_or("(none)".to_string(), |r| r.display().to_string());
-                    return format!(
-                        "LSP workspace ({}): {} errors, {} warnings (cached; open a file for details)",
-                        root, errors, warnings
-                    );
-                }
-            },
-        };
-
-        // Determine which LSP client handles this file.
-        let Some(client) = self.lsp.client_for_path(&path) else {
-            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("unknown");
-            return format!(
-                "LSP: no server configured for .{} files",
-                ext
-            );
-        };
-
-        match client.status() {
-            LspStatus::Running => {}
-            LspStatus::Stopped => {
-                let server_name = self.lsp.server_name_for_path(&path);
-                let key = self.lsp.config_key_for_path(&path);
-                return format!(
-                    "LSP: server not running. Enable it with `{key} = on` in rustama.conf \
-                    (or /workspace <dir>) — requires {server_name}."
-                );
-            }
-            LspStatus::Failed(e) => return format!("LSP: server failed: {}", e),
-            LspStatus::Starting => {} // rare; wait below handles it
-        }
-
-        if let Err(e) = client.sync_file(&path) {
-            return format!("LSP: cannot sync {}: {}", path.display(), e);
-        }
-
-        let root = client.root().to_path_buf();
-        let cancel = AtomicBool::new(false);
-
-        // Pull diagnostics when the server supports it (rust-analyzer
-        // does) — a direct answer beats waiting for a push. The server
-        // *cancels* pulls invalidated by a fresh didChange ("server
-        // cancelled the request"): retry briefly while it re-analyzes.
-        let diags = if client.pull_supported() {
-            let mut result = None;
-            for _ in 0..10 {
-                match client.pull_diagnostics(&path, timeout, &cancel) {
-                    Ok(d) => {
-                        result = Some(d);
-                        break;
-                    }
-                    Err(e) if e.contains("cancelled") => {
-                        std::thread::sleep(std::time::Duration::from_millis(300));
-                    }
-                    Err(e) => return format!("LSP: diagnostic request failed: {}", e),
-                }
-            }
-            match result {
-                Some(d) => d,
-                None => {
-                    return format!(
-                        "LSP: diagnostics for {} not ready (server busy re-analyzing — try again)",
-                        path.display()
-                    );
-                }
-            }
-        } else {
-            // Push-only server: wait briefly for fresh analysis, then use
-            // whatever is cached (possibly empty = clean or not ready).
-            let since = self.lsp.diag_version(&path);
-            let waited = std::time::Duration::from_secs(10).min(timeout);
-            let v = self.lsp.wait_for_diagnostics(&path, since, waited, &cancel);
-            if v == since && since == 0 {
-                return format!(
-                    "LSP: no diagnostics for {} yet (analysis still in progress — try again)",
-                    path.display()
-                );
-            }
-            self.lsp.diagnostics_for(&path)
-        };
-
-        let formatted = crate::lsp::format_diagnostics(&diags, &path, &root, filter);
-        if formatted.is_empty() {
-            format!("LSP: no diagnostics for {} ✓", path.display())
-        } else {
-            format!(
-                "LSP diagnostics for {}:\n{}",
-                path.display(),
-                formatted.trim_end()
-            )
-        }
-    }
-
-    /// Auto-feedback hook: after a successful edit_file/write_file tool
-    /// call, append fresh diagnostics so the model sees its own type
-    /// errors immediately. Gated by `lsp_auto_diagnostics`; no-op when the
-    /// server is not running or the edit failed.
-    fn maybe_append_lsp_diagnostics(&mut self, name: &str, args_json: &str, result: &mut String) {
-        if !self.lsp_auto_diagnostics
-            || !matches!(name, "edit_file" | "write_file")
-            || result.starts_with("Error")
-        {
-            return;
-        }
-        let args: serde_json::Value =
-            serde_json::from_str(args_json).unwrap_or(serde_json::json!({}));
-        let Some(path) = args["path"].as_str() else { return };
-        let path = Path::new(path);
-        let ext = path.extension().and_then(|e| e.to_str());
-        if ext != Some("rs") && ext != Some("kt") && ext != Some("kts") {
-            return;
-        }
-        let Some(client) = self.lsp_client_for_path(path) else {
-            return;
-        };
-        if client.status() != crate::lsp::LspStatus::Running {
-            return;
-        }
-        // Fresh analysis takes a moment after didChange; give it a
-        // bounded wait so the feedback reflects the edit, not the past.
-        let diag = self.lsp_diagnostics(
-            Some(path.to_string_lossy().as_ref()),
-            None,
-            std::time::Duration::from_secs(15),
-        );
-        result.push_str(&format!("\n\nDiagnostics: {}", diag));
-    }
-
     /// Unified tool dispatch: terminal tools → LSP tools → stateless tools,
     /// then the auto-diagnostics hook for file edits.
     fn execute_tool(&mut self, name: &str, args: &str) -> String {
@@ -3072,7 +2507,7 @@ impl App {
         // hooks below) as a filesystem-valid path. Stateless tools
         // expand again themselves — a no-op on absolute paths. The
         // shell expands `~` on its own for bash/terminal commands.
-        let args = &expand_path_args(args);
+        let args = &crate::tools::expand_path_args(args);
         if matches!(name, "edit_file" | "write_file") {
             let parsed: serde_json::Value =
                 serde_json::from_str(args).unwrap_or(serde_json::json!({}));
@@ -3082,9 +2517,13 @@ impl App {
         }
         let mut result = self
             .execute_terminal_tool(name, args)
-            .or_else(|| self.execute_lsp_tool(name, args))
+            .or_else(|| {
+                self.lsp
+                    .execute_tool(name, args, self.last_edited_file.as_deref())
+            })
             .unwrap_or_else(|| execute_tool_call(name, args, &self.proxy));
-        self.maybe_append_lsp_diagnostics(name, args, &mut result);
+        self.lsp
+            .append_edit_diagnostics(self.lsp_auto_diagnostics, name, args, &mut result);
         result
     }
 
@@ -5976,7 +5415,7 @@ impl App {
 
         // Apply LSP changes: start/stop rust-analyzer to match the new state.
         if self.lsp_enabled {
-            let root = resolve_lsp_workspace(&self.lsp_workspace, &self.save_path);
+            let root = crate::lsp::resolve_workspace(&self.lsp_workspace, &self.save_path);
             let server = self.lsp_server.clone();
             self.start_lsp(root, server);
         } else {
@@ -5985,7 +5424,7 @@ impl App {
 
         // Apply Kotlin LSP changes: connect/disconnect the Kotlin LSP server.
         if self.kotlin_lsp_enabled {
-            let root = resolve_lsp_workspace(&self.kotlin_lsp_workspace, &self.save_path);
+            let root = crate::lsp::resolve_workspace(&self.kotlin_lsp_workspace, &self.save_path);
             let _ = self.lsp.start(
                 "kotlin",
                 root,
@@ -7624,7 +7063,7 @@ impl App {
                         .map_or_else(|| "(unknown)".to_string(), |r| r.display().to_string());
                     return format!("LSP: already running (workspace: {root})");
                 }
-                let root = resolve_lsp_workspace(&self.lsp_workspace, &self.save_path);
+                let root = crate::lsp::resolve_workspace(&self.lsp_workspace, &self.save_path);
                 self.start_lsp(root.clone(), self.lsp_server.clone());
                 if self.lsp.status_for("rust") == crate::lsp::LspStatus::Running {
                     format!("LSP: on — rust-analyzer running ({})", root.display())
@@ -8434,71 +7873,6 @@ fn dirs_home() -> PathBuf {
 /// Rewrites the `path` argument of a tool-call JSON with a leading `~`
 /// expanded to the home directory (`crate::tools::expand_tilde`). Used
 /// by [`App::execute_tool`] as the dispatch-time safety net for tools
-/// that hand paths to rust-analyzer rather than `std::fs`. Idempotent:
-/// absolute paths pass through untouched, and malformed JSON is
-/// returned as-is so the tool produces its own "bad arguments" error.
-fn expand_path_args(args: &str) -> String {
-    let Ok(mut parsed) = serde_json::from_str::<serde_json::Value>(args) else {
-        return args.to_string();
-    };
-    if let Some(path) = parsed["path"].as_str() {
-        let expanded = crate::tools::expand_tilde(path);
-        if expanded != path {
-            parsed["path"] = serde_json::Value::String(expanded);
-        }
-    }
-    parsed.to_string()
-}
-
-/// Resolves the LSP workspace root: the configured `lsp_workspace` if set,
-/// else the directory of `save_path`, else the current directory.
-/// Missing `Cargo.toml` is not fatal — rust-analyzer still parses
-/// single files (the caller only warns).
-fn resolve_lsp_workspace(configured: &str, save_path: &str) -> PathBuf {
-    if !configured.trim().is_empty() {
-        return PathBuf::from(configured.trim());
-    }
-    let save_dir = std::path::Path::new(save_path)
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .map(PathBuf::from);
-    match save_dir {
-        Some(d) if d.is_dir() => d,
-        _ => std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-    }
-}
-
-/// Detects whether the workspace looks like a Kotlin / Android Studio
-/// project by checking for Gradle build files, AndroidManifest.xml, or
-/// any `.kt`/`.kts` source files.
-fn detect_kotlin_project(root: &Path) -> bool {
-    let markers = [
-        "build.gradle",
-        "build.gradle.kts",
-        "settings.gradle",
-        "settings.gradle.kts",
-        "AndroidManifest.xml",
-    ];
-    for marker in &markers {
-        if root.join(marker).is_file() {
-            return true;
-        }
-    }
-    // Also check for any .kt/.kts source files (shallow scan of src/ and
-    // the root).
-    for entry in std::fs::read_dir(root).ok().into_iter().flatten() {
-        if let Ok(entry) = entry {
-            let path = entry.path();
-            if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                if ext == "kt" || ext == "kts" {
-                    return true;
-                }
-            }
-        }
-    }
-    false
-}
-
 /// Autogenerated session id: 16 hex chars from the current unix
 /// timestamp in nanoseconds. Also serves as the default session name,
 /// so a session is autosaved under a unique, collision-free file name.
@@ -11076,31 +10450,6 @@ mod lsp_tool_tests {
     }
 
     #[test]
-    fn expand_path_args_expands_tilde_only_in_path() {
-        let home = std::env::var("HOME").unwrap_or_default();
-        if home.is_empty() {
-            return;
-        }
-        // `path` is expanded, sibling args are left alone.
-        let out = expand_path_args(r#"{"path": "~/git/Rustama", "limit": 3}"#);
-        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
-        assert_eq!(parsed["path"], format!("{home}/git/Rustama"));
-        assert_eq!(parsed["limit"], 3);
-
-        // Absolute paths and a missing `path` key pass through verbatim.
-        assert_eq!(
-            expand_path_args(r#"{"path": "/tmp/x.rs"}"#),
-            r#"{"path":"/tmp/x.rs"}"#
-        );
-        assert_eq!(
-            expand_path_args(r#"{"command": "ls ~"}"#),
-            r#"{"command":"ls ~"}"#
-        );
-        // Malformed JSON: returned unchanged so the tool reports it.
-        assert_eq!(expand_path_args("not json"), "not json");
-    }
-
-    #[test]
     fn execute_tool_expands_tilde_path_for_tracking() {
         let mut app = test_app();
         let Some(home) = std::env::var("HOME").ok().filter(|h| !h.is_empty()) else {
@@ -11129,7 +10478,12 @@ mod lsp_tool_tests {
     fn auto_diagnostics_noop_when_server_stopped() {
         let mut app = test_app();
         let mut result = "Successfully edited /tmp/x.rs".to_string();
-        app.maybe_append_lsp_diagnostics("edit_file", r#"{"path": "/tmp/x.rs"}"#, &mut result);
+        app.lsp.append_edit_diagnostics(
+            app.lsp_auto_diagnostics,
+            "edit_file",
+            r#"{"path": "/tmp/x.rs"}"#,
+            &mut result,
+        );
         assert_eq!(result, "Successfully edited /tmp/x.rs");
     }
 
@@ -11171,17 +10525,17 @@ mod lsp_tool_tests {
     fn workspace_root_resolution_order() {
         // Explicit config wins.
         assert_eq!(
-            resolve_lsp_workspace("/tmp", "output.md"),
+            crate::lsp::resolve_workspace("/tmp", "output.md"),
             PathBuf::from("/tmp")
         );
         // Else the directory of save_path (when it is a real dir).
         assert_eq!(
-            resolve_lsp_workspace("", "/tmp/output.md"),
+            crate::lsp::resolve_workspace("", "/tmp/output.md"),
             PathBuf::from("/tmp")
         );
         // Else (relative save_path without a parent dir) the cwd.
         assert_eq!(
-            resolve_lsp_workspace("  ", "output.md"),
+            crate::lsp::resolve_workspace("  ", "output.md"),
             std::env::current_dir().unwrap()
         );
     }

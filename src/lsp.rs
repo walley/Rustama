@@ -822,6 +822,520 @@ impl LspManager {
         }
     }
 
+    /// Shared preflight for the position-based LSP tools: checks the
+    /// server status and syncs the file. On success returns `()`;
+    /// on failure returns a ready-to-return error string.
+    pub fn position_preflight(&self, tool: &str, path: &Path) -> Result<(), String> {
+        let Some(client) = self.client_for_path(path) else {
+            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("unknown");
+            return Err(format!(
+                "{}: no LSP server configured for .{} files",
+                tool, ext
+            ));
+        };
+        let server_name = self.server_name_for_path(path);
+        let key = self.config_key_for_path(path);
+
+        match client.status() {
+            LspStatus::Running => {}
+            LspStatus::Stopped => {
+                return Err(format!(
+                    "{}: server not running. Enable it with `{key} = on` in \
+                    rustama.conf (or /workspace <dir>) — requires {server_name}.",
+                    tool
+                ));
+            }
+            LspStatus::Failed(e) => return Err(format!("{}: server failed: {}", tool, e)),
+            LspStatus::Starting => {} // rare; request below waits for analysis
+        }
+        if let Err(e) = client.sync_file(path) {
+            return Err(format!("{}: cannot sync {}: {}", tool, path.display(), e));
+        }
+        Ok(())
+    }
+
+    /// Core of the `lsp_definition` tool: sync the file into the server,
+    /// resolve the symbol at (line, column), format the target location(s).
+    /// `line`/`column` are 1-based in the tool interface (matching how
+    /// diagnostics are reported) but are converted to LSP's 0-based
+    /// positions internally.
+    pub fn goto_definition_tool(
+        &self,
+        path: Option<&str>,
+        line: Option<u64>,
+        column: Option<u64>,
+        timeout: Duration,
+    ) -> String {
+        // A definition needs a concrete symbol position, so a path is
+        // mandatory (unlike lsp_diagnostics which can fall back to a
+        // workspace summary).
+        let Some(path) = path else {
+            return "lsp_definition: `path` is required (the file to search in) and \
+                `line`/`column` (1-based) must point at the symbol."
+                .to_string();
+        };
+        let Some(line) = line else {
+            return "lsp_definition: `line` (1-based) is required.".to_string();
+        };
+        let Some(column) = column else {
+            return "lsp_definition: `column` (1-based) is required.".to_string();
+        };
+        if line == 0 || column == 0 {
+            return "lsp_definition: `line` and `column` are 1-based (>= 1).".to_string();
+        }
+
+        let path = PathBuf::from(path);
+        if let Err(e) = self.position_preflight("lsp_definition", &path) {
+            return e;
+        }
+        let Some(client) = self.client_for_path(&path) else {
+            return "lsp_definition: no LSP server configured for this file type".to_string();
+        };
+
+        let root = client.root().to_path_buf();
+        let cancel = AtomicBool::new(false);
+        let locs = match client.goto_definition(
+            &path,
+            (line - 1) as u32,
+            (column - 1) as u32,
+            timeout,
+            &cancel,
+        ) {
+            Ok(locs) => locs,
+            Err(e) if e.contains("cancelled") => {
+                return format!(
+                    "lsp_definition: {} not analyzed yet (server busy re-analyzing — try again)",
+                    path.display()
+                );
+            }
+            Err(e) => return format!("lsp_definition: request failed: {}", e),
+        };
+
+        if locs.is_empty() {
+            return format!(
+                "lsp_definition: no definition found for {}:{}:{}",
+                path.display(),
+                line,
+                column
+            );
+        }
+        let formatted = format_locations(&locs, &root);
+        format!(
+            "Definition of {}:{}:{}:\n{}",
+            path.display(),
+            line,
+            column,
+            formatted.trim_end()
+        )
+    }
+
+    /// Core of the `lsp_symbol_info` tool: sync the file, fetch hover info for
+    /// the symbol at (line, column), return the rendered text.
+    pub fn symbol_info_tool(
+        &self,
+        path: Option<&str>,
+        line: Option<u64>,
+        column: Option<u64>,
+        timeout: Duration,
+    ) -> String {
+        let (path, line, column) = match parse_position_args("lsp_symbol_info", path, line, column)
+        {
+            Ok(t) => t,
+            Err(e) => return e,
+        };
+        if let Err(e) = self.position_preflight("lsp_symbol_info", &path) {
+            return e;
+        }
+        let Some(client) = self.client_for_path(&path) else {
+            return "lsp_symbol_info: no LSP server configured for this file type".to_string();
+        };
+        let cancel = AtomicBool::new(false);
+        let text = match client.hover(
+            &path,
+            (line - 1) as u32,
+            (column - 1) as u32,
+            timeout,
+            &cancel,
+        ) {
+            Ok(t) => t,
+            Err(e) if e.contains("cancelled") => {
+                return format!(
+                    "lsp_symbol_info: {} not analyzed yet (server busy re-analyzing — try again)",
+                    path.display()
+                );
+            }
+            Err(e) => return format!("lsp_symbol_info: request failed: {}", e),
+        };
+        if text.trim().is_empty() {
+            format!(
+                "lsp_symbol_info: no hover information for {}:{}:{}",
+                path.display(),
+                line,
+                column
+            )
+        } else {
+            format!(
+                "Hover for {}:{}:{}:\n{}",
+                path.display(),
+                line,
+                column,
+                text.trim_end()
+            )
+        }
+    }
+
+    /// Core of the `lsp_references` tool: sync the file, list references to
+    /// the symbol at (line, column).
+    pub fn references_tool(
+        &self,
+        path: Option<&str>,
+        line: Option<u64>,
+        column: Option<u64>,
+        include_declaration: Option<bool>,
+        timeout: Duration,
+    ) -> String {
+        let (path, line, column) =
+            match parse_position_args("lsp_references", path, line, column) {
+                Ok(t) => t,
+                Err(e) => return e,
+            };
+        if let Err(e) = self.position_preflight("lsp_references", &path) {
+            return e;
+        }
+        let Some(client) = self.client_for_path(&path) else {
+            return "lsp_references: no LSP server configured for this file type".to_string();
+        };
+        let cancel = AtomicBool::new(false);
+        let locs = match client.references(
+            &path,
+            (line - 1) as u32,
+            (column - 1) as u32,
+            include_declaration.unwrap_or(true),
+            timeout,
+            &cancel,
+        ) {
+            Ok(l) => l,
+            Err(e) if e.contains("cancelled") => {
+                return format!(
+                    "lsp_references: {} not analyzed yet (server busy re-analyzing — try again)",
+                    path.display()
+                );
+            }
+            Err(e) => return format!("lsp_references: request failed: {}", e),
+        };
+        if locs.is_empty() {
+            return format!(
+                "lsp_references: no references found for {}:{}:{}",
+                path.display(),
+                line,
+                column
+            );
+        }
+        let root = client.root().to_path_buf();
+        let formatted = format_locations(&locs, &root);
+        format!(
+            "References to {}:{}:{} ({}):\n{}",
+            path.display(),
+            line,
+            column,
+            locs.len(),
+            formatted.trim_end()
+        )
+    }
+
+    /// Core of the `lsp_completion` tool: sync the file, request
+    /// completions at (line, column), return the list.
+    pub fn completion_tool(
+        &self,
+        path: Option<&str>,
+        line: Option<u64>,
+        column: Option<u64>,
+        timeout: Duration,
+    ) -> String {
+        let (path, line, column) =
+            match parse_position_args("lsp_completion", path, line, column) {
+                Ok(t) => t,
+                Err(e) => return e,
+            };
+        if let Err(e) = self.position_preflight("lsp_completion", &path) {
+            return e;
+        }
+        let Some(client) = self.client_for_path(&path) else {
+            return "lsp_completion: no LSP server configured for this file type".to_string();
+        };
+        let cancel = AtomicBool::new(false);
+        let items = match client.completion(
+            &path,
+            (line - 1) as u32,
+            (column - 1) as u32,
+            timeout,
+            &cancel,
+        ) {
+            Ok(items) => items,
+            Err(e) if e.contains("cancelled") => {
+                return format!(
+                    "lsp_completion: {} not analyzed yet (server busy re-analyzing — try again)",
+                    path.display()
+                );
+            }
+            Err(e) => return format!("lsp_completion: request failed: {}", e),
+        };
+        if items.is_empty() {
+            return format!(
+                "lsp_completion: no completions for {}:{}:{}",
+                path.display(),
+                line,
+                column
+            );
+        }
+        let mut out = format!(
+            "Completions at {}:{}:{}:\n",
+            path.display(),
+            line,
+            column
+        );
+        for item in items {
+            out.push_str(&format!("- {}\n", item));
+        }
+        out.trim_end().to_string()
+    }
+
+    /// Core of the `lsp_diagnostics` tool: sync the file into the server,
+    /// wait for fresh analysis, format the results. Shared by the tool,
+    /// the auto-feedback hook, and tests. `fallback_path` (the last edited
+    /// file) is used when the tool is called without a `path` argument.
+    pub fn diagnostics_tool(
+        &self,
+        path: Option<&str>,
+        severity: Option<&str>,
+        timeout: Duration,
+        fallback_path: Option<&Path>,
+    ) -> String {
+        let filter = match severity {
+            None => SeverityFilter::All,
+            Some(s) => match SeverityFilter::parse(s) {
+                Some(f) => f,
+                None => {
+                    return format!(
+                        "LSP: unknown severity '{}' (use error|warning|hint|info)",
+                        s
+                    );
+                }
+            },
+        };
+
+        // If no LSP server is running, report it before doing anything else.
+        if self.status_for("rust") != LspStatus::Running {
+            return "LSP: server not running. Enable it with `lsp = on` in rustama.conf \
+                (or /workspace <dir>) — requires rust-analyzer."
+                .to_string();
+        }
+
+        // No path → workspace summary of everything published so far.
+        let path = match path {
+            Some(p) => PathBuf::from(p),
+            None => match fallback_path {
+                Some(p) => p.to_path_buf(),
+                None => {
+                    let (errors, warnings) = self.diagnostics_summary();
+                    let root = self
+                        .root_for_path(Path::new("."))
+                        .map_or("(none)".to_string(), |r| r.display().to_string());
+                    return format!(
+                        "LSP workspace ({}): {} errors, {} warnings (cached; open a file for details)",
+                        root, errors, warnings
+                    );
+                }
+            },
+        };
+
+        // Determine which LSP client handles this file.
+        let Some(client) = self.client_for_path(&path) else {
+            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("unknown");
+            return format!(
+                "LSP: no server configured for .{} files",
+                ext
+            );
+        };
+
+        match client.status() {
+            LspStatus::Running => {}
+            LspStatus::Stopped => {
+                let server_name = self.server_name_for_path(&path);
+                let key = self.config_key_for_path(&path);
+                return format!(
+                    "LSP: server not running. Enable it with `{key} = on` in rustama.conf \
+                    (or /workspace <dir>) — requires {server_name}."
+                );
+            }
+            LspStatus::Failed(e) => return format!("LSP: server failed: {}", e),
+            LspStatus::Starting => {} // rare; wait below handles it
+        }
+
+        if let Err(e) = client.sync_file(&path) {
+            return format!("LSP: cannot sync {}: {}", path.display(), e);
+        }
+
+        let root = client.root().to_path_buf();
+        let cancel = AtomicBool::new(false);
+
+        // Pull diagnostics when the server supports it (rust-analyzer
+        // does) — a direct answer beats waiting for a push. The server
+        // *cancels* pulls invalidated by a fresh didChange ("server
+        // cancelled the request"): retry briefly while it re-analyzes.
+        let diags = if client.pull_supported() {
+            let mut result = None;
+            for _ in 0..10 {
+                match client.pull_diagnostics(&path, timeout, &cancel) {
+                    Ok(d) => {
+                        result = Some(d);
+                        break;
+                    }
+                    Err(e) if e.contains("cancelled") => {
+                        std::thread::sleep(std::time::Duration::from_millis(300));
+                    }
+                    Err(e) => return format!("LSP: diagnostic request failed: {}", e),
+                }
+            }
+            match result {
+                Some(d) => d,
+                None => {
+                    return format!(
+                        "LSP: diagnostics for {} not ready (server busy re-analyzing — try again)",
+                        path.display()
+                    );
+                }
+            }
+        } else {
+            // Push-only server: wait briefly for fresh analysis, then use
+            // whatever is cached (possibly empty = clean or not ready).
+            let since = self.diag_version(&path);
+            let waited = std::time::Duration::from_secs(10).min(timeout);
+            let v = self.wait_for_diagnostics(&path, since, waited, &cancel);
+            if v == since && since == 0 {
+                return format!(
+                    "LSP: no diagnostics for {} yet (analysis still in progress — try again)",
+                    path.display()
+                );
+            }
+            self.diagnostics_for(&path)
+        };
+
+        let formatted = format_diagnostics(&diags, &path, &root, filter);
+        if formatted.is_empty() {
+            format!("LSP: no diagnostics for {} ✓", path.display())
+        } else {
+            format!(
+                "LSP diagnostics for {}:\n{}",
+                path.display(),
+                formatted.trim_end()
+            )
+        }
+    }
+
+    /// Executes the LSP-flavored tools; `None` = not an LSP tool (the caller
+    /// falls through to the stateless tool executor). `fallback_path` is the
+    /// app's last-edited file, used by `lsp_diagnostics` when no path is
+    /// given.
+    pub fn execute_tool(
+        &self,
+        name: &str,
+        args_json: &str,
+        fallback_path: Option<&Path>,
+    ) -> Option<String> {
+        if name == "lsp_diagnostics" {
+            let args: serde_json::Value =
+                serde_json::from_str(args_json).unwrap_or(serde_json::json!({}));
+            return Some(self.diagnostics_tool(
+                args["path"].as_str(),
+                args["severity"].as_str(),
+                LSP_REQUEST_TIMEOUT,
+                fallback_path,
+            ));
+        }
+        if name == "lsp_definition" {
+            let args: serde_json::Value =
+                serde_json::from_str(args_json).unwrap_or(serde_json::json!({}));
+            return Some(self.goto_definition_tool(
+                args["path"].as_str(),
+                args["line"].as_u64(),
+                args["column"].as_u64(),
+                LSP_REQUEST_TIMEOUT,
+            ));
+        }
+        if name == "lsp_symbol_info" {
+            let args: serde_json::Value =
+                serde_json::from_str(args_json).unwrap_or(serde_json::json!({}));
+            return Some(self.symbol_info_tool(
+                args["path"].as_str(),
+                args["line"].as_u64(),
+                args["column"].as_u64(),
+                LSP_REQUEST_TIMEOUT,
+            ));
+        }
+        if name == "lsp_references" {
+            let args: serde_json::Value =
+                serde_json::from_str(args_json).unwrap_or(serde_json::json!({}));
+            return Some(self.references_tool(
+                args["path"].as_str(),
+                args["line"].as_u64(),
+                args["column"].as_u64(),
+                args["include_declaration"].as_bool(),
+                LSP_REQUEST_TIMEOUT,
+            ));
+        }
+        if name == "lsp_completion" {
+            let args: serde_json::Value =
+                serde_json::from_str(args_json).unwrap_or(serde_json::json!({}));
+            return Some(self.completion_tool(
+                args["path"].as_str(),
+                args["line"].as_u64(),
+                args["column"].as_u64(),
+                LSP_REQUEST_TIMEOUT,
+            ));
+        }
+        None
+    }
+
+    /// Auto-feedback hook: after a successful edit_file/write_file tool
+    /// call, append fresh diagnostics so the model sees its own type
+    /// errors immediately. Gated by `enabled` (`lsp_auto_diagnostics`);
+    /// no-op when the server is not running or the edit failed.
+    pub fn append_edit_diagnostics(
+        &self,
+        enabled: bool,
+        name: &str,
+        args_json: &str,
+        result: &mut String,
+    ) {
+        if !enabled || !matches!(name, "edit_file" | "write_file") || result.starts_with("Error")
+        {
+            return;
+        }
+        let args: serde_json::Value =
+            serde_json::from_str(args_json).unwrap_or(serde_json::json!({}));
+        let Some(path) = args["path"].as_str() else { return };
+        let path = Path::new(path);
+        let ext = path.extension().and_then(|e| e.to_str());
+        if ext != Some("rs") && ext != Some("kt") && ext != Some("kts") {
+            return;
+        }
+        let Some(client) = self.client_for_path(path) else {
+            return;
+        };
+        if client.status() != LspStatus::Running {
+            return;
+        }
+        // Fresh analysis takes a moment after didChange; give it a
+        // bounded wait so the feedback reflects the edit, not the past.
+        let diag = self.diagnostics_tool(
+            Some(&path.to_string_lossy()),
+            None,
+            std::time::Duration::from_secs(15),
+            Some(path),
+        );
+        result.push_str(&format!("\n\nDiagnostics: {}", diag));
+    }
 }
 
 impl Default for LspManager {
@@ -972,6 +1486,84 @@ fn language_id_for(path: &Path) -> &'static str {
         Some("toml") => "toml",
         _ => "rust",
     }
+}
+
+/// Shared arg validation for the position-based LSP tools
+/// (`lsp_symbol_info`, `lsp_references`, `lsp_completion`): all need a
+/// `path` plus 1-based `line`/`column`. Returns `Ok((path, line,
+/// column))` or an error string describing the missing/invalid arg.
+pub fn parse_position_args(
+    tool: &str,
+    path: Option<&str>,
+    line: Option<u64>,
+    column: Option<u64>,
+) -> Result<(PathBuf, u64, u64), String> {
+    let Some(path) = path else {
+        return Err(format!(
+            "{}: `path` is required (the file to search in) and \
+            `line`/`column` (1-based) must point at the symbol.",
+            tool
+        ));
+    };
+    let Some(line) = line else {
+        return Err(format!("{}: `line` (1-based) is required.", tool));
+    };
+    let Some(column) = column else {
+        return Err(format!("{}: `column` (1-based) is required.", tool));
+    };
+    if line == 0 || column == 0 {
+        return Err(format!("{}: `line` and `column` are 1-based (>= 1).", tool));
+    }
+    Ok((PathBuf::from(path), line, column))
+}
+
+/// Resolves the LSP workspace root: the configured `lsp_workspace` if set,
+/// else the directory of `save_path`, else the current directory.
+/// Missing `Cargo.toml` is not fatal — rust-analyzer still parses
+/// single files (the caller only warns).
+pub fn resolve_workspace(configured: &str, save_path: &str) -> PathBuf {
+    if !configured.trim().is_empty() {
+        return PathBuf::from(configured.trim());
+    }
+    let save_dir = std::path::Path::new(save_path)
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(PathBuf::from);
+    match save_dir {
+        Some(d) if d.is_dir() => d,
+        _ => std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+    }
+}
+
+/// Detects whether the workspace looks like a Kotlin / Android Studio
+/// project by checking for Gradle build files, AndroidManifest.xml, or
+/// any `.kt`/`.kts` source files.
+pub fn detect_kotlin_project(root: &Path) -> bool {
+    let markers = [
+        "build.gradle",
+        "build.gradle.kts",
+        "settings.gradle",
+        "settings.gradle.kts",
+        "AndroidManifest.xml",
+    ];
+    for marker in &markers {
+        if root.join(marker).is_file() {
+            return true;
+        }
+    }
+    // Also check for any .kt/.kts source files (shallow scan of src/ and
+    // the root).
+    for entry in std::fs::read_dir(root).ok().into_iter().flatten() {
+        if let Ok(entry) = entry {
+            let path = entry.path();
+            if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                if ext == "kt" || ext == "kts" {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 /// Severity filter for the diagnostics tool / formatting.

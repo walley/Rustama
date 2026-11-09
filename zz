@@ -1,0 +1,3 @@
+ > [26-10-2026, 10:10:59] nice, i found probably unrelated problem. Configuration in
+/home/walley/.config/rustama/rustama.conf is being reset to default state, changes by config dialog from menu, or even
+by hand editing config file are reseted imediatelly.
