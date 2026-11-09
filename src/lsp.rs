@@ -743,13 +743,6 @@ impl LspManager {
         }
     }
 
-    /// Stops all LSP servers.
-    pub fn stop_all(&mut self) {
-        for client in self.clients.values_mut() {
-            client.shutdown();
-        }
-    }
-
     /// Returns the LSP client responsible for `path`, based on file
     /// extension. Returns `None` if no client is configured for that
     /// language.
@@ -764,20 +757,6 @@ impl LspManager {
             .get(language)
             .map(|c| c.status())
             .unwrap_or(LspStatus::Stopped)
-    }
-
-    /// Returns true if any LSP server is running.
-    pub fn any_running(&self) -> bool {
-        self.clients
-            .values()
-            .any(|c| matches!(c.status(), LspStatus::Running))
-    }
-
-    /// Returns true if the LSP server for `path`'s language is running.
-    pub fn is_running_for_path(&self, path: &Path) -> bool {
-        self.client_for_path(path)
-            .map(|c| matches!(c.status(), LspStatus::Running))
-            .unwrap_or(false)
     }
 
     /// Diagnostics for `path` (routes to the client for that file's
@@ -808,43 +787,9 @@ impl LspManager {
             .unwrap_or(0)
     }
 
-    /// Whether pull diagnostics are supported by the client for `path`'s
-    /// language.
-    pub fn pull_supported_for_path(&self, path: &Path) -> bool {
-        self.client_for_path(path)
-            .map(|c| c.pull_supported())
-            .unwrap_or(false)
-    }
-
     /// Root of the LSP server for `path`'s language.
     pub fn root_for_path(&self, path: &Path) -> Option<PathBuf> {
         self.client_for_path(path).map(|c| c.root().to_path_buf())
-    }
-
-    /// Syncs `path` into the appropriate LSP server.
-    pub fn sync_file(&self, path: &Path) -> Result<(), String> {
-        match self.client_for_path(path) {
-            Some(client) => client.sync_file(path),
-            None => Err(format!(
-                "no LSP server configured for {} files",
-                path.extension()
-                    .and_then(|e| e.to_str())
-                    .unwrap_or("unknown")
-            )),
-        }
-    }
-
-    /// Pull diagnostics for `path` via its language's LSP server.
-    pub fn pull_diagnostics(
-        &self,
-        path: &Path,
-        timeout: Duration,
-        cancel: &AtomicBool,
-    ) -> Result<Vec<lsp_types::Diagnostic>, String> {
-        match self.client_for_path(path) {
-            Some(client) => client.pull_diagnostics(path, timeout, cancel),
-            None => Err("no LSP server configured for this file type".to_string()),
-        }
     }
 
     /// Wait for fresh diagnostics for `path`.
@@ -858,69 +803,6 @@ impl LspManager {
         match self.client_for_path(path) {
             Some(client) => client.wait_for_diagnostics(path, since, timeout, cancel),
             None => 0,
-        }
-    }
-
-    /// Goto definition for `path` via its language's LSP server.
-    pub fn goto_definition(
-        &self,
-        path: &Path,
-        line: u32,
-        character: u32,
-        timeout: Duration,
-        cancel: &AtomicBool,
-    ) -> Result<Vec<lsp_types::Location>, String> {
-        match self.client_for_path(path) {
-            Some(client) => client.goto_definition(path, line, character, timeout, cancel),
-            None => Err("no LSP server configured for this file type".to_string()),
-        }
-    }
-
-    /// Hover info for `path` via its language's LSP server.
-    pub fn hover(
-        &self,
-        path: &Path,
-        line: u32,
-        character: u32,
-        timeout: Duration,
-        cancel: &AtomicBool,
-    ) -> Result<String, String> {
-        match self.client_for_path(path) {
-            Some(client) => client.hover(path, line, character, timeout, cancel),
-            None => Ok(String::new()),
-        }
-    }
-
-    /// References for `path` via its language's LSP server.
-    pub fn references(
-        &self,
-        path: &Path,
-        line: u32,
-        character: u32,
-        include_declaration: bool,
-        timeout: Duration,
-        cancel: &AtomicBool,
-    ) -> Result<Vec<lsp_types::Location>, String> {
-        match self.client_for_path(path) {
-            Some(client) => {
-                client.references(path, line, character, include_declaration, timeout, cancel)
-            }
-            None => Err("no LSP server configured for this file type".to_string()),
-        }
-    }
-
-    /// Completions for `path` via its language's LSP server.
-    pub fn completion(
-        &self,
-        path: &Path,
-        line: u32,
-        character: u32,
-        timeout: Duration,
-        cancel: &AtomicBool,
-    ) -> Result<Vec<String>, String> {
-        match self.client_for_path(path) {
-            Some(client) => client.completion(path, line, character, timeout, cancel),
-            None => Ok(Vec::new()),
         }
     }
 
@@ -940,13 +822,6 @@ impl LspManager {
         }
     }
 
-    /// Returns an iterator over (language, status) pairs for all clients.
-    pub fn statuses(&self) -> Vec<(String, LspStatus)> {
-        self.clients
-            .iter()
-            .map(|(lang, client)| (lang.clone(), client.status()))
-            .collect()
-    }
 }
 
 impl Default for LspManager {

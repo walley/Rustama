@@ -3688,16 +3688,12 @@ impl App {
                 }
                 ChatMessage::System { .. } => {}
                 ChatMessage::App { .. } => {}
-                ChatMessage::Thinking { text: t, .. } => {
-                    if is_cloud {
-                        // NVIDIA's API rejects thinking content as system
-                        // messages in follow-up requests after tool results.
-                        // Ollama: thinking is attached to the assistant message
-                        // itself (see Assistant arm above), so nothing to push
-                        // here for either backend in this context.
-                    }
-                    // Ollama: thinking is attached to the assistant message
-                    // itself (see Assistant arm above), so nothing to push here.
+                ChatMessage::Thinking { .. } => {
+                    // Cloud: NVIDIA's API rejects thinking content in
+                    // follow-up requests after tool results, and other cloud
+                    // APIs have no slot for it — drop it here. Ollama:
+                    // thinking is attached to the assistant message itself
+                    // (see Assistant arm above), so nothing to push here.
                 }
                 ChatMessage::FileContent { name, content, .. } => {
                     api_messages.push(serde_json::json!({
