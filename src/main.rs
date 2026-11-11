@@ -1875,17 +1875,17 @@ fn render_settings_dialog(f: &mut Frame, app: &App, area: Rect) {
 /// Uses ui.rs components: dialog_block for the border/title, Paragraph
 /// for labels/values/toggles, and Button for Save/Cancel.
 fn render_lsp_dialog(f: &mut Frame, app: &App, area: Rect) {
-    const DIALOG_W: u16 = 60;
-    const FIELD_COUNT: u16 = 7;
-    let dialog_h = FIELD_COUNT * 2 + 6;
-
-    let popup = Rect {
-        x: area.x + (area.width.saturating_sub(DIALOG_W)) / 2,
-        y: area.y + (area.height.saturating_sub(dialog_h)) / 2,
-        width: DIALOG_W,
-        height: dialog_h,
-    };
-    let inner = popup.inner(Margin::new(2, 1));
+    // Shared geometry: the click hit-test (app.rs) uses the same
+    // layout, so the label and input columns never overlap and the
+    // buttons are clickable exactly where they draw — on the last row
+    // INSIDE the dialog, not on its border.
+    let layout = crate::ui::lsp_dialog_layout(area);
+    let popup = layout.popup;
+    // Label column: fixed LSP_LABEL_W wide starting at the inner left
+    // edge; the input/toggle column fills the rest of the inner width.
+    let label_w = crate::ui::LSP_LABEL_W;
+    let value_x = layout.inner_x + label_w;
+    let value_w = layout.inner_w.saturating_sub(label_w);
 
     f.render_widget(Clear, popup);
     f.render_widget(dialog_block("LSP Configuration", &app.theme), popup);
@@ -1901,7 +1901,7 @@ fn render_lsp_dialog(f: &mut Frame, app: &App, area: Rect) {
     ];
 
     for (i, (label, focus)) in field_labels.iter().enumerate() {
-        let field_y = inner.y + i as u16 * 2;
+        let field_y = layout.inner_y + i as u16 * 2;
 
         let label_style = if *focus == app.lsp_dialog_focus {
             Style::default()
@@ -1911,14 +1911,16 @@ fn render_lsp_dialog(f: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(app.theme.dialog_fg)
         };
 
+        // Fixed-width label column: the input column starts right after
+        // it, so the two never overlap and long labels are not clipped.
         let label_para = Paragraph::new(Line::from(Span::styled(
-            format!("  {:<16}", label),
+            format!("  {:<width$}", label, width = (label_w - 2) as usize),
             label_style,
         )));
         let label_area = Rect {
-            x: inner.x,
+            x: layout.inner_x,
             y: field_y,
-            width: 18,
+            width: label_w,
             height: 1,
         };
         f.render_widget(label_para, label_area);
@@ -1945,7 +1947,7 @@ fn render_lsp_dialog(f: &mut Frame, app: &App, area: Rect) {
                 toggle_style,
             )));
             let toggle_area = Rect {
-                x: inner.x + 17,
+                x: value_x,
                 y: field_y,
                 width: 7,
                 height: 1,
@@ -1970,47 +1972,50 @@ fn render_lsp_dialog(f: &mut Frame, app: &App, area: Rect) {
                     .bg(app.theme.dialog_focus_bg)
             };
 
-            let max_w = inner.width.saturating_sub(19);
-            let display_val = if value.len() > max_w as usize {
-                format!("{}...", &value[..(max_w as usize - 3)])
+            // Input box: starts at the value column, spans the rest of
+            // the inner width. Truncation is char-based (never splits a
+            // multi-byte character) and leaves room for "...".
+            let max_chars = value_w.saturating_sub(2) as usize;
+            let display_val = if value.chars().count() > max_chars {
+                let keep = max_chars.saturating_sub(3);
+                format!("{}...", value.chars().take(keep).collect::<String>())
             } else {
                 value.to_string()
             };
 
             let value_para = Paragraph::new(Line::from(Span::styled(
-                format!(
-                    " {:<width$} ",
-                    display_val,
-                    width = max_w.saturating_sub(1) as usize
-                ),
+                format!(" {:<width$} ", display_val, width = max_chars),
                 value_style,
             )));
             let value_area = Rect {
-                x: inner.x + 17,
+                x: value_x,
                 y: field_y,
-                width: max_w + 2,
+                width: value_w,
                 height: 1,
             };
             f.render_widget(value_para, value_area);
 
             if *focus == app.lsp_dialog_focus {
-                let cursor_x = value_area.x + 1 + app.lsp_dialog_cursor as u16;
+                // Keep the cursor inside the input box even when the
+                // field text is longer than the visible width.
+                let cursor_x = (value_area.x + 1 + app.lsp_dialog_cursor as u16)
+                    .min(value_area.x + value_w.saturating_sub(1));
                 f.set_cursor_position(Position::new(cursor_x, field_y));
             }
         }
     }
 
-    let btn_y = inner.y + FIELD_COUNT * 2;
-    let save_label = "Save";
-    let cancel_label = "Cancel";
-    let save_w = save_label.len() as u16 + 4;
-    let cancel_w = cancel_label.len() as u16 + 4;
-    let gap: u16 = 4;
+    // Save/Cancel on the last row inside the dialog (never on the
+    // border) — positions come from the shared layout.
+    let btn_y = layout.btn_y;
+    let btn_start_x = layout.save_x;
+    let save_w = layout.save_w;
+    let cancel_w = layout.cancel_w;
+    let gap: u16 = layout.cancel_x - layout.save_x - save_w;
     let total_btn_w = save_w + gap + cancel_w;
-    let btn_start_x = inner.x + (inner.width.saturating_sub(total_btn_w)) / 2;
 
     let save_btn = Button::new(
-        save_label,
+        "Save",
         btn_start_x,
         btn_y,
         app.lsp_dialog_focus == LspDialogFocus::Save,
@@ -2023,8 +2028,8 @@ fn render_lsp_dialog(f: &mut Frame, app: &App, area: Rect) {
         app.mouse_pos.1,
     );
     let cancel_btn = Button::new(
-        cancel_label,
-        btn_start_x + save_w + gap,
+        "Cancel",
+        layout.cancel_x,
         btn_y,
         app.lsp_dialog_focus == LspDialogFocus::Cancel,
         app.theme.dialog_fg,
@@ -2906,6 +2911,104 @@ mod settings_dialog_tests {
         // Buttons draw on the last row INSIDE the dialog.
         assert!(btn_row.contains("[ Save ]"), "got: {}", btn_row);
         assert!(btn_row.contains("[ Cancel ]"), "got: {}", btn_row);
+    }
+}
+
+#[cfg(test)]
+mod lsp_dialog_tests {
+    use super::render_lsp_dialog;
+    use crate::app::App;
+    use crate::config::Config;
+    use crate::ui::{LSP_LABEL_W, lsp_dialog_layout};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::layout::Rect;
+
+    fn test_app() -> App {
+        App::new(Config {
+            logging: false,
+            logfile: std::env::temp_dir()
+                .join(format!("rustama-test-{}.log", std::process::id()))
+                .to_string_lossy()
+                .to_string(),
+            ..Config::default()
+        })
+    }
+
+    #[test]
+    fn lsp_dialog_render_layout() {
+        let app = test_app();
+        let layout = lsp_dialog_layout(Rect::new(0, 0, 100, 40));
+        let backend = TestBackend::new(100, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                render_lsp_dialog(f, &app, area);
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        // Index rows by chars, not bytes — the border glyphs are
+        // multi-byte UTF-8 and byte slicing panics on them.
+        let row = |y: u16| -> Vec<char> {
+            (0..buf.area.width)
+                .map(|x| buf[(x, y)].symbol().chars().next().unwrap_or(' '))
+                .collect()
+        };
+        let line = |y: u16| -> String { row(y).into_iter().collect() };
+
+        // Buttons draw on the last row INSIDE the dialog; the bottom
+        // border stays intact with no buttons on it.
+        let border_row = line(layout.popup.y + layout.popup.height - 1);
+        let border_trimmed = border_row.trim();
+        assert!(
+            border_trimmed.starts_with('└') && border_trimmed.ends_with('┘'),
+            "got: {}",
+            border_row
+        );
+        assert!(
+            !border_row.contains("[ Save ]") && !border_row.contains("[ Cancel ]"),
+            "buttons must not sit on the border: {}",
+            border_row
+        );
+        let btn_row = line(layout.btn_y);
+        assert!(btn_row.contains("[ Save ]"), "got: {}", btn_row);
+        assert!(btn_row.contains("[ Cancel ]"), "got: {}", btn_row);
+
+        // The longest label renders in full (not clipped) and the input
+        // column starts exactly at value_x — the two never overlap.
+        let auto_y = layout.inner_y + 3 * 2; // "Auto-diagnostics:" row
+        let auto_row = line(auto_y);
+        let auto_chars = row(auto_y);
+        let value_x = (layout.inner_x + LSP_LABEL_W) as usize;
+        assert!(
+            auto_row.contains("Auto-diagnostics:"),
+            "label clipped: {}",
+            auto_row
+        );
+        let label_part: String = auto_chars[layout.inner_x as usize..value_x]
+            .iter()
+            .collect();
+        assert_eq!(label_part.chars().count(), LSP_LABEL_W as usize);
+        assert!(label_part.contains("Auto-diagnostics:"));
+        // The toggle box starts at the value column, not over the label.
+        let toggle: String = auto_chars[value_x..value_x + 4].iter().collect();
+        assert!(
+            toggle.starts_with(" [X]") || toggle.starts_with(" [ ]"),
+            "toggle must start at the value column: {} (row: {})",
+            toggle,
+            auto_row
+        );
+
+        // A text field row: label in its own column, input box at value_x.
+        let server_y = layout.inner_y + 1 * 2; // "Server:" row
+        let server_row = line(server_y);
+        let server_chars = row(server_y);
+        let server_label: String = server_chars[layout.inner_x as usize..value_x]
+            .iter()
+            .collect();
+        assert!(server_label.contains("Server:"));
+        assert_eq!(server_chars[value_x], ' ');
     }
 }
 

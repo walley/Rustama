@@ -577,6 +577,79 @@ pub fn settings_dialog_layout(area: Rect) -> SettingsDialogLayout {
     }
 }
 
+// ── LSP dialog geometry (shared by render + hit test) ──────────────────
+
+/// LSP settings dialog popup width — wider than the Settings dialog so
+/// long server/workspace paths stay readable.
+pub const LSP_DIALOG_W: u16 = 80;
+/// Number of label+value rows in the LSP dialog.
+pub const LSP_FIELD_COUNT: u16 = 7;
+/// LSP settings dialog popup height: the field rows (2 each) + spacer
+/// rows + the button row + 2 border rows.
+pub const LSP_DIALOG_H: u16 = LSP_FIELD_COUNT * 2 + 6;
+/// Width of the label column (including its 2-space indent). The
+/// toggle/input column starts at `inner_x + LSP_LABEL_W`, right after
+/// it — the two columns never overlap, and the longest label
+/// ("Auto-diagnostics:", 17 chars) fits without being clipped.
+pub const LSP_LABEL_W: u16 = 20;
+
+/// Shared geometry of the LSP settings dialog: the renderer (main.rs
+/// `render_lsp_dialog`) and the mouse hit-test (app.rs
+/// `handle_lsp_dialog_click`) both go through here, so the drawn and
+/// clickable coordinates can never drift. The Save/Cancel buttons sit
+/// on the **last row inside the dialog** — never on the bottom border.
+pub struct LspDialogLayout {
+    /// The centered popup rect.
+    pub popup: Rect,
+    /// Inner content origin (popup inset by `Margin(2, 1)`).
+    pub inner_x: u16,
+    pub inner_y: u16,
+    /// Inner content width.
+    pub inner_w: u16,
+    /// Absolute row of the Save/Cancel buttons (inside the dialog).
+    pub btn_y: u16,
+    /// X position and width of the Save / Cancel buttons.
+    pub save_x: u16,
+    pub save_w: u16,
+    pub cancel_x: u16,
+    pub cancel_w: u16,
+}
+
+/// Computes the LSP settings dialog layout for a terminal of `area`.
+pub fn lsp_dialog_layout(area: Rect) -> LspDialogLayout {
+    let w = LSP_DIALOG_W.min(area.width);
+    let h = LSP_DIALOG_H.min(area.height);
+    let popup = Rect {
+        x: area.width.saturating_sub(w) / 2,
+        y: area.height.saturating_sub(h) / 2,
+        width: w,
+        height: h,
+    };
+    let inner_x = popup.x + 2;
+    let inner_y = popup.y + 1;
+    let inner_w = w.saturating_sub(4);
+    // Fields occupy inner_y + i*2 for i in 0..FIELD_COUNT (last at
+    // +12); the buttons sit on the last inner row, one above the
+    // bottom border (popup.y + h - 1).
+    let btn_y = popup.y + h.saturating_sub(2);
+    let save_w = "Save".len() as u16 + 4;
+    let cancel_w = "Cancel".len() as u16 + 4;
+    let gap: u16 = 4;
+    let total_btn_w = save_w + gap + cancel_w;
+    let save_x = inner_x + inner_w.saturating_sub(total_btn_w) / 2;
+    LspDialogLayout {
+        popup,
+        inner_x,
+        inner_y,
+        inner_w,
+        btn_y,
+        save_x,
+        save_w,
+        cancel_x: save_x + save_w + gap,
+        cancel_w,
+    }
+}
+
 pub struct Button {
     pub name: String,
     pub x: u16,
@@ -2235,6 +2308,37 @@ mod tests {
         assert_eq!(l.btn_y, l.inner_y + 28);
         assert!(l.btn_y < l.popup.y + l.popup.height - 1);
         assert!(l.btn_y > l.inner_y + (SETTINGS_FIELD_COUNT - 1) * 2);
+    }
+
+    #[test]
+    fn lsp_dialog_layout_geometry() {
+        // 100x40 terminal: popup 80x20 centered at (10, 10).
+        let l = lsp_dialog_layout(Rect::new(0, 0, 100, 40));
+        assert_eq!(l.popup, Rect::new(10, 10, 80, 20));
+        assert_eq!(l.inner_x, 12);
+        assert_eq!(l.inner_y, 11);
+        assert_eq!(l.inner_w, 76);
+        // Label and input columns are adjacent but never overlap; the
+        // input box ends exactly at the inner right edge.
+        let value_x = l.inner_x + LSP_LABEL_W;
+        let value_w = l.inner_w - LSP_LABEL_W;
+        assert_eq!(value_x + value_w, l.inner_x + l.inner_w);
+        // The longest label (17 chars + 2-space indent) fits the column.
+        assert!(LSP_LABEL_W >= 2 + 17);
+        // Buttons on the last inner row — strictly above the bottom
+        // border and below the last field row.
+        assert_eq!(l.btn_y, l.popup.y + l.popup.height - 2);
+        assert!(l.btn_y < l.popup.y + l.popup.height - 1);
+        assert!(l.btn_y > l.inner_y + (LSP_FIELD_COUNT - 1) * 2);
+        // Buttons are centered inside the dialog and fully contained.
+        assert!(l.save_x >= l.inner_x);
+        assert!(l.cancel_x + l.cancel_w <= l.inner_x + l.inner_w);
+        assert!(l.cancel_x >= l.save_x + l.save_w);
+        // Narrow terminals: the popup shrinks to fit instead of overflowing.
+        let small = lsp_dialog_layout(Rect::new(0, 0, 50, 12));
+        assert_eq!(small.popup.width, 50);
+        assert_eq!(small.popup.height, 12);
+        assert!(small.inner_x + small.inner_w <= small.popup.x + small.popup.width);
     }
 
     #[test]

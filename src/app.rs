@@ -5556,18 +5556,15 @@ impl App {
         height: u16,
         phase: ClickPhase,
     ) {
-        // LSP dialog geometry: 60 wide, fields at inner_y + i*2, buttons at bottom.
-        const DIALOG_W: u16 = 60;
-        const FIELD_COUNT: u16 = 7;
-        let popup = Rect {
-            x: (width.saturating_sub(DIALOG_W)) / 2,
-            y: (height.saturating_sub(FIELD_COUNT * 2 + 6)) / 2,
-            width: DIALOG_W,
-            height: FIELD_COUNT * 2 + 6,
-        };
-        let inner_x = popup.x + 2;
-        let inner_y = popup.y + 1;
-        let inner_w = DIALOG_W.saturating_sub(4);
+        // Shared geometry: must agree with render_lsp_dialog (main.rs) —
+        // same popup size, same label/input columns, buttons on the last
+        // row inside the dialog.
+        let layout = crate::ui::lsp_dialog_layout(Rect::new(0, 0, width, height));
+        let popup = layout.popup;
+        let inner_y = layout.inner_y;
+        // Input box column: right after the fixed-width label column.
+        let value_x = layout.inner_x + crate::ui::LSP_LABEL_W;
+        let value_w = layout.inner_w.saturating_sub(crate::ui::LSP_LABEL_W);
 
         if col < popup.x
             || col >= popup.x + popup.width
@@ -5592,7 +5589,6 @@ impl App {
 
         for (i, (focus, _label)) in fields.iter().enumerate() {
             let field_y = inner_y + i as u16 * 2;
-            let max_w = inner_w.saturating_sub(16);
             if row == field_y {
                 if focus.is_toggle() {
                     if phase == ClickPhase::Press {
@@ -5600,7 +5596,7 @@ impl App {
                         self.toggle_lsp_dialog_checkbox();
                     }
                     return;
-                } else if col >= inner_x + 14 && col < inner_x + 14 + max_w + 2 {
+                } else if col >= value_x && col < value_x + value_w {
                     if phase == ClickPhase::Press {
                         self.lsp_dialog_focus = *focus;
                     }
@@ -5609,19 +5605,13 @@ impl App {
             }
         }
 
-        let btn_y = popup.y + 1 + FIELD_COUNT * 2;
-        let save_label = "Save";
-        let cancel_label = "Cancel";
-        let save_w = save_label.len() as u16 + 4;
-        let cancel_w = cancel_label.len() as u16 + 4;
-        let gap: u128 = 4;
-        let total_btn_w = save_w + gap as u16 + cancel_w;
-        let btn_start_x = inner_x + (inner_w.saturating_sub(total_btn_w)) / 2;
+        let btn_y = layout.btn_y;
+        let save_w = layout.save_w;
+        let btn_start_x = layout.save_x;
 
         if row == btn_y {
             let save_hit = col >= btn_start_x && col < btn_start_x + save_w;
-            let cancel_hit =
-                col >= btn_start_x + save_w + gap as u16 && col < btn_start_x + total_btn_w;
+            let cancel_hit = col >= layout.cancel_x && col < layout.cancel_x + layout.cancel_w;
             if save_hit || cancel_hit {
                 let pressed_id = if save_hit {
                     PressedButton::LspDialogConfirm
